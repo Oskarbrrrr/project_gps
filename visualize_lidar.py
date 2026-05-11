@@ -10,11 +10,16 @@ def _ensure_logs_dir():
     os.makedirs("logs", exist_ok=True)
 
 
+def _save_figure(fig, out_path):
+    _ensure_logs_dir()
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved to: {out_path}")
+
+
 def visualize_bev_sequence(scenario_name="scenario32", sample_idx=10, mode="train"):
     print(f"Loading {scenario_name} / {mode} ...")
     dataset = MultimodalDataset(mode=mode, scenario_name=scenario_name)
-
-    print(f"Reading sample {sample_idx} ...")
     _, _, lidars, _, target, _ = dataset[sample_idx]
     lidar_np = lidars.squeeze(1).numpy()
 
@@ -31,11 +36,7 @@ def visualize_bev_sequence(scenario_name="scenario32", sample_idx=10, mode="trai
         ax.axis("off")
 
     plt.tight_layout()
-    _ensure_logs_dir()
-    out_path = f"logs/lidar_bev_vis_{scenario_name}_{mode}_sample_{sample_idx}.png"
-    plt.savefig(out_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved to: {out_path}")
+    _save_figure(fig, f"logs/lidar_bev_vis_{scenario_name}_{mode}_sample_{sample_idx}.png")
 
 
 def visualize_paper_style_triptych(
@@ -49,8 +50,8 @@ def visualize_paper_style_triptych(
     _, _, _, _, target, _ = dataset[sample_idx]
     debug = dataset.get_lidar_debug_sequence(sample_idx)
 
-    frame_names = ["BEV", "Virtual Point Generation", "BEV+Generation"]
-    frame_tensors = [debug["base"], debug["virtual"], debug["combined"]]
+    names = ["BEV", "Virtual Point Generation", "BEV+Generation"]
+    tensors = [debug["base"], debug["virtual"], debug["combined"]]
 
     fig, axes = plt.subplots(3, 1, figsize=(5, 12))
     fig.suptitle(
@@ -58,60 +59,51 @@ def visualize_paper_style_triptych(
         fontsize=16,
     )
 
-    for row_idx, (title, tensor) in enumerate(zip(frame_names, frame_tensors)):
-        ax = axes[row_idx]
+    for ax, name, tensor in zip(axes, names, tensors):
         image = tensor[frame_idx]
         ax.imshow(image, cmap="viridis", origin="lower")
-        ax.set_title(f"{title}\nnonzero={int(np.count_nonzero(image))}")
+        ax.set_title(f"{name}\nnonzero={int(np.count_nonzero(image))}")
         ax.axis("off")
 
     plt.tight_layout()
-    _ensure_logs_dir()
-    out_path = (
-        f"logs/lidar_paper_style_{scenario_name}_{mode}_sample_{sample_idx}_frame_{frame_idx + 1}.png"
-    )
-    plt.savefig(out_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved to: {out_path}")
+    out_path = f"logs/lidar_paper_style_{scenario_name}_{mode}_sample_{sample_idx}_frame_{frame_idx + 1}.png"
+    _save_figure(fig, out_path)
 
 
-def visualize_orientation_variants(
+def visualize_debug_layers(
     scenario_name="scenario34",
     sample_idx=50,
     mode="train",
-    frame_idx=0,
+    frame_idx=1,
 ):
-    print(f"Rendering orientation variants for {scenario_name} / {mode} / sample {sample_idx} ...")
-    variants = [
-        ("original", dict(lidar_swap_xy=False, lidar_flip_x=False, lidar_flip_y=False)),
-        ("swap_xy", dict(lidar_swap_xy=True, lidar_flip_x=False, lidar_flip_y=False)),
-        ("swap+flip_x", dict(lidar_swap_xy=True, lidar_flip_x=True, lidar_flip_y=False)),
-        ("swap+flip_y", dict(lidar_swap_xy=True, lidar_flip_x=False, lidar_flip_y=True)),
+    print(f"Rendering debug layers for {scenario_name} / {mode} / sample {sample_idx} ...")
+    dataset = MultimodalDataset(mode=mode, scenario_name=scenario_name)
+    _, _, _, _, target, _ = dataset[sample_idx]
+    debug = dataset.get_lidar_debug_sequence(sample_idx)
+
+    names = [
+        ("base", "Base BEV"),
+        ("raw_motion", "Raw Motion Cue"),
+        ("region_mask", "Region Mask"),
+        ("virtual", "Virtual Points"),
+        ("combined", "Combined BEV"),
     ]
 
-    fig, axes = plt.subplots(2, 2, figsize=(10, 10))
-    axes = axes.flatten()
+    fig, axes = plt.subplots(len(names), 1, figsize=(5, 18))
+    fig.suptitle(
+        f"LiDAR debug layers: {scenario_name} {mode} sample={sample_idx} frame={frame_idx + 1} target={int(target)}",
+        fontsize=16,
+    )
 
-    for ax, (title, kwargs) in zip(axes, variants):
-        dataset = MultimodalDataset(mode=mode, scenario_name=scenario_name, **kwargs)
-        debug = dataset.get_lidar_debug_sequence(sample_idx)
-        image = debug["base"][frame_idx]
+    for ax, (key, title) in zip(axes, names):
+        image = debug[key][frame_idx]
         ax.imshow(image, cmap="viridis", origin="lower")
         ax.set_title(f"{title}\nnonzero={int(np.count_nonzero(image))}")
         ax.axis("off")
 
-    fig.suptitle(
-        f"Orientation variants: {scenario_name} {mode} sample={sample_idx} frame={frame_idx + 1}",
-        fontsize=16,
-    )
     plt.tight_layout()
-    _ensure_logs_dir()
-    out_path = (
-        f"logs/lidar_orientation_variants_{scenario_name}_{mode}_sample_{sample_idx}_frame_{frame_idx + 1}.png"
-    )
-    plt.savefig(out_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved to: {out_path}")
+    out_path = f"logs/lidar_debug_layers_{scenario_name}_{mode}_sample_{sample_idx}_frame_{frame_idx + 1}.png"
+    _save_figure(fig, out_path)
 
 
 if __name__ == "__main__":
@@ -119,5 +111,5 @@ if __name__ == "__main__":
     visualize_bev_sequence("scenario34", sample_idx=100, mode="train")
     visualize_paper_style_triptych("scenario34", sample_idx=50, mode="train", frame_idx=1)
     visualize_paper_style_triptych("scenario34", sample_idx=100, mode="train", frame_idx=1)
-    visualize_orientation_variants("scenario34", sample_idx=50, mode="train", frame_idx=0)
-    visualize_orientation_variants("scenario34", sample_idx=100, mode="train", frame_idx=0)
+    visualize_debug_layers("scenario34", sample_idx=50, mode="train", frame_idx=1)
+    visualize_debug_layers("scenario34", sample_idx=100, mode="train", frame_idx=1)
