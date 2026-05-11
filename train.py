@@ -62,9 +62,9 @@ def run_scenario(scenario_name):
     alpha_weights = calculate_alpha_weights(train_csv_path, num_classes=64).to(device)
     print("✅ 已生成自适应 Alpha 类别权重。")
     
-    train_ds = MultimodalDataset(train_csv_path)
-    val_ds   = MultimodalDataset(f"Data/splits/{scenario_name}_val.csv")
-    test_ds  = MultimodalDataset(f"Data/splits/{scenario_name}_test.csv")
+    train_ds = MultimodalDataset(mode='train', scenario_name=scenario_name)
+    val_ds   = MultimodalDataset(mode='val', scenario_name=scenario_name)
+    test_ds  = MultimodalDataset(mode='test', scenario_name=scenario_name)
     
     train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=8)
     val_loader   = DataLoader(val_ds, batch_size=32, shuffle=False, num_workers=8)
