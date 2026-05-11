@@ -25,9 +25,9 @@ class MultimodalDataset(Dataset):
         lidar_swap_xy=False,
         lidar_flip_x=False,
         lidar_flip_y=False,
-        virtual_temporal_tolerance=1,
-        virtual_group_radius=1,
-        virtual_min_component_size=3,
+        virtual_temporal_tolerance=0,
+        virtual_group_radius=0,
+        virtual_min_component_size=2,
         virtual_max_component_size=256,
         virtual_max_bbox_size=32,
         virtual_dilation_radius=1,
@@ -246,12 +246,15 @@ class MultimodalDataset(Dataset):
         current_mask = current_bev > 0.5
         prev_mask = prev_bev > 0.5
 
-        # Suppress pseudo-motion caused by rasterization jitter on static structures.
+        # Start from plain frame difference. Keep suppression minimal for now so
+        # the debug view does not collapse to an empty map.
         prev_tolerated = self._binary_dilate(prev_mask, self.virtual_temporal_tolerance)
         candidate_motion = current_mask & (~prev_tolerated)
 
-        # Keep only compact local regions that look more like moving targets.
         filtered_motion = self._filter_motion_components(candidate_motion)
+        if not np.any(filtered_motion):
+            filtered_motion = candidate_motion
+
         virtual_mask = self._binary_dilate(filtered_motion, self.virtual_dilation_radius)
 
         return np.maximum(current_mask.astype(np.float32), virtual_mask.astype(np.float32))
