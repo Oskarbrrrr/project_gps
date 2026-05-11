@@ -25,11 +25,11 @@ class MultimodalDataset(Dataset):
         lidar_swap_xy=False,
         lidar_flip_x=False,
         lidar_flip_y=False,
-        virtual_temporal_tolerance=2,
-        virtual_min_component_size=4,
+        virtual_temporal_tolerance=1,
+        virtual_group_radius=1,
+        virtual_min_component_size=3,
         virtual_max_component_size=256,
-        virtual_min_fill_ratio=0.08,
-        virtual_max_bbox_size=24,
+        virtual_max_bbox_size=32,
         virtual_dilation_radius=1,
     ):
         self.data_dir = data_root
@@ -41,9 +41,9 @@ class MultimodalDataset(Dataset):
         self.lidar_flip_x = lidar_flip_x
         self.lidar_flip_y = lidar_flip_y
         self.virtual_temporal_tolerance = int(virtual_temporal_tolerance)
+        self.virtual_group_radius = int(virtual_group_radius)
         self.virtual_min_component_size = int(virtual_min_component_size)
         self.virtual_max_component_size = int(virtual_max_component_size)
-        self.virtual_min_fill_ratio = float(virtual_min_fill_ratio)
         self.virtual_max_bbox_size = int(virtual_max_bbox_size)
         self.virtual_dilation_radius = int(virtual_dilation_radius)
 
@@ -178,14 +178,19 @@ class MultimodalDataset(Dataset):
 
     def _filter_motion_components(self, candidate_mask):
         filtered = np.zeros_like(candidate_mask, dtype=bool)
+        grouped_mask = self._binary_dilate(candidate_mask, self.virtual_group_radius)
 
-        for component in self._connected_components(candidate_mask):
-            size = component["size"]
+        for component in self._connected_components(grouped_mask):
             min_x, max_x, min_y, max_y = component["bbox"]
             bbox_h = max_x - min_x + 1
             bbox_w = max_y - min_y + 1
-            bbox_area = bbox_h * bbox_w
-            fill_ratio = size / max(bbox_area, 1)
+
+            raw_component_mask = np.zeros_like(candidate_mask, dtype=bool)
+            for x, y in component["coords"]:
+                if candidate_mask[x, y]:
+                    raw_component_mask[x, y] = True
+
+            size = int(raw_component_mask.sum())
 
             if size < self.virtual_min_component_size:
                 continue
@@ -193,11 +198,8 @@ class MultimodalDataset(Dataset):
                 continue
             if bbox_h > self.virtual_max_bbox_size or bbox_w > self.virtual_max_bbox_size:
                 continue
-            if fill_ratio < self.virtual_min_fill_ratio:
-                continue
 
-            for x, y in component["coords"]:
-                filtered[x, y] = True
+            filtered |= raw_component_mask
 
         return filtered
 
