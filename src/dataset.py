@@ -33,6 +33,10 @@ class MultimodalDataset(Dataset):
         lidar_motion_min_cells=2,
         lidar_motion_max_cells=48,
         lidar_motion_count_threshold=2.0,
+        lidar_virtual_density_kernel_radius=2,
+        lidar_virtual_component_expand=8,
+        lidar_virtual_density_percentile=75.0,
+        lidar_virtual_min_density=1.0,
     ):
         self.data_dir = data_root
         self.lidar_grid_size = int(lidar_grid_size)
@@ -51,6 +55,10 @@ class MultimodalDataset(Dataset):
         self.lidar_motion_min_cells = int(lidar_motion_min_cells)
         self.lidar_motion_max_cells = int(lidar_motion_max_cells)
         self.lidar_motion_count_threshold = float(lidar_motion_count_threshold)
+        self.lidar_virtual_density_kernel_radius = int(lidar_virtual_density_kernel_radius)
+        self.lidar_virtual_component_expand = int(lidar_virtual_component_expand)
+        self.lidar_virtual_density_percentile = float(lidar_virtual_density_percentile)
+        self.lidar_virtual_min_density = float(lidar_virtual_min_density)
 
         if csv_path is None:
             csv_path = os.path.join(split_root, f"{scenario_name}_{mode}.csv")
@@ -251,6 +259,57 @@ class MultimodalDataset(Dataset):
         np.add.at(count_map, (x_idx, y_idx), 1.0)
         return count_map
 
+    def _smooth_count_map(self, count_map, radius):
+        if radius <= 0:
+            return count_map.astype(np.float32)
+
+        radius = int(radius)
+        offsets = range(-radius, radius + 1)
+        kernel_1d = np.array(
+            [np.exp(-(offset * offset) / max(radius, 1)) for offset in offsets],
+            dtype=np.float32,
+        )
+        kernel_1d /= np.sum(kernel_1d)
+
+        padded = np.pad(count_map.astype(np.float32), ((radius, radius), (0, 0)), mode="constant")
+        tmp = np.zeros_like(count_map, dtype=np.float32)
+        for idx, weight in enumerate(kernel_1d):
+            tmp += weight * padded[idx : idx + count_map.shape[0], :]
+
+        padded = np.pad(tmp, ((0, 0), (radius, radius)), mode="constant")
+        out = np.zeros_like(count_map, dtype=np.float32)
+        for idx, weight in enumerate(kernel_1d):
+            out += weight * padded[:, idx : idx + count_map.shape[1]]
+        return out
+
+    def _component_local_virtual_mask(self, raw_motion, density_map):
+        if not np.any(raw_motion):
+            return np.zeros_like(raw_motion, dtype=bool)
+
+        virtual_mask = np.zeros_like(raw_motion, dtype=bool)
+        seed_components = self._connected_components(raw_motion)
+
+        for component in seed_components:
+            component_mask = np.zeros_like(raw_motion, dtype=bool)
+            for x, y in component["coords"]:
+                component_mask[x, y] = True
+
+            expanded_region = self._binary_dilate(component_mask, self.lidar_virtual_component_expand)
+            local_density = density_map[expanded_region]
+            local_density = local_density[local_density > 0]
+            if len(local_density) == 0:
+                continue
+
+            threshold = max(
+                self.lidar_virtual_min_density,
+                float(np.percentile(local_density, self.lidar_virtual_density_percentile)),
+            )
+            local_virtual = expanded_region & (density_map >= threshold)
+            local_virtual = self._binary_dilate(local_virtual, self.lidar_virtual_expand)
+            virtual_mask |= local_virtual
+
+        return virtual_mask
+
     def _upsample_mask(self, coarse_mask, target_size):
         coarse_h, coarse_w = coarse_mask.shape
         scale_h = max(1, target_size // coarse_h)
@@ -290,12 +349,15 @@ class MultimodalDataset(Dataset):
         region_mask = self._binary_dilate(raw_motion, self.lidar_motion_region_expand)
 
         base_mask = base_bev > 0.5
+        highres_count = self._points_to_count_map(current_points, self.lidar_grid_size)
+        highres_density = self._smooth_count_map(highres_count, self.lidar_virtual_density_kernel_radius)
         motion_seed = self._binary_dilate(raw_motion, self.lidar_virtual_seed_expand)
-        virtual_seed = base_mask & motion_seed
-        virtual_mask = self._binary_dilate(virtual_seed, self.lidar_virtual_expand)
+        local_motion = motion_seed & region_mask
+        virtual_mask = self._component_local_virtual_mask(local_motion, highres_density)
 
-        # Keep only the enhancement structure, not the whole base map.
-        virtual_only = virtual_mask & (~base_mask)
+        # Keep virtual points independent from the base occupancy so the debug
+        # layer reflects motion-focused enhancement rather than copied edges.
+        virtual_only = virtual_mask
         combined = np.maximum(base_mask.astype(np.float32), virtual_mask.astype(np.float32))
 
         return {
