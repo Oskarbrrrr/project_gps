@@ -31,6 +31,7 @@ class MultimodalDataset(Dataset):
         virtual_max_component_size=256,
         virtual_max_bbox_size=32,
         virtual_dilation_radius=1,
+        virtual_point_distance_threshold=0.35,
     ):
         self.data_dir = data_root
         self.lidar_grid_size = int(lidar_grid_size)
@@ -46,6 +47,7 @@ class MultimodalDataset(Dataset):
         self.virtual_max_component_size = int(virtual_max_component_size)
         self.virtual_max_bbox_size = int(virtual_max_bbox_size)
         self.virtual_dilation_radius = int(virtual_dilation_radius)
+        self.virtual_point_distance_threshold = float(virtual_point_distance_threshold)
 
         if csv_path is None:
             csv_path = os.path.join(split_root, f"{scenario_name}_{mode}.csv")
@@ -203,23 +205,20 @@ class MultimodalDataset(Dataset):
 
         return filtered
 
-    def _ply_to_base_bev(self, rel_path):
-        grid_size = self.lidar_grid_size
-        bev = np.zeros((grid_size, grid_size), dtype=np.float32)
+    def _read_lidar_xy(self, rel_path):
         try:
             full_path = os.path.join(self.data_dir, rel_path)
             if not os.path.exists(full_path):
-                return bev
+                return np.zeros((0, 2), dtype=np.float32)
 
             pcd = o3d.io.read_point_cloud(full_path)
             points = np.asarray(pcd.points)
             if len(points) == 0:
-                return bev
+                return np.zeros((0, 2), dtype=np.float32)
 
             x, y = points[:, 0], points[:, 1]
             x_min, x_max = self.lidar_x_range
             y_min, y_max = self.lidar_y_range
-
             mask = (
                 (x >= x_min)
                 & (x <= x_max)
@@ -227,10 +226,22 @@ class MultimodalDataset(Dataset):
                 & (y <= y_max)
             )
             if not np.any(mask):
+                return np.zeros((0, 2), dtype=np.float32)
+
+            return np.stack([x[mask], y[mask]], axis=1).astype(np.float32)
+        except Exception:
+            return np.zeros((0, 2), dtype=np.float32)
+
+    def _points_to_bev(self, points):
+        grid_size = self.lidar_grid_size
+        bev = np.zeros((grid_size, grid_size), dtype=np.float32)
+        try:
+            if points is None or len(points) == 0:
                 return bev
 
-            x = x[mask]
-            y = y[mask]
+            x, y = points[:, 0], points[:, 1]
+            x_min, x_max = self.lidar_x_range
+            y_min, y_max = self.lidar_y_range
             x_idx = (
                 (x - x_min) / (x_max - x_min + 1e-6) * (grid_size - 1)
             ).astype(np.int32)
@@ -241,6 +252,23 @@ class MultimodalDataset(Dataset):
         except Exception:
             pass
         return self._apply_bev_orientation(bev)
+
+    def _ply_to_base_bev(self, rel_path):
+        return self._points_to_bev(self._read_lidar_xy(rel_path))
+
+    def _extract_motion_points(self, current_points, prev_points):
+        if len(current_points) == 0:
+            return np.zeros((0, 2), dtype=np.float32)
+        if len(prev_points) == 0:
+            return current_points.copy()
+
+        current_xy = current_points[:, None, :]
+        prev_xy = prev_points[None, :, :]
+        diff = current_xy - prev_xy
+        dist2 = np.sum(diff * diff, axis=2)
+        min_dist2 = np.min(dist2, axis=1)
+        keep = min_dist2 > (self.virtual_point_distance_threshold ** 2)
+        return current_points[keep]
 
     def _generate_virtual_points(self, current_bev, prev_bev):
         current_mask = current_bev > 0.5
@@ -259,6 +287,17 @@ class MultimodalDataset(Dataset):
 
         return np.maximum(current_mask.astype(np.float32), virtual_mask.astype(np.float32))
 
+    def _generate_virtual_points_from_point_clouds(self, current_points, prev_points):
+        motion_points = self._extract_motion_points(current_points, prev_points)
+        candidate_motion = self._points_to_bev(motion_points) > 0.5
+
+        filtered_motion = self._filter_motion_components(candidate_motion)
+        if not np.any(filtered_motion):
+            filtered_motion = candidate_motion
+
+        virtual_mask = self._binary_dilate(filtered_motion, self.virtual_dilation_radius)
+        return virtual_mask.astype(np.float32)
+
     def _resize_tensor(self, tensor, size=(256, 256)):
         return F.interpolate(
             tensor.unsqueeze(0),
@@ -272,13 +311,14 @@ class MultimodalDataset(Dataset):
         base_bevs = []
         virtual_bevs = []
         combined_bevs = []
-        prev_base_bev = None
+        prev_points = None
 
         for t in range(1, 6):
-            base_bev = self._ply_to_base_bev(row[f"unit1_lidar_{t}"])
-            if self.use_virtual_points and prev_base_bev is not None:
-                combined_bev = self._generate_virtual_points(base_bev.copy(), prev_base_bev)
-                virtual_bev = np.clip(combined_bev - base_bev, 0.0, 1.0)
+            current_points = self._read_lidar_xy(row[f"unit1_lidar_{t}"])
+            base_bev = self._points_to_bev(current_points)
+            if self.use_virtual_points and prev_points is not None:
+                virtual_bev = self._generate_virtual_points_from_point_clouds(current_points, prev_points)
+                combined_bev = np.maximum(base_bev, virtual_bev)
             else:
                 combined_bev = base_bev.copy()
                 virtual_bev = np.zeros_like(base_bev)
@@ -286,7 +326,7 @@ class MultimodalDataset(Dataset):
             base_bevs.append(base_bev)
             virtual_bevs.append(virtual_bev)
             combined_bevs.append(combined_bev)
-            prev_base_bev = base_bev.copy()
+            prev_points = current_points.copy()
 
         return {
             "base": np.stack(base_bevs),
@@ -300,7 +340,7 @@ class MultimodalDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         imgs, radars, lidars = [], [], []
-        prev_bev = None
+        prev_points = None
 
         for t in range(1, 6):
             img_path = os.path.join(self.data_dir, row[f"unit1_rgb_{t}"])
@@ -325,11 +365,15 @@ class MultimodalDataset(Dataset):
                 radar_tensor = torch.zeros((2, 256, 256), dtype=torch.float32)
             radars.append(self._resize_tensor(radar_tensor))
 
-            current_bev = self._ply_to_base_bev(row[f"unit1_lidar_{t}"])
-            if self.use_virtual_points and prev_bev is not None:
-                current_bev = self._generate_virtual_points(current_bev, prev_bev)
-            prev_bev = current_bev.copy()
-            lidars.append(self._resize_tensor(torch.tensor(current_bev).unsqueeze(0)))
+            current_points = self._read_lidar_xy(row[f"unit1_lidar_{t}"])
+            base_bev = self._points_to_bev(current_points)
+            if self.use_virtual_points and prev_points is not None:
+                virtual_bev = self._generate_virtual_points_from_point_clouds(current_points, prev_points)
+                combined_bev = np.maximum(base_bev, virtual_bev)
+            else:
+                combined_bev = base_bev.copy()
+            prev_points = current_points.copy()
+            lidars.append(self._resize_tensor(torch.tensor(combined_bev).unsqueeze(0)))
 
         bs_lat, bs_lon = self._read_gps_raw(row["unit1_loc"])
         u1_lat, u1_lon = self._read_gps_raw(row["unit2_loc_1"])
