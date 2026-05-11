@@ -22,12 +22,18 @@ class MultimodalDataset(Dataset):
         lidar_x_range=(-30.0, 30.0),
         lidar_y_range=(-30.0, 30.0),
         use_virtual_points=True,
+        lidar_swap_xy=False,
+        lidar_flip_x=False,
+        lidar_flip_y=False,
     ):
         self.data_dir = data_root
         self.lidar_grid_size = int(lidar_grid_size)
         self.lidar_x_range = tuple(lidar_x_range)
         self.lidar_y_range = tuple(lidar_y_range)
         self.use_virtual_points = use_virtual_points
+        self.lidar_swap_xy = lidar_swap_xy
+        self.lidar_flip_x = lidar_flip_x
+        self.lidar_flip_y = lidar_flip_y
 
         if csv_path is None:
             csv_path = os.path.join(split_root, f"{scenario_name}_{mode}.csv")
@@ -86,6 +92,15 @@ class MultimodalDataset(Dataset):
         except Exception:
             return [0.0] * 64
 
+    def _apply_bev_orientation(self, bev):
+        if self.lidar_swap_xy:
+            bev = bev.T
+        if self.lidar_flip_x:
+            bev = np.flip(bev, axis=0)
+        if self.lidar_flip_y:
+            bev = np.flip(bev, axis=1)
+        return np.ascontiguousarray(bev)
+
     def _ply_to_base_bev(self, rel_path):
         grid_size = self.lidar_grid_size
         bev = np.zeros((grid_size, grid_size), dtype=np.float32)
@@ -123,7 +138,7 @@ class MultimodalDataset(Dataset):
             bev[x_idx, y_idx] = 1.0
         except Exception:
             pass
-        return bev
+        return self._apply_bev_orientation(bev)
 
     def _generate_virtual_points(self, current_bev, prev_bev):
         diff = current_bev - prev_bev
@@ -146,6 +161,33 @@ class MultimodalDataset(Dataset):
             mode="bilinear",
             align_corners=False,
         ).squeeze(0)
+
+    def get_lidar_debug_sequence(self, idx):
+        row = self.df.iloc[idx]
+        base_bevs = []
+        virtual_bevs = []
+        combined_bevs = []
+        prev_base_bev = None
+
+        for t in range(1, 6):
+            base_bev = self._ply_to_base_bev(row[f"unit1_lidar_{t}"])
+            if self.use_virtual_points and prev_base_bev is not None:
+                combined_bev = self._generate_virtual_points(base_bev.copy(), prev_base_bev)
+                virtual_bev = np.clip(combined_bev - base_bev, 0.0, 1.0)
+            else:
+                combined_bev = base_bev.copy()
+                virtual_bev = np.zeros_like(base_bev)
+
+            base_bevs.append(base_bev)
+            virtual_bevs.append(virtual_bev)
+            combined_bevs.append(combined_bev)
+            prev_base_bev = base_bev.copy()
+
+        return {
+            "base": np.stack(base_bevs),
+            "virtual": np.stack(virtual_bevs),
+            "combined": np.stack(combined_bevs),
+        }
 
     def __len__(self):
         return len(self.df)
