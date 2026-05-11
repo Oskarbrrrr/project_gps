@@ -34,8 +34,8 @@ class MultimodalDataset(Dataset):
         lidar_motion_max_cells=48,
         lidar_motion_count_threshold=2.0,
         lidar_virtual_density_kernel_radius=2,
-        lidar_virtual_component_expand=8,
-        lidar_virtual_density_percentile=75.0,
+        lidar_virtual_component_expand=5,
+        lidar_virtual_density_percentile=88.0,
         lidar_virtual_min_density=1.0,
     ):
         self.data_dir = data_root
