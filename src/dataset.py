@@ -31,6 +31,7 @@ class MultimodalDataset(Dataset):
         lidar_virtual_expand=2,
         lidar_motion_min_cells=2,
         lidar_motion_max_cells=48,
+        lidar_motion_count_threshold=2.0,
     ):
         self.data_dir = data_root
         self.lidar_grid_size = int(lidar_grid_size)
@@ -47,6 +48,7 @@ class MultimodalDataset(Dataset):
         self.lidar_virtual_expand = int(lidar_virtual_expand)
         self.lidar_motion_min_cells = int(lidar_motion_min_cells)
         self.lidar_motion_max_cells = int(lidar_motion_max_cells)
+        self.lidar_motion_count_threshold = float(lidar_motion_count_threshold)
 
         if csv_path is None:
             csv_path = os.path.join(split_root, f"{scenario_name}_{mode}.csv")
@@ -234,6 +236,19 @@ class MultimodalDataset(Dataset):
             return self._apply_bev_orientation(bev)
         return bev
 
+    def _points_to_count_map(self, points, grid_size):
+        count_map = np.zeros((grid_size, grid_size), dtype=np.float32)
+        if points is None or len(points) == 0:
+            return count_map
+
+        x, y = points[:, 0], points[:, 1]
+        x_min, x_max = self.lidar_x_range
+        y_min, y_max = self.lidar_y_range
+        x_idx = ((x - x_min) / (x_max - x_min + 1e-6) * (grid_size - 1)).astype(np.int32)
+        y_idx = ((y - y_min) / (y_max - y_min + 1e-6) * (grid_size - 1)).astype(np.int32)
+        np.add.at(count_map, (x_idx, y_idx), 1.0)
+        return count_map
+
     def _upsample_mask(self, coarse_mask, target_size):
         coarse_h, coarse_w = coarse_mask.shape
         scale_h = max(1, target_size // coarse_h)
@@ -246,18 +261,26 @@ class MultimodalDataset(Dataset):
 
         if (not self.use_virtual_points) or prev_points is None or len(prev_points) == 0:
             zeros = np.zeros_like(base_bev, dtype=np.float32)
+            zeros_coarse = np.zeros((self.lidar_motion_grid_size, self.lidar_motion_grid_size), dtype=np.float32)
             return {
                 "base": base_bev,
+                "coarse_current": zeros_coarse,
+                "coarse_prev": zeros_coarse,
+                "coarse_diff": zeros_coarse,
                 "raw_motion": zeros,
                 "region_mask": zeros,
                 "virtual": zeros,
                 "combined": base_bev.copy(),
             }
 
-        current_coarse = self._points_to_bev(current_points, self.lidar_motion_grid_size) > 0.5
-        prev_coarse = self._points_to_bev(prev_points, self.lidar_motion_grid_size) > 0.5
-        prev_coarse_dilated = self._binary_dilate(prev_coarse, self.lidar_motion_history_dilation)
-        raw_motion_coarse = current_coarse & (~prev_coarse_dilated)
+        current_count = self._points_to_count_map(current_points, self.lidar_motion_grid_size)
+        prev_count = self._points_to_count_map(prev_points, self.lidar_motion_grid_size)
+        prev_support = self._binary_dilate(prev_count > 0, self.lidar_motion_history_dilation)
+        count_diff = current_count - prev_count
+        raw_motion_coarse = count_diff >= self.lidar_motion_count_threshold
+        raw_motion_coarse = raw_motion_coarse & (current_count > 0)
+        raw_motion_coarse = raw_motion_coarse | ((count_diff > 0) & (~prev_support))
+
         filtered_motion_coarse = self._filter_motion_coarse(raw_motion_coarse)
         motion_coarse = filtered_motion_coarse if np.any(filtered_motion_coarse) else raw_motion_coarse
 
@@ -274,6 +297,9 @@ class MultimodalDataset(Dataset):
 
         return {
             "base": base_bev.astype(np.float32),
+            "coarse_current": current_count.astype(np.float32),
+            "coarse_prev": prev_count.astype(np.float32),
+            "coarse_diff": np.clip(count_diff, a_min=0.0, a_max=None).astype(np.float32),
             "raw_motion": raw_motion.astype(np.float32),
             "region_mask": region_mask.astype(np.float32),
             "virtual": virtual_only.astype(np.float32),
@@ -292,6 +318,9 @@ class MultimodalDataset(Dataset):
         row = self.df.iloc[idx]
         debug = {
             "base": [],
+            "coarse_current": [],
+            "coarse_prev": [],
+            "coarse_diff": [],
             "raw_motion": [],
             "region_mask": [],
             "virtual": [],

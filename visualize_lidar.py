@@ -83,13 +83,16 @@ def visualize_debug_layers(
 
     names = [
         ("base", "Base BEV"),
+        ("coarse_current", "Coarse Current Count"),
+        ("coarse_prev", "Coarse Prev Count"),
+        ("coarse_diff", "Coarse Positive Diff"),
         ("raw_motion", "Raw Motion Cue"),
         ("region_mask", "Region Mask"),
         ("virtual", "Virtual Points"),
         ("combined", "Combined BEV"),
     ]
 
-    fig, axes = plt.subplots(len(names), 1, figsize=(5, 18))
+    fig, axes = plt.subplots(len(names), 1, figsize=(5, 28))
     fig.suptitle(
         f"LiDAR debug layers: {scenario_name} {mode} sample={sample_idx} frame={frame_idx + 1} target={int(target)}",
         fontsize=16,
