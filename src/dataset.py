@@ -27,8 +27,9 @@ class MultimodalDataset(Dataset):
         lidar_flip_y=False,
         lidar_motion_grid_size=64,
         lidar_motion_history_dilation=1,
-        lidar_motion_region_expand=6,
-        lidar_virtual_expand=2,
+        lidar_motion_region_expand=2,
+        lidar_virtual_seed_expand=1,
+        lidar_virtual_expand=1,
         lidar_motion_min_cells=2,
         lidar_motion_max_cells=48,
         lidar_motion_count_threshold=2.0,
@@ -45,6 +46,7 @@ class MultimodalDataset(Dataset):
         self.lidar_motion_grid_size = int(lidar_motion_grid_size)
         self.lidar_motion_history_dilation = int(lidar_motion_history_dilation)
         self.lidar_motion_region_expand = int(lidar_motion_region_expand)
+        self.lidar_virtual_seed_expand = int(lidar_virtual_seed_expand)
         self.lidar_virtual_expand = int(lidar_virtual_expand)
         self.lidar_motion_min_cells = int(lidar_motion_min_cells)
         self.lidar_motion_max_cells = int(lidar_motion_max_cells)
@@ -288,7 +290,8 @@ class MultimodalDataset(Dataset):
         region_mask = self._binary_dilate(raw_motion, self.lidar_motion_region_expand)
 
         base_mask = base_bev > 0.5
-        virtual_seed = base_mask & region_mask
+        motion_seed = self._binary_dilate(raw_motion, self.lidar_virtual_seed_expand)
+        virtual_seed = base_mask & motion_seed
         virtual_mask = self._binary_dilate(virtual_seed, self.lidar_virtual_expand)
 
         # Keep only the enhancement structure, not the whole base map.
