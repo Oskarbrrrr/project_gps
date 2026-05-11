@@ -25,6 +25,12 @@ class MultimodalDataset(Dataset):
         lidar_swap_xy=False,
         lidar_flip_x=False,
         lidar_flip_y=False,
+        virtual_temporal_tolerance=2,
+        virtual_min_component_size=4,
+        virtual_max_component_size=256,
+        virtual_min_fill_ratio=0.08,
+        virtual_max_bbox_size=24,
+        virtual_dilation_radius=1,
     ):
         self.data_dir = data_root
         self.lidar_grid_size = int(lidar_grid_size)
@@ -34,6 +40,12 @@ class MultimodalDataset(Dataset):
         self.lidar_swap_xy = lidar_swap_xy
         self.lidar_flip_x = lidar_flip_x
         self.lidar_flip_y = lidar_flip_y
+        self.virtual_temporal_tolerance = int(virtual_temporal_tolerance)
+        self.virtual_min_component_size = int(virtual_min_component_size)
+        self.virtual_max_component_size = int(virtual_max_component_size)
+        self.virtual_min_fill_ratio = float(virtual_min_fill_ratio)
+        self.virtual_max_bbox_size = int(virtual_max_bbox_size)
+        self.virtual_dilation_radius = int(virtual_dilation_radius)
 
         if csv_path is None:
             csv_path = os.path.join(split_root, f"{scenario_name}_{mode}.csv")
@@ -101,6 +113,94 @@ class MultimodalDataset(Dataset):
             bev = np.flip(bev, axis=1)
         return np.ascontiguousarray(bev)
 
+    def _binary_dilate(self, bev, radius):
+        if radius <= 0:
+            return bev.astype(bool)
+
+        bev = bev.astype(bool)
+        dilated = np.zeros_like(bev, dtype=bool)
+        h, w = bev.shape
+        for dx in range(-radius, radius + 1):
+            x_src_start = max(0, -dx)
+            x_src_end = min(h, h - dx)
+            x_dst_start = max(0, dx)
+            x_dst_end = min(h, h + dx)
+            for dy in range(-radius, radius + 1):
+                y_src_start = max(0, -dy)
+                y_src_end = min(w, w - dy)
+                y_dst_start = max(0, dy)
+                y_dst_end = min(w, w + dy)
+                dilated[x_dst_start:x_dst_end, y_dst_start:y_dst_end] |= bev[
+                    x_src_start:x_src_end, y_src_start:y_src_end
+                ]
+        return dilated
+
+    def _connected_components(self, bev):
+        bev = bev.astype(bool)
+        visited = np.zeros_like(bev, dtype=bool)
+        h, w = bev.shape
+        components = []
+
+        for x in range(h):
+            for y in range(w):
+                if not bev[x, y] or visited[x, y]:
+                    continue
+
+                stack = [(x, y)]
+                visited[x, y] = True
+                coords = []
+                min_x = max_x = x
+                min_y = max_y = y
+
+                while stack:
+                    cx, cy = stack.pop()
+                    coords.append((cx, cy))
+                    min_x = min(min_x, cx)
+                    max_x = max(max_x, cx)
+                    min_y = min(min_y, cy)
+                    max_y = max(max_y, cy)
+
+                    for nx in range(max(0, cx - 1), min(h, cx + 2)):
+                        for ny in range(max(0, cy - 1), min(w, cy + 2)):
+                            if bev[nx, ny] and not visited[nx, ny]:
+                                visited[nx, ny] = True
+                                stack.append((nx, ny))
+
+                components.append(
+                    {
+                        "coords": coords,
+                        "size": len(coords),
+                        "bbox": (min_x, max_x, min_y, max_y),
+                    }
+                )
+
+        return components
+
+    def _filter_motion_components(self, candidate_mask):
+        filtered = np.zeros_like(candidate_mask, dtype=bool)
+
+        for component in self._connected_components(candidate_mask):
+            size = component["size"]
+            min_x, max_x, min_y, max_y = component["bbox"]
+            bbox_h = max_x - min_x + 1
+            bbox_w = max_y - min_y + 1
+            bbox_area = bbox_h * bbox_w
+            fill_ratio = size / max(bbox_area, 1)
+
+            if size < self.virtual_min_component_size:
+                continue
+            if size > self.virtual_max_component_size:
+                continue
+            if bbox_h > self.virtual_max_bbox_size or bbox_w > self.virtual_max_bbox_size:
+                continue
+            if fill_ratio < self.virtual_min_fill_ratio:
+                continue
+
+            for x, y in component["coords"]:
+                filtered[x, y] = True
+
+        return filtered
+
     def _ply_to_base_bev(self, rel_path):
         grid_size = self.lidar_grid_size
         bev = np.zeros((grid_size, grid_size), dtype=np.float32)
@@ -141,18 +241,18 @@ class MultimodalDataset(Dataset):
         return self._apply_bev_orientation(bev)
 
     def _generate_virtual_points(self, current_bev, prev_bev):
-        diff = current_bev - prev_bev
-        moving_points = np.where(diff > 0.5)
+        current_mask = current_bev > 0.5
+        prev_mask = prev_bev > 0.5
 
-        if len(moving_points[0]) > 0:
-            for _ in range(3):
-                offset_x = np.random.randint(-2, 3, size=len(moving_points[0]))
-                offset_y = np.random.randint(-2, 3, size=len(moving_points[1]))
-                virtual_x = np.clip(moving_points[0] + offset_x, 0, current_bev.shape[0] - 1)
-                virtual_y = np.clip(moving_points[1] + offset_y, 0, current_bev.shape[1] - 1)
-                current_bev[virtual_x, virtual_y] = 1.0
+        # Suppress pseudo-motion caused by rasterization jitter on static structures.
+        prev_tolerated = self._binary_dilate(prev_mask, self.virtual_temporal_tolerance)
+        candidate_motion = current_mask & (~prev_tolerated)
 
-        return current_bev
+        # Keep only compact local regions that look more like moving targets.
+        filtered_motion = self._filter_motion_components(candidate_motion)
+        virtual_mask = self._binary_dilate(filtered_motion, self.virtual_dilation_radius)
+
+        return np.maximum(current_mask.astype(np.float32), virtual_mask.astype(np.float32))
 
     def _resize_tensor(self, tensor, size=(256, 256)):
         return F.interpolate(
