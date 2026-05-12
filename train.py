@@ -3,7 +3,6 @@ import csv
 import datetime
 import os
 import random
-import tempfile
 import time
 from dataclasses import asdict, dataclass
 from typing import Dict, Tuple
@@ -113,6 +112,9 @@ def build_dataloader(dataset: MultimodalDataset, config: TrainConfig, shuffle: b
 
 
 def build_scheduler(optimizer: torch.optim.Optimizer, config: TrainConfig):
+    if config.epochs <= 1:
+        return None
+
     if config.warmup_epochs <= 0:
         return CosineAnnealingLR(
             optimizer,
@@ -235,6 +237,7 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
     os.makedirs(checkpoints_dir, exist_ok=True)
 
     train_csv_path = build_combined_train_csv(train_config.split_root, scenario_name, run_dir)
+    val_csv_path = os.path.join(train_config.split_root, f"{scenario_name}_val.csv")
     test_csv_path = os.path.join(train_config.split_root, f"{scenario_name}_test.csv")
     alpha_weights = None
     if train_config.use_alpha_loss:
@@ -246,6 +249,12 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
         scenario_name=scenario_name,
         csv_path=train_csv_path,
     )
+    val_ds = MultimodalDataset(
+        data_root=train_config.data_root,
+        split_root=train_config.split_root,
+        scenario_name=scenario_name,
+        csv_path=val_csv_path,
+    )
     test_ds = MultimodalDataset(
         data_root=train_config.data_root,
         split_root=train_config.split_root,
@@ -254,6 +263,7 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
     )
 
     train_loader = build_dataloader(train_ds, train_config, shuffle=True)
+    val_loader = build_dataloader(val_ds, train_config, shuffle=False)
     test_loader = build_dataloader(test_ds, train_config, shuffle=False)
 
     model = BeMambaModel(model_config).to(device)
@@ -278,17 +288,18 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
                 "train_acc1",
                 "train_acc2",
                 "train_acc3",
-                "test_loss",
-                "test_acc1",
-                "test_acc2",
-                "test_acc3",
-                "test_dba",
-                "test_apl",
+                "val_loss",
+                "val_acc1",
+                "val_acc2",
+                "val_acc3",
+                "val_dba",
+                "val_apl",
             ]
         )
 
     best_val_loss = float("inf")
     best_epoch = -1
+    early_stop_counter = 0
     start_time = time.time()
 
     for epoch in range(1, train_config.epochs + 1):
@@ -302,9 +313,9 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
             amp_enabled=(train_config.amp and device.type == "cuda"),
             grad_clip_norm=train_config.grad_clip_norm,
         )
-        test_metrics = run_epoch(
+        val_metrics = run_epoch(
             model=model,
-            loader=test_loader,
+            loader=val_loader,
             criterion=criterion,
             optimizer=None,
             scaler=None,
@@ -312,7 +323,8 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
             amp_enabled=(train_config.amp and device.type == "cuda"),
             grad_clip_norm=train_config.grad_clip_norm,
         )
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
 
         elapsed = time.time() - start_time
         avg_epoch_time = elapsed / epoch
@@ -326,10 +338,10 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
                 f"| lr={current_lr:.2e} "
                 f"| train_loss={train_metrics['loss']:.4f} "
                 f"| train_acc3={train_metrics['acc3']:.2f}% "
-                f"| test_loss={test_metrics['loss']:.4f} "
-                f"| test_acc3={test_metrics['acc3']:.2f}% "
-                f"| test_dba={test_metrics['dba']:.4f} "
-                f"| test_apl={test_metrics['apl']:.4f} dB "
+                f"| val_loss={val_metrics['loss']:.4f} "
+                f"| val_acc3={val_metrics['acc3']:.2f}% "
+                f"| val_dba={val_metrics['dba']:.4f} "
+                f"| val_apl={val_metrics['apl']:.4f} dB "
                 f"| ETA {eta_string}"
             )
 
@@ -343,20 +355,28 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
                     f"{train_metrics['acc1']:.4f}",
                     f"{train_metrics['acc2']:.4f}",
                     f"{train_metrics['acc3']:.4f}",
-                    f"{test_metrics['loss']:.6f}",
-                    f"{test_metrics['acc1']:.4f}",
-                    f"{test_metrics['acc2']:.4f}",
-                    f"{test_metrics['acc3']:.4f}",
-                    f"{test_metrics['dba']:.6f}",
-                    f"{test_metrics['apl']:.6f}",
+                    f"{val_metrics['loss']:.6f}",
+                    f"{val_metrics['acc1']:.4f}",
+                    f"{val_metrics['acc2']:.4f}",
+                    f"{val_metrics['acc3']:.4f}",
+                    f"{val_metrics['dba']:.6f}",
+                    f"{val_metrics['apl']:.6f}",
                 ]
             )
 
-        if test_metrics["loss"] < best_val_loss:
-            best_val_loss = test_metrics["loss"]
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
             best_epoch = epoch
             torch.save(model.state_dict(), os.path.join(checkpoints_dir, "best_model.pth"))
             print(f"  -> saved best checkpoint at epoch {epoch} (val_loss={best_val_loss:.4f})")
+            early_stop_counter = 0
+        else:
+            early_stop_counter += 1
+            if train_config.patience > 0:
+                print(f"  -> early-stop counter {early_stop_counter}/{train_config.patience}")
+                if early_stop_counter >= train_config.patience:
+                    print(f"Stopping early at epoch {epoch}.")
+                    break
 
         if train_config.save_every_epoch:
             torch.save(model.state_dict(), os.path.join(checkpoints_dir, f"epoch_{epoch:03d}.pth"))
