@@ -1,14 +1,18 @@
 # AGENTS
 
-## Project scope
+## 1. 项目定位
 
-This repository is a local reproduction workspace for:
+这是一个用于复现论文 `BeMamba: Efficient Multimodal Sensing-Aided Beamforming via State Space Model` 的本地代码仓库。
 
-- `BeMamba: Efficient Multimodal Sensing-Aided Beamforming via State Space Model`
+这个仓库通常只保存代码，不包含：
 
-The repo usually contains code only. Datasets, checkpoints, and experiment logs live on AutoDL unless explicitly copied back.
+- 数据集本体
+- 训练生成的 checkpoint
+- AutoDL 上的大量日志与实验产物
 
-Core files:
+这些内容默认都在 AutoDL 上。
+
+当前最重要的代码文件：
 
 - [train.py](/D:/code/project_gps/train.py)
 - [src/dataset.py](/D:/code/project_gps/src/dataset.py)
@@ -17,130 +21,216 @@ Core files:
 - [visualize_lidar.py](/D:/code/project_gps/visualize_lidar.py)
 - [AUTODL_WORKFLOW.md](/D:/code/project_gps/AUTODL_WORKFLOW.md)
 
-## Current architecture
+## 2. 当前代码状态
 
-### Data
+### 2.1 数据输入
 
-`MultimodalDataset` returns:
+`MultimodalDataset` 当前返回：
 
 - `imgs`: `[5, 3, 256, 256]`
 - `radars`: `[5, 2, 256, 256]`
 - `lidars`: `[5, 1, 256, 256]`
 - `gps`: `[2, 2]`
-- `target`: scalar beam index in `[0, 63]`
+- `target`: 单个 beam 类别，范围 `[0, 63]`
 - `power_vec`: `[64]`
 
-### LiDAR
+也就是说，每个样本包含：
 
-LiDAR preprocessing is no longer the original random virtual-point heuristic.
+- 5 帧图像
+- 5 帧雷达
+- 5 帧 LiDAR
+- 起点/终点 GPS
 
-Current implementation:
+### 2.2 LiDAR 预处理
 
-1. Fixed-range BEV projection in `[-30 m, 30 m] x [-30 m, 30 m]`
-2. Coarse motion cue from frame-to-frame point-count difference
-3. Region filtering on coarse connected components
-4. High-resolution local density enhancement for virtual points
-5. Final LiDAR input is `max(base_bev, virtual_points)`
+LiDAR 已经不是最早那种随机撒点版了，目前是“质量优先”的近似复现实现。
 
-Important note:
+当前流程：
 
-- This is a quality-oriented approximation of the paper behavior, not a guaranteed line-by-line reconstruction of the original unpublished preprocessing code.
+1. 把点云投影到固定范围的 BEV：
+   - `x ∈ [-30m, 30m]`
+   - `y ∈ [-30m, 30m]`
+2. 用前后帧的低分辨率点数图做 motion cue
+3. 过滤掉不合理的小块或大块运动区域
+4. 在高分辨率密度图上做局部增强，生成 virtual points
+5. 最终 LiDAR 输入为：
+   - `combined = max(base_bev, virtual_points)`
 
-### Model
+要注意：
 
-`src/model.py` now follows a clearer two-stage structure:
+- 这版 LiDAR 预处理已经比较接近论文风格
+- 但它仍然是“高质量近似实现”
+- 不能声称它一定和论文作者的原始未公开代码逐行一致
 
-1. Per-modality CNN encoder
-2. Per-modality temporal Mamba stack
-3. GPS start/end token projection
-4. Multi-order modal fusion with bidirectional Mamba stacks
-5. Mean pooling + classification head
+### 2.3 模型结构
 
-Main configuration lives in `BeMambaConfig`.
+`src/model.py` 现在已经重构成更清楚的 BeMamba 复现风格。
 
-Key design choices:
+当前模型主线：
 
-- image branch: `ResNet34`
-- radar branch: `ResNet18` with 2-channel stem
-- lidar branch: `ResNet18` with 1-channel stem
-- pooled spatial token grid: configurable, default `6 x 6`
-- temporal modeling: patch-wise across 5 frames
-- modal fusion: three orderings, averaged after fusion
+1. 每个模态先用 CNN backbone 做编码
+2. 每个模态再做时序 Mamba 建模
+3. GPS 起点/终点投影成 token
+4. 用三种模态顺序做跨模态融合
+5. 每种顺序各自走一套 bidirectional Mamba fusion
+6. 三路结果取平均，最后做分类
 
-### Training
+当前 backbone 设定：
 
-`train.py` is now a configurable experiment entrypoint.
+- Image: `ResNet34`
+- Radar: `ResNet18`，输入 2 通道
+- LiDAR: `ResNet18`，输入 1 通道
 
-Features:
+当前设计要点：
 
-- CLI arguments for scenarios, optimizer, scheduler, model width, and runtime options
-- fixed random seed
+- 先做模态内时序建模
+- 再做模态间序列融合
+- 空间特征先池化成固定 patch grid，默认 `6 x 6`
+
+### 2.4 训练入口
+
+`train.py` 已经从“写死流程”改成了配置化实验入口。
+
+当前具备：
+
+- 支持命令行参数
+- 支持指定单场景或多场景
+- 固定随机种子
 - `AdamW`
-- warmup + cosine scheduler
-- AMP support
+- warmup + cosine 学习率调度
+- AMP 混合精度
 - gradient clipping
-- scenario-specific output directories under `./outputs`
-- CSV logs and saved config snapshot per run
-- focal loss with optional adaptive alpha weights
+- early stopping
+- 每次实验保存独立输出目录
+- 保存日志和配置快照
 
-Example:
+示例：
 
 ```bash
-python train.py --scenarios scenario34 --batch-size 16 --epochs 80
+python train.py --scenarios scenario34 --epochs 80 --batch-size 8
 ```
 
-## Collaboration rules for this repo
+## 3. 当前哪些部分比较对齐，哪些仍然是近似
 
-### Local vs AutoDL
+### 3.1 相对已经比较对齐的部分
 
-Local workspace:
+- 多模态输入形式
+- 5 帧时序结构
+- Radar 双通道读法
+- LiDAR 固定范围 BEV + motion-focused enhancement
+- Mamba 用于时序和跨模态融合的总体思路
 
-- edit code
-- review diffs
-- maintain git history
-- inspect generated plots copied back from AutoDL
+### 3.2 还不能说完全对齐的部分
 
-AutoDL:
+- LiDAR virtual point generation 的精确细节
+- GPS 归一化是否与论文完全一致
+- 训练超参数是否与论文完全一致
+- 数据划分是否与论文官方 split 完全一致
 
-- stores datasets
-- runs training
-- produces checkpoints and logs
-- is the source of runtime validation
+所以当前仓库状态更适合叫：
 
-### Preferred workflow
+**“高质量复现版本”**
 
-1. Edit locally
-2. Commit locally
-3. Push to remote
-4. Pull on AutoDL
-5. Run experiment on AutoDL
-6. Bring back logs or plots for review
+而不是：
 
-Avoid mixing uncommitted manual edits on AutoDL with local git-driven changes. That caused version confusion already.
+**“论文原始实现逐行复刻版本”**
 
-## Current reconstruction status
+## 4. 本地与 AutoDL 的分工
 
-What is reasonably aligned:
+### 本地负责
 
-- multimodal input structure
-- 5-frame temporal setup
-- radar two-channel loading
-- fixed-range LiDAR BEV with motion-focused enhancement
-- Mamba-based temporal and cross-modal fusion idea
+- 阅读和修改代码
+- 做静态检查
+- 维护 git 历史
+- 看从 AutoDL 带回来的图和日志
 
-What is still approximate:
+### AutoDL 负责
 
-- exact LiDAR virtual point generation from the paper
-- exact GPS normalization strategy from the paper
-- exact training hyperparameters from the paper
-- exact split policy if the paper used a different official split
+- 挂载或存放数据集
+- 跑训练
+- 跑可视化
+- 保存 checkpoint
+- 保存实验日志
 
-## Practical reminders
+## 5. 推荐工作流
 
-- Use `visualize_lidar.py` first when LiDAR behavior looks suspicious.
-- If AutoDL git pull fails, check for local dirty files before debugging model behavior.
-- The latest meaningful training/model refactor happened on `2026-05-12` and introduced:
-  - the new `BeMambaConfig`
-  - the refactored `BeMambaModel`
-  - the configurable `train.py`
+每次尽量按这个闭环走：
+
+1. 在本地改代码
+2. 本地 `git commit`
+3. 本地 `git push`
+4. AutoDL 上同步代码
+5. AutoDL 上运行训练或可视化
+6. 把结果带回本地分析
+
+不推荐：
+
+- 本地改一部分，AutoDL 再手改一部分但不提交
+- AutoDL 上长期保留未提交改动
+- 不清楚当前结果到底是哪一版代码跑出来的
+
+前面已经出现过版本混乱，所以后续要尽量避免。
+
+## 6. 运行与排错提醒
+
+### 6.1 LiDAR 排查
+
+只要怀疑 LiDAR 不对，优先跑：
+
+- [visualize_lidar.py](/D:/code/project_gps/visualize_lidar.py)
+
+重点看：
+
+- Base BEV
+- Raw Motion Cue
+- Region Mask
+- Virtual Points
+- Combined BEV
+
+### 6.2 训练最小冒烟
+
+当模型或训练逻辑刚改完时，先不要直接跑完整实验。
+
+先用这种最小配置检查链路：
+
+```bash
+python train.py --scenarios scenario34 --epochs 1 --batch-size 2 --num-workers 2 --d-model 128 --temporal-layers 1 --fusion-layers 1
+```
+
+如果这条能跑通，说明下面这些都基本没坏：
+
+- dataset
+- dataloader
+- model forward
+- loss
+- backward
+- validation
+- checkpoint 保存
+
+### 6.3 AutoDL git 问题
+
+如果 AutoDL 上：
+
+- `git fetch`
+- `git pull`
+
+经常卡住或 TLS 出错，不要立刻怀疑代码。先怀疑容器到 GitHub 的网络。
+
+如果 AutoDL 工作区有脏文件，拉代码前先处理干净。
+
+## 7. 当前实现的关键结论
+
+到 `2026-05-12` 为止，仓库里已经完成了三件重要事：
+
+1. LiDAR 预处理已经重构成高质量近似复现版本
+2. `src/model.py` 已重构成更清楚的双阶段 BeMamba 风格架构
+3. `train.py` 已重构成配置化实验入口
+
+## 8. 后续协作时默认记住
+
+- 当前正式运行环境是 AutoDL
+- 当前本地仓库路径是 `D:\code\project_gps`
+- 用户当前优先级是“高质量复现”，不优先省算力
+- 4090D 可用于跑更重的版本
+- 如果只是验证代码链路，优先先跑单场景、单 epoch 冒烟
 
