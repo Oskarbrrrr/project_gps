@@ -1,215 +1,469 @@
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-import os
-import pandas as pd
-import numpy as np
+import argparse
 import csv
 import datetime
-import time  # <--- 新增导入 time 模块用于计算 ETA
+import os
+import random
+import time
+from dataclasses import asdict, dataclass
+from typing import Dict, Iterable, List, Tuple
 
-# 从 src 导入你已经写好的模块
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.cuda.amp import GradScaler, autocast
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.utils.data import DataLoader
+
 from src.dataset import MultimodalDataset
-from src.model import BeMambaModel
-from src.utils import calculate_topk_accuracy, calculate_dba_score, calculate_apl
+from src.model import BeMambaConfig, BeMambaModel
+from src.utils import calculate_apl, calculate_dba_score, calculate_topk_accuracy
 
-# ==========================================
-# 1. 带动态 Alpha 权重的 FocalLoss
-# ==========================================
+
+@dataclass
+class TrainConfig:
+    data_root: str = "./Data/Multi_Modal"
+    split_root: str = "./Data/splits"
+    output_root: str = "./outputs"
+    scenarios: Tuple[str, ...] = ("scenario32", "scenario33", "scenario34")
+    epochs: int = 80
+    batch_size: int = 16
+    num_workers: int = 8
+    lr: float = 2e-4
+    weight_decay: float = 1e-2
+    min_lr: float = 1e-6
+    warmup_epochs: int = 5
+    grad_clip_norm: float = 1.0
+    patience: int = 12
+    gamma: float = 2.0
+    use_alpha_loss: bool = True
+    amp: bool = True
+    seed: int = 42
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    log_every: int = 1
+    save_every_epoch: bool = False
+    device: str = "cuda"
+
+
 class AlphaFocalLoss(nn.Module):
-    def __init__(self, alpha=None, gamma=2.0):
-        super(AlphaFocalLoss, self).__init__()
+    def __init__(self, alpha: torch.Tensor | None = None, gamma: float = 2.0):
+        super().__init__()
         self.gamma = gamma
-        self.alpha = alpha  # alpha 为 [64] 维的 tensor
+        self.register_buffer("alpha", alpha if alpha is not None else None, persistent=False)
 
-    def forward(self, inputs, targets):
-        ce_loss = nn.functional.cross_entropy(inputs, targets, reduction='none')
-        pt = torch.exp(-ce_loss) 
-        
-        if self.alpha is not None:
-            at = self.alpha.gather(0, targets)
-        else:
-            at = 1.0
-            
-        focal_loss = at * ((1 - pt) ** self.gamma) * ce_loss
-        return focal_loss.mean()
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce_loss = nn.functional.cross_entropy(inputs, targets, reduction="none")
+        pt = torch.exp(-ce_loss)
+        alpha_weight = self.alpha.gather(0, targets) if self.alpha is not None else 1.0
+        return (alpha_weight * ((1.0 - pt) ** self.gamma) * ce_loss).mean()
 
-# ==========================================
-# 2. 动态计算当前场景训练集的波束频率
-# ==========================================
-def calculate_alpha_weights(csv_path, num_classes=64):
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def prepare_device(device_name: str) -> torch.device:
+    if device_name == "cuda" and torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def calculate_alpha_weights(csv_path: str, num_classes: int = 64) -> torch.Tensor:
     df = pd.read_csv(csv_path)
-    beams = df['unit1_beam'].values - 1 
+    beams = df["unit1_beam"].values - 1
     class_counts = np.bincount(beams, minlength=num_classes)
-    
     total_samples = len(beams)
-    # 逆频率加权，+1 防止除 0
     alpha = total_samples / (num_classes * (class_counts + 1))
-    # 归一化，保持 loss 整体量级不崩
     alpha = alpha / np.mean(alpha)
-    
     return torch.tensor(alpha, dtype=torch.float32)
 
-# ==========================================
-# 3. 核心训练与评估主循环
-# ==========================================
-def run_scenario(scenario_name):
-    print(f"\n========== 开始训练场景: {scenario_name} ==========")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # 路径配置
-    train_csv_path = f"Data/splits/{scenario_name}_train.csv"
-    alpha_weights = calculate_alpha_weights(train_csv_path, num_classes=64).to(device)
-    print("✅ 已生成自适应 Alpha 类别权重。")
-    
-    train_ds = MultimodalDataset(mode='train', scenario_name=scenario_name)
-    val_ds   = MultimodalDataset(mode='val', scenario_name=scenario_name)
-    test_ds  = MultimodalDataset(mode='test', scenario_name=scenario_name)
-    
-    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=8)
-    val_loader   = DataLoader(val_ds, batch_size=32, shuffle=False, num_workers=8)
-    test_loader  = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=8)
 
-    model = BeMambaModel().to(device)
-    criterion = AlphaFocalLoss(alpha=alpha_weights, gamma=2.0)
-    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4, weight_decay=1e-2)
+def build_dataloader(dataset: MultimodalDataset, config: TrainConfig, shuffle: bool) -> DataLoader:
+    return DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        shuffle=shuffle,
+        num_workers=config.num_workers,
+        pin_memory=config.pin_memory,
+        persistent_workers=(config.persistent_workers and config.num_workers > 0),
+        drop_last=False,
+    )
 
-    best_val_loss = float('inf') 
-    os.makedirs("checkpoints", exist_ok=True)
-    os.makedirs("logs", exist_ok=True)
-    
-    # ==========================================
-    # 🌟 早停机制参数配置 🌟
-    # ==========================================
-    patience = 10  # 10轮验证损失不下降就停止
-    early_stop_counter = 0  # 计数器
-    early_stop = False  # 早停标志
-    
-    # 初始化日志文件
-    log_file_path = f"logs/{scenario_name}_train_log.csv"
-    with open(log_file_path, mode='w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['Epoch', 'Train_Loss', 'Val_Loss', 'Acc@3', 'DBA', 'APL_dB'])
-    
-    # ==========================================
-    # 训练轮数修改为 100 轮
-    # ==========================================
-    epochs = 100
-    start_time = time.time()  # <--- 新增：记录开始时间
-    
-    for epoch in range(epochs):
-        # --- 训练 ---
-        model.train()
-        train_loss_tot = 0.0
-        for imgs, radars, lidars, gps, targets, _ in train_loader:
-            imgs, radars, lidars, gps, targets = imgs.to(device), radars.to(device), lidars.to(device), gps.to(device), targets.to(device)
-            optimizer.zero_grad()
+
+def build_scheduler(optimizer: torch.optim.Optimizer, config: TrainConfig):
+    warmup = LinearLR(
+        optimizer,
+        start_factor=0.1,
+        end_factor=1.0,
+        total_iters=max(config.warmup_epochs, 1),
+    )
+    cosine = CosineAnnealingLR(
+        optimizer,
+        T_max=max(config.epochs - config.warmup_epochs, 1),
+        eta_min=config.min_lr,
+    )
+    return SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine],
+        milestones=[config.warmup_epochs],
+    )
+
+
+def move_batch_to_device(batch, device: torch.device):
+    imgs, radars, lidars, gps, targets, power_vec = batch
+    return (
+        imgs.to(device, non_blocking=True),
+        radars.to(device, non_blocking=True),
+        lidars.to(device, non_blocking=True),
+        gps.to(device, non_blocking=True),
+        targets.to(device, non_blocking=True),
+        power_vec,
+    )
+
+
+def run_epoch(
+    model: BeMambaModel,
+    loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer | None,
+    scaler: GradScaler | None,
+    device: torch.device,
+    amp_enabled: bool,
+    grad_clip_norm: float,
+) -> Dict[str, float]:
+    training = optimizer is not None
+    model.train(training)
+
+    loss_total = 0.0
+    sample_total = 0
+    acc1_total = 0.0
+    acc3_total = 0.0
+    dba_total = 0.0
+    apl_total = 0.0
+
+    for batch in loader:
+        imgs, radars, lidars, gps, targets, power_vec = move_batch_to_device(batch, device)
+        batch_size = targets.size(0)
+
+        if training:
+            optimizer.zero_grad(set_to_none=True)
+
+        with autocast(enabled=amp_enabled):
             outputs = model(imgs, radars, lidars, gps)
             loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
-            train_loss_tot += loss.item() * targets.size(0)
-            
-        # --- 验证 ---
-        model.eval()
-        t1_tot, t3_tot, dba_tot, apl_tot, val_loss_tot = 0.0, 0.0, 0.0, 0.0, 0.0
-        with torch.no_grad():
-            for imgs, radars, lidars, gps, targets, power_vec in val_loader:
-                imgs, radars, lidars, gps, targets = imgs.to(device), radars.to(device), lidars.to(device), gps.to(device), targets.to(device)
-                outputs = model(imgs, radars, lidars, gps)
-                
-                v_loss = criterion(outputs, targets)
-                bs = targets.size(0)
-                val_loss_tot += v_loss.item() * bs
-                
-                acc1, acc3 = calculate_topk_accuracy(outputs, targets, topk=(1, 3))
-                t1_tot += acc1 * bs
-                t3_tot += acc3 * bs
-                dba_tot += calculate_dba_score(outputs, targets) * bs
-                apl_tot += calculate_apl(outputs, power_vec) * bs
-                
-        n_train, n_val = len(train_ds), len(val_ds)
-        epoch_train_loss = train_loss_tot / n_train
-        epoch_val_loss = val_loss_tot / n_val
-        epoch_dba = dba_tot / n_val
-        epoch_apl = apl_tot / n_val
-        epoch_acc3 = t3_tot / n_val
-        
-        # ==========================================
-        # 🌟 计算并格式化 ETA 🌟
-        # ==========================================
-        elapsed_time = time.time() - start_time
-        avg_time_per_epoch = elapsed_time / (epoch + 1)
-        remaining_epochs = epochs - (epoch + 1)
-        eta_seconds = int(avg_time_per_epoch * remaining_epochs)
-        eta_str = str(datetime.timedelta(seconds=eta_seconds))
-        
-        # <--- 修改：打印语句加入了 ETA
-        print(f"Epoch {epoch+1:02d}/{epochs} | Train L: {epoch_train_loss:.4f} | Val L: {epoch_val_loss:.4f} | Acc@3: {epoch_acc3:.2f}% | DBA: {epoch_dba:.4f} | APL: {epoch_apl:.4f} dB | ⏳ ETA: {eta_str}")
-        
-        # 写入日志
-        with open(log_file_path, mode='a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([epoch+1, f"{epoch_train_loss:.4f}", f"{epoch_val_loss:.4f}", f"{epoch_acc3:.2f}", f"{epoch_dba:.4f}", f"{epoch_apl:.4f}"])
-        
-        # ==========================================
-        # 🌟 早停逻辑 & 模型保存 🌟
-        # ==========================================
-        if epoch_val_loss < best_val_loss:
-            # 验证损失下降：更新最佳值，重置计数器
-            best_val_loss = epoch_val_loss
+
+        if training:
+            assert optimizer is not None
+            if scaler is not None and amp_enabled:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                optimizer.step()
+
+        loss_total += loss.item() * batch_size
+        sample_total += batch_size
+
+        acc1, acc3 = calculate_topk_accuracy(outputs, targets, topk=(1, 3))
+        acc1_total += acc1 * batch_size
+        acc3_total += acc3 * batch_size
+        dba_total += calculate_dba_score(outputs, targets) * batch_size
+        apl_total += calculate_apl(outputs, power_vec) * batch_size
+
+    return {
+        "loss": loss_total / max(sample_total, 1),
+        "acc1": acc1_total / max(sample_total, 1),
+        "acc3": acc3_total / max(sample_total, 1),
+        "dba": dba_total / max(sample_total, 1),
+        "apl": apl_total / max(sample_total, 1),
+    }
+
+
+def save_config(run_dir: str, train_config: TrainConfig, model_config: BeMambaConfig) -> None:
+    os.makedirs(run_dir, exist_ok=True)
+    config_path = os.path.join(run_dir, "config.txt")
+    with open(config_path, "w", encoding="utf-8") as handle:
+        handle.write("[train]\n")
+        for key, value in asdict(train_config).items():
+            handle.write(f"{key}={value}\n")
+        handle.write("\n[model]\n")
+        for key, value in asdict(model_config).items():
+            handle.write(f"{key}={value}\n")
+
+
+def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: BeMambaConfig, device: torch.device) -> None:
+    print(f"\n========== Running {scenario_name} ==========")
+    train_csv_path = os.path.join(train_config.split_root, f"{scenario_name}_train.csv")
+    alpha_weights = None
+    if train_config.use_alpha_loss:
+        alpha_weights = calculate_alpha_weights(train_csv_path, num_classes=model_config.num_classes).to(device)
+
+    train_ds = MultimodalDataset(
+        mode="train",
+        data_root=train_config.data_root,
+        split_root=train_config.split_root,
+        scenario_name=scenario_name,
+    )
+    val_ds = MultimodalDataset(
+        mode="val",
+        data_root=train_config.data_root,
+        split_root=train_config.split_root,
+        scenario_name=scenario_name,
+    )
+    test_ds = MultimodalDataset(
+        mode="test",
+        data_root=train_config.data_root,
+        split_root=train_config.split_root,
+        scenario_name=scenario_name,
+    )
+
+    train_loader = build_dataloader(train_ds, train_config, shuffle=True)
+    val_loader = build_dataloader(val_ds, train_config, shuffle=False)
+    test_loader = build_dataloader(test_ds, train_config, shuffle=False)
+
+    model = BeMambaModel(model_config).to(device)
+    criterion = AlphaFocalLoss(alpha=alpha_weights, gamma=train_config.gamma)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=train_config.lr,
+        weight_decay=train_config.weight_decay,
+    )
+    scheduler = build_scheduler(optimizer, train_config)
+    scaler = GradScaler(enabled=(train_config.amp and device.type == "cuda"))
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(train_config.output_root, scenario_name, timestamp)
+    checkpoints_dir = os.path.join(run_dir, "checkpoints")
+    os.makedirs(checkpoints_dir, exist_ok=True)
+    save_config(run_dir, train_config, model_config)
+
+    log_path = os.path.join(run_dir, "train_log.csv")
+    with open(log_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "epoch",
+                "lr",
+                "train_loss",
+                "train_acc1",
+                "train_acc3",
+                "val_loss",
+                "val_acc1",
+                "val_acc3",
+                "val_dba",
+                "val_apl",
+            ]
+        )
+
+    best_val_loss = float("inf")
+    best_epoch = -1
+    early_stop_counter = 0
+    start_time = time.time()
+
+    for epoch in range(1, train_config.epochs + 1):
+        train_metrics = run_epoch(
+            model=model,
+            loader=train_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            scaler=scaler,
+            device=device,
+            amp_enabled=(train_config.amp and device.type == "cuda"),
+            grad_clip_norm=train_config.grad_clip_norm,
+        )
+        val_metrics = run_epoch(
+            model=model,
+            loader=val_loader,
+            criterion=criterion,
+            optimizer=None,
+            scaler=None,
+            device=device,
+            amp_enabled=(train_config.amp and device.type == "cuda"),
+            grad_clip_norm=train_config.grad_clip_norm,
+        )
+        scheduler.step()
+
+        elapsed = time.time() - start_time
+        avg_epoch_time = elapsed / epoch
+        eta_seconds = int(avg_epoch_time * (train_config.epochs - epoch))
+        eta_string = str(datetime.timedelta(seconds=eta_seconds))
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        if epoch % train_config.log_every == 0:
+            print(
+                f"Epoch {epoch:03d}/{train_config.epochs} "
+                f"| lr={current_lr:.2e} "
+                f"| train_loss={train_metrics['loss']:.4f} "
+                f"| train_acc3={train_metrics['acc3']:.2f}% "
+                f"| val_loss={val_metrics['loss']:.4f} "
+                f"| val_acc3={val_metrics['acc3']:.2f}% "
+                f"| val_dba={val_metrics['dba']:.4f} "
+                f"| val_apl={val_metrics['apl']:.4f} dB "
+                f"| ETA {eta_string}"
+            )
+
+        with open(log_path, "a", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(
+                [
+                    epoch,
+                    f"{current_lr:.8f}",
+                    f"{train_metrics['loss']:.6f}",
+                    f"{train_metrics['acc1']:.4f}",
+                    f"{train_metrics['acc3']:.4f}",
+                    f"{val_metrics['loss']:.6f}",
+                    f"{val_metrics['acc1']:.4f}",
+                    f"{val_metrics['acc3']:.4f}",
+                    f"{val_metrics['dba']:.6f}",
+                    f"{val_metrics['apl']:.6f}",
+                ]
+            )
+
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
+            best_epoch = epoch
             early_stop_counter = 0
-            torch.save(model.state_dict(), f"checkpoints/best_{scenario_name}.pth")
-            print(f"  --> [Saved Best Model] Val Loss 创新低: {best_val_loss:.4f}")
+            torch.save(model.state_dict(), os.path.join(checkpoints_dir, "best_model.pth"))
+            print(f"  -> saved best checkpoint at epoch {epoch} (val_loss={best_val_loss:.4f})")
         else:
-            # 验证损失未下降：计数器+1
             early_stop_counter += 1
-            print(f"  --> [Early Stop Counter] 连续 {early_stop_counter}/{patience} 轮无提升")
-            
-            # 达到耐心值，触发早停
-            if early_stop_counter >= patience:
-                print(f"\n🚨 验证损失连续 {patience} 轮未下降，触发早停！")
-                early_stop = True
+            print(f"  -> early-stop counter {early_stop_counter}/{train_config.patience}")
+            if early_stop_counter >= train_config.patience:
+                print(f"Stopping early at epoch {epoch}.")
                 break
 
-    # --- 最终 Test 评估阶段 ---
-    print(f"\n>>> 载入最佳权重进行 Test 评估...")
-    model.load_state_dict(torch.load(f"checkpoints/best_{scenario_name}.pth"))
-    model.eval()
-    
-    t1_tot, t3_tot, dba_tot, apl_tot = 0.0, 0.0, 0.0, 0.0
-    with torch.no_grad():
-        for imgs, radars, lidars, gps, targets, power_vec in test_loader:
-            imgs, radars, lidars, gps, targets = imgs.to(device), radars.to(device), lidars.to(device), gps.to(device), targets.to(device)
-            outputs = model(imgs, radars, lidars, gps)
-            
-            acc1, acc3 = calculate_topk_accuracy(outputs, targets, topk=(1, 3))
-            bs = targets.size(0)
-            t1_tot += acc1 * bs
-            t3_tot += acc3 * bs
-            dba_tot += calculate_dba_score(outputs, targets) * bs
-            apl_tot += calculate_apl(outputs, power_vec) * bs
-            
-    n_test = len(test_ds)
-    final_res = f"""
-[Final Results for {scenario_name} Test Set]
-Top-1 Acc: {t1_tot/n_test:.2f}%
-Top-3 Acc: {t3_tot/n_test:.2f}%
-DBA Score: {dba_tot/n_test:.4f}
-APL Loss:  {apl_tot/n_test:.4f} dB
-"""
-    print(final_res)
-    
-    # 保存最终测试结果
-    with open(f"logs/{scenario_name}_final_test_result.txt", "w") as f:
-        f.write(final_res)
+        if train_config.save_every_epoch:
+            torch.save(model.state_dict(), os.path.join(checkpoints_dir, f"epoch_{epoch:03d}.pth"))
+
+    best_ckpt = os.path.join(checkpoints_dir, "best_model.pth")
+    model.load_state_dict(torch.load(best_ckpt, map_location=device))
+    test_metrics = run_epoch(
+        model=model,
+        loader=test_loader,
+        criterion=criterion,
+        optimizer=None,
+        scaler=None,
+        device=device,
+        amp_enabled=(train_config.amp and device.type == "cuda"),
+        grad_clip_norm=train_config.grad_clip_norm,
+    )
+
+    result_path = os.path.join(run_dir, "final_test_result.txt")
+    result_text = (
+        f"[Final Results for {scenario_name}]\n"
+        f"best_epoch: {best_epoch}\n"
+        f"top1_acc: {test_metrics['acc1']:.2f}%\n"
+        f"top3_acc: {test_metrics['acc3']:.2f}%\n"
+        f"dba: {test_metrics['dba']:.4f}\n"
+        f"apl: {test_metrics['apl']:.4f} dB\n"
+    )
+    print("\n" + result_text)
+    with open(result_path, "w", encoding="utf-8") as handle:
+        handle.write(result_text)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train BeMamba reproduction experiments.")
+    parser.add_argument("--data-root", default="./Data/Multi_Modal")
+    parser.add_argument("--split-root", default="./Data/splits")
+    parser.add_argument("--output-root", default="./outputs")
+    parser.add_argument("--scenarios", nargs="+", default=["scenario32", "scenario33", "scenario34"])
+    parser.add_argument("--epochs", type=int, default=80)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-2)
+    parser.add_argument("--min-lr", type=float, default=1e-6)
+    parser.add_argument("--warmup-epochs", type=int, default=5)
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument("--patience", type=int, default=12)
+    parser.add_argument("--gamma", type=float, default=2.0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument("--no-alpha-loss", action="store_true")
+    parser.add_argument("--no-pin-memory", action="store_true")
+    parser.add_argument("--no-persistent-workers", action="store_true")
+    parser.add_argument("--save-every-epoch", action="store_true")
+    parser.add_argument("--d-model", type=int, default=192)
+    parser.add_argument("--d-state", type=int, default=16)
+    parser.add_argument("--d-conv", type=int, default=4)
+    parser.add_argument("--expand", type=int, default=2)
+    parser.add_argument("--patch-grid", type=int, default=6)
+    parser.add_argument("--temporal-layers", type=int, default=2)
+    parser.add_argument("--fusion-layers", type=int, default=2)
+    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--gps-hidden-dim", type=int, default=96)
+    parser.add_argument("--no-pretrained-backbones", action="store_true")
+    parser.add_argument("--freeze-image-stem", action="store_true")
+    return parser.parse_args()
+
+
+def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]:
+    train_config = TrainConfig(
+        data_root=args.data_root,
+        split_root=args.split_root,
+        output_root=args.output_root,
+        scenarios=tuple(args.scenarios),
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        min_lr=args.min_lr,
+        warmup_epochs=args.warmup_epochs,
+        grad_clip_norm=args.grad_clip_norm,
+        patience=args.patience,
+        gamma=args.gamma,
+        use_alpha_loss=(not args.no_alpha_loss),
+        amp=(not args.no_amp),
+        seed=args.seed,
+        pin_memory=(not args.no_pin_memory),
+        persistent_workers=(not args.no_persistent_workers),
+        save_every_epoch=args.save_every_epoch,
+        device=args.device,
+    )
+    model_config = BeMambaConfig(
+        d_model=args.d_model,
+        d_state=args.d_state,
+        d_conv=args.d_conv,
+        expand=args.expand,
+        patch_grid=args.patch_grid,
+        temporal_layers=args.temporal_layers,
+        fusion_layers=args.fusion_layers,
+        dropout=args.dropout,
+        gps_hidden_dim=args.gps_hidden_dim,
+        pretrained_backbones=(not args.no_pretrained_backbones),
+        freeze_image_stem=args.freeze_image_stem,
+    )
+    return train_config, model_config
+
+
+def main() -> None:
+    args = parse_args()
+    train_config, model_config = build_configs(args)
+    set_seed(train_config.seed)
+    device = prepare_device(train_config.device)
+    os.makedirs(train_config.output_root, exist_ok=True)
+
+    for scenario_name in train_config.scenarios:
+        run_scenario(
+            scenario_name=scenario_name,
+            train_config=train_config,
+            model_config=model_config,
+            device=device,
+        )
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
 
 if __name__ == "__main__":
-    # 连续依次跑三个场景
-    run_scenario("scenario32")
-    torch.cuda.empty_cache()  # <--- 新增：清空显存，防止连续运行时 OOM
-    
-    run_scenario("scenario33")
-    torch.cuda.empty_cache()  
-    
-    run_scenario("scenario34")
+    main()
