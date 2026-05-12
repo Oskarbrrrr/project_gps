@@ -36,7 +36,7 @@ class TrainConfig:
     grad_clip_norm: float = 1.0
     patience: int = 0
     gamma: float = 2.0
-    use_alpha_loss: bool = True
+    loss_name: str = "ce"
     amp: bool = True
     seed: int = 42
     pin_memory: bool = True
@@ -112,32 +112,7 @@ def build_dataloader(dataset: MultimodalDataset, config: TrainConfig, shuffle: b
 
 
 def build_scheduler(optimizer: torch.optim.Optimizer, config: TrainConfig):
-    if config.epochs <= 1:
-        return None
-
-    if config.warmup_epochs <= 0:
-        return CosineAnnealingLR(
-            optimizer,
-            T_max=max(config.epochs, 1),
-            eta_min=config.min_lr,
-        )
-
-    warmup = LinearLR(
-        optimizer,
-        start_factor=0.1,
-        end_factor=1.0,
-        total_iters=max(config.warmup_epochs, 1),
-    )
-    cosine = CosineAnnealingLR(
-        optimizer,
-        T_max=max(config.epochs - config.warmup_epochs, 1),
-        eta_min=config.min_lr,
-    )
-    return SequentialLR(
-        optimizer,
-        schedulers=[warmup, cosine],
-        milestones=[config.warmup_epochs],
-    )
+    return None
 
 
 def move_batch_to_device(batch, device: torch.device):
@@ -229,6 +204,14 @@ def save_config(run_dir: str, train_config: TrainConfig, model_config: BeMambaCo
             handle.write(f"{key}={value}\n")
 
 
+def build_criterion(train_config: TrainConfig, alpha_weights: torch.Tensor | None) -> nn.Module:
+    if train_config.loss_name == "focal":
+        return AlphaFocalLoss(alpha=alpha_weights, gamma=train_config.gamma)
+    if train_config.loss_name == "ce":
+        return nn.CrossEntropyLoss()
+    raise ValueError(f"Unsupported loss: {train_config.loss_name}")
+
+
 def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: BeMambaConfig, device: torch.device) -> None:
     print(f"\n========== Running {scenario_name} ==========")
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -237,10 +220,9 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
     os.makedirs(checkpoints_dir, exist_ok=True)
 
     train_csv_path = build_combined_train_csv(train_config.split_root, scenario_name, run_dir)
-    val_csv_path = os.path.join(train_config.split_root, f"{scenario_name}_val.csv")
     test_csv_path = os.path.join(train_config.split_root, f"{scenario_name}_test.csv")
     alpha_weights = None
-    if train_config.use_alpha_loss:
+    if train_config.loss_name == "focal":
         alpha_weights = calculate_alpha_weights(train_csv_path, num_classes=model_config.num_classes).to(device)
 
     train_ds = MultimodalDataset(
@@ -248,12 +230,6 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
         split_root=train_config.split_root,
         scenario_name=scenario_name,
         csv_path=train_csv_path,
-    )
-    val_ds = MultimodalDataset(
-        data_root=train_config.data_root,
-        split_root=train_config.split_root,
-        scenario_name=scenario_name,
-        csv_path=val_csv_path,
     )
     test_ds = MultimodalDataset(
         data_root=train_config.data_root,
@@ -263,17 +239,15 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
     )
 
     train_loader = build_dataloader(train_ds, train_config, shuffle=True)
-    val_loader = build_dataloader(val_ds, train_config, shuffle=False)
     test_loader = build_dataloader(test_ds, train_config, shuffle=False)
 
     model = BeMambaModel(model_config).to(device)
-    criterion = AlphaFocalLoss(alpha=alpha_weights, gamma=train_config.gamma)
+    criterion = build_criterion(train_config, alpha_weights)
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=train_config.lr,
         weight_decay=train_config.weight_decay,
     )
-    scheduler = build_scheduler(optimizer, train_config)
     scaler = GradScaler(enabled=(train_config.amp and device.type == "cuda"))
     save_config(run_dir, train_config, model_config)
 
@@ -288,19 +262,17 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
                 "train_acc1",
                 "train_acc2",
                 "train_acc3",
-                "val_loss",
-                "val_acc1",
-                "val_acc2",
-                "val_acc3",
-                "val_dba",
-                "val_apl",
+                "test_loss",
+                "test_acc1",
+                "test_acc2",
+                "test_acc3",
+                "test_dba",
+                "test_apl",
             ]
         )
 
-    best_val_loss = float("inf")
-    best_epoch = -1
-    early_stop_counter = 0
     start_time = time.time()
+    final_test_metrics = None
 
     for epoch in range(1, train_config.epochs + 1):
         train_metrics = run_epoch(
@@ -313,9 +285,9 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
             amp_enabled=(train_config.amp and device.type == "cuda"),
             grad_clip_norm=train_config.grad_clip_norm,
         )
-        val_metrics = run_epoch(
+        test_metrics = run_epoch(
             model=model,
-            loader=val_loader,
+            loader=test_loader,
             criterion=criterion,
             optimizer=None,
             scaler=None,
@@ -323,8 +295,7 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
             amp_enabled=(train_config.amp and device.type == "cuda"),
             grad_clip_norm=train_config.grad_clip_norm,
         )
-        if scheduler is not None:
-            scheduler.step()
+        final_test_metrics = test_metrics
 
         elapsed = time.time() - start_time
         avg_epoch_time = elapsed / epoch
@@ -338,10 +309,10 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
                 f"| lr={current_lr:.2e} "
                 f"| train_loss={train_metrics['loss']:.4f} "
                 f"| train_acc3={train_metrics['acc3']:.2f}% "
-                f"| val_loss={val_metrics['loss']:.4f} "
-                f"| val_acc3={val_metrics['acc3']:.2f}% "
-                f"| val_dba={val_metrics['dba']:.4f} "
-                f"| val_apl={val_metrics['apl']:.4f} dB "
+                f"| test_loss={test_metrics['loss']:.4f} "
+                f"| test_acc3={test_metrics['acc3']:.2f}% "
+                f"| test_dba={test_metrics['dba']:.4f} "
+                f"| test_apl={test_metrics['apl']:.4f} dB "
                 f"| ETA {eta_string}"
             )
 
@@ -355,35 +326,21 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
                     f"{train_metrics['acc1']:.4f}",
                     f"{train_metrics['acc2']:.4f}",
                     f"{train_metrics['acc3']:.4f}",
-                    f"{val_metrics['loss']:.6f}",
-                    f"{val_metrics['acc1']:.4f}",
-                    f"{val_metrics['acc2']:.4f}",
-                    f"{val_metrics['acc3']:.4f}",
-                    f"{val_metrics['dba']:.6f}",
-                    f"{val_metrics['apl']:.6f}",
+                    f"{test_metrics['loss']:.6f}",
+                    f"{test_metrics['acc1']:.4f}",
+                    f"{test_metrics['acc2']:.4f}",
+                    f"{test_metrics['acc3']:.4f}",
+                    f"{test_metrics['dba']:.6f}",
+                    f"{test_metrics['apl']:.6f}",
                 ]
             )
-
-        if val_metrics["loss"] < best_val_loss:
-            best_val_loss = val_metrics["loss"]
-            best_epoch = epoch
-            torch.save(model.state_dict(), os.path.join(checkpoints_dir, "best_model.pth"))
-            print(f"  -> saved best checkpoint at epoch {epoch} (val_loss={best_val_loss:.4f})")
-            early_stop_counter = 0
-        else:
-            early_stop_counter += 1
-            if train_config.patience > 0:
-                print(f"  -> early-stop counter {early_stop_counter}/{train_config.patience}")
-                if early_stop_counter >= train_config.patience:
-                    print(f"Stopping early at epoch {epoch}.")
-                    break
 
         if train_config.save_every_epoch:
             torch.save(model.state_dict(), os.path.join(checkpoints_dir, f"epoch_{epoch:03d}.pth"))
 
-    best_ckpt = os.path.join(checkpoints_dir, "best_model.pth")
-    model.load_state_dict(torch.load(best_ckpt, map_location=device))
-    test_metrics = run_epoch(
+    final_ckpt = os.path.join(checkpoints_dir, "final_model.pth")
+    torch.save(model.state_dict(), final_ckpt)
+    test_metrics = final_test_metrics if final_test_metrics is not None else run_epoch(
         model=model,
         loader=test_loader,
         criterion=criterion,
@@ -397,7 +354,7 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
     result_path = os.path.join(run_dir, "final_test_result.txt")
     result_text = (
         f"[Final Results for {scenario_name}]\n"
-        f"best_epoch: {best_epoch}\n"
+        f"epoch: {train_config.epochs}\n"
         f"top1_acc: {test_metrics['acc1']:.2f}%\n"
         f"top2_acc: {test_metrics['acc2']:.2f}%\n"
         f"top3_acc: {test_metrics['acc3']:.2f}%\n"
@@ -425,10 +382,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--patience", type=int, default=0)
     parser.add_argument("--gamma", type=float, default=2.0)
+    parser.add_argument("--loss", choices=["ce", "focal"], default="ce")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--no-amp", action="store_true")
-    parser.add_argument("--no-alpha-loss", action="store_true")
     parser.add_argument("--no-pin-memory", action="store_true")
     parser.add_argument("--no-persistent-workers", action="store_true")
     parser.add_argument("--save-every-epoch", action="store_true")
@@ -462,7 +419,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         grad_clip_norm=args.grad_clip_norm,
         patience=args.patience,
         gamma=args.gamma,
-        use_alpha_loss=(not args.no_alpha_loss),
+        loss_name=args.loss,
         amp=(not args.no_amp),
         seed=args.seed,
         pin_memory=(not args.no_pin_memory),
