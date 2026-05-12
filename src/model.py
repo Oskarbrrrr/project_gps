@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -10,67 +10,77 @@ from torchvision import models
 @dataclass
 class BeMambaConfig:
     num_classes: int = 64
-    d_model: int = 192
+    d_model: int = 128
     d_state: int = 16
     d_conv: int = 4
     expand: int = 2
     patch_grid: int = 6
-    temporal_layers: int = 2
-    fusion_layers: int = 2
     dropout: float = 0.2
     gps_hidden_dim: int = 96
     pretrained_backbones: bool = True
+    temporal_layers: int = 1
+    fusion_layers: int = 1
     freeze_image_stem: bool = False
 
 
-class BidirectionalMambaBlock(nn.Module):
-    def __init__(self, d_model: int, d_state: int, d_conv: int, expand: int, dropout: float):
+class ChannelEncoding(nn.Module):
+    def __init__(self, d_model: int):
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
-        self.forward_mamba = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
-        self.backward_mamba = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
-        self.gate = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.SiLU(),
-            nn.Linear(d_model, d_model),
-            nn.Sigmoid(),
-        )
+        self.conv1d = nn.Conv1d(d_model, d_model, kernel_size=1, bias=False)
+
+    def forward(self, sequence: torch.Tensor) -> torch.Tensor:
+        sequence = self.norm(sequence)
+        sequence = self.conv1d(sequence.transpose(1, 2)).transpose(1, 2)
+        return sequence
+
+
+class TFMamba(nn.Module):
+    def __init__(self, d_model: int, d_state: int, d_conv: int, expand: int, dropout: float):
+        super().__init__()
+        self.ssm_in = nn.Linear(d_model, d_model)
+        self.ssm_conv = nn.Conv1d(d_model, d_model, kernel_size=1, bias=False)
+        self.ssm_act = nn.SiLU()
+        self.ssm = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+
+        self.gate_in = nn.Linear(d_model, d_model)
+        self.gate_act = nn.SiLU()
         self.out_proj = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        x_norm = self.norm(x)
-        out_forward = self.forward_mamba(x_norm)
-        out_backward = torch.flip(
-            self.backward_mamba(torch.flip(x_norm, dims=[1])),
+    def forward(self, sequence: torch.Tensor) -> torch.Tensor:
+        ssm_branch = self.ssm_in(sequence)
+        ssm_branch = self.ssm_conv(ssm_branch.transpose(1, 2)).transpose(1, 2)
+        ssm_branch = self.ssm_act(ssm_branch)
+        ssm_branch = self.ssm(ssm_branch)
+
+        gate_branch = self.gate_act(self.gate_in(sequence))
+        fused = self.out_proj(ssm_branch * gate_branch)
+        return self.dropout(fused)
+
+
+class MBMamba(nn.Module):
+    def __init__(self, d_model: int, d_state: int, d_conv: int, expand: int, dropout: float):
+        super().__init__()
+        self.channel_encoding = ChannelEncoding(d_model)
+        self.forward_mamba = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.backward_mamba = Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.weight_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, sequence: torch.Tensor) -> torch.Tensor:
+        normalized = self.channel_encoding(sequence)
+        forward = self.forward_mamba(normalized)
+        backward = torch.flip(
+            self.backward_mamba(torch.flip(normalized, dims=[1])),
             dims=[1],
         )
-        gated = self.gate(x_norm) * (out_forward + out_backward)
-        return residual + self.dropout(self.out_proj(gated))
-
-
-class MambaStack(nn.Module):
-    def __init__(self, num_layers: int, d_model: int, d_state: int, d_conv: int, expand: int, dropout: float):
-        super().__init__()
-        self.layers = nn.ModuleList(
-            [
-                BidirectionalMambaBlock(
-                    d_model=d_model,
-                    d_state=d_state,
-                    d_conv=d_conv,
-                    expand=expand,
-                    dropout=dropout,
-                )
-                for _ in range(num_layers)
-            ]
-        )
-        self.final_norm = nn.LayerNorm(d_model)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for layer in self.layers:
-            x = layer(x)
-        return self.final_norm(x)
+        weight = self.weight_proj(normalized)
+        return self.dropout(weight * forward + weight * backward)
 
 
 class GPSProjection(nn.Module):
@@ -87,16 +97,8 @@ class GPSProjection(nn.Module):
         return self.net(gps)
 
 
-class ModalityEncoder(nn.Module):
-    def __init__(
-        self,
-        backbone_name: str,
-        in_channels: int,
-        d_model: int,
-        patch_grid: int,
-        pretrained: bool,
-        freeze_stem: bool = False,
-    ):
+class ModalityBackbone(nn.Module):
+    def __init__(self, backbone_name: str, in_channels: int, d_model: int, patch_grid: int, pretrained: bool):
         super().__init__()
         if backbone_name == "resnet34":
             weights = models.ResNet34_Weights.IMAGENET1K_V1 if pretrained else None
@@ -136,72 +138,49 @@ class ModalityEncoder(nn.Module):
             backbone.layer2,
         )
         self.pool = nn.AdaptiveAvgPool2d((patch_grid, patch_grid))
-        self.proj = nn.Sequential(
-            nn.Conv2d(out_channels, d_model, kernel_size=1, bias=False),
-            nn.BatchNorm2d(d_model),
-            nn.SiLU(),
-        )
-
-        if freeze_stem:
-            for param in self.features[0].parameters():
-                param.requires_grad = False
-            for param in self.features[1].parameters():
-                param.requires_grad = False
+        self.project = nn.Identity() if out_channels == d_model else nn.Conv2d(out_channels, d_model, kernel_size=1, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feat = self.features(x)
         feat = self.pool(feat)
-        feat = self.proj(feat)
+        feat = self.project(feat)
         return feat
 
 
-class TemporalModalityBranch(nn.Module):
-    def __init__(
-        self,
-        name: str,
-        backbone_name: str,
-        in_channels: int,
-        config: BeMambaConfig,
-        modality_index: int,
-    ):
+class TimeSequenceBranch(nn.Module):
+    def __init__(self, backbone_name: str, in_channels: int, config: BeMambaConfig):
         super().__init__()
-        self.name = name
-        self.patch_grid = config.patch_grid
-        self.num_patches = config.patch_grid * config.patch_grid
-        self.encoder = ModalityEncoder(
+        self.encoder = ModalityBackbone(
             backbone_name=backbone_name,
             in_channels=in_channels,
             d_model=config.d_model,
             patch_grid=config.patch_grid,
             pretrained=config.pretrained_backbones,
-            freeze_stem=(config.freeze_image_stem and name == "image"),
         )
-        self.temporal_stack = MambaStack(
-            num_layers=config.temporal_layers,
+        self.channel_encoding = ChannelEncoding(config.d_model)
+        self.tf_mamba = TFMamba(
             d_model=config.d_model,
             d_state=config.d_state,
             d_conv=config.d_conv,
             expand=config.expand,
             dropout=config.dropout,
         )
-        self.frame_pos = nn.Parameter(torch.zeros(1, 5, config.d_model))
-        self.patch_pos = nn.Parameter(torch.zeros(1, self.num_patches, config.d_model))
-        self.modality_token = nn.Parameter(torch.zeros(1, 1, config.d_model))
-        nn.init.normal_(self.frame_pos, std=0.02)
-        nn.init.normal_(self.patch_pos, std=0.02)
-        nn.init.normal_(self.modality_token, std=0.02)
-        self.modality_index = modality_index
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, channels, height, width = x.shape
-        encoded = self.encoder(x.view(batch_size * seq_len, channels, height, width))
-        encoded = encoded.view(batch_size, seq_len, -1, self.num_patches).permute(0, 1, 3, 2)
-        encoded = encoded + self.frame_pos[:, :seq_len].unsqueeze(2) + self.patch_pos.unsqueeze(1)
+        encoded = self.encoder(x.reshape(batch_size * seq_len, channels, height, width))
+        _, d_model, pooled_h, pooled_w = encoded.shape
+        spatial_len = pooled_h * pooled_w
 
-        patch_first = encoded.permute(0, 2, 1, 3).reshape(batch_size * self.num_patches, seq_len, -1)
-        temporal_out = self.temporal_stack(patch_first)
-        temporal_out = temporal_out.mean(dim=1).view(batch_size, self.num_patches, -1)
-        return temporal_out + self.modality_token
+        encoded = encoded.reshape(batch_size, seq_len, d_model, spatial_len)
+        time_sequence = encoded.permute(0, 1, 3, 2).reshape(batch_size, seq_len * spatial_len, d_model)
+        channel_encoded = self.channel_encoding(time_sequence)
+        fused_sequence = self.tf_mamba(channel_encoded)
+
+        per_time = fused_sequence.reshape(batch_size, seq_len, spatial_len, d_model)
+        aggregated = per_time.sum(dim=1)
+        feature_map = aggregated.permute(0, 2, 1).reshape(batch_size, d_model, pooled_h, pooled_w)
+        return aggregated, feature_map
 
 
 class BeMambaModel(nn.Module):
@@ -209,19 +188,20 @@ class BeMambaModel(nn.Module):
         super().__init__()
         self.config = config or BeMambaConfig()
         cfg = self.config
+        self.spatial_len = cfg.patch_grid * cfg.patch_grid
 
-        self.branches = nn.ModuleDict(
-            {
-                "image": TemporalModalityBranch("image", "resnet34", 3, cfg, modality_index=0),
-                "radar": TemporalModalityBranch("radar", "resnet18", 2, cfg, modality_index=1),
-                "lidar": TemporalModalityBranch("lidar", "resnet18", 1, cfg, modality_index=2),
-            }
-        )
+        self.image_branch = TimeSequenceBranch("resnet34", 3, cfg)
+        self.lidar_branch = TimeSequenceBranch("resnet18", 1, cfg)
+        self.radar_branch = TimeSequenceBranch("resnet18", 2, cfg)
         self.gps_projection = GPSProjection(cfg.d_model, cfg.gps_hidden_dim, cfg.dropout)
-        self.fusion_stacks = nn.ModuleList(
+
+        self.image_align = nn.Linear(cfg.d_model, cfg.d_model)
+        self.lidar_align = nn.Linear(cfg.d_model, cfg.d_model)
+        self.radar_align = nn.Linear(cfg.d_model, cfg.d_model)
+
+        self.modal_blocks = nn.ModuleList(
             [
-                MambaStack(
-                    num_layers=cfg.fusion_layers,
+                MBMamba(
                     d_model=cfg.d_model,
                     d_state=cfg.d_state,
                     d_conv=cfg.d_conv,
@@ -231,45 +211,60 @@ class BeMambaModel(nn.Module):
                 for _ in range(3)
             ]
         )
-        self.permutations: List[Tuple[str, str, str]] = [
-            ("image", "lidar", "radar"),
-            ("lidar", "radar", "image"),
-            ("radar", "image", "lidar"),
-        ]
+
+        flattened_dim = cfg.d_model * self.spatial_len
         self.head = nn.Sequential(
-            nn.LayerNorm(cfg.d_model),
-            nn.Linear(cfg.d_model, cfg.d_model),
-            nn.SiLU(),
+            nn.Linear(flattened_dim, 2048),
+            nn.ReLU(),
             nn.Dropout(cfg.dropout),
-            nn.Linear(cfg.d_model, cfg.num_classes),
+            nn.Linear(2048, 2048),
+            nn.ReLU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(2048, cfg.num_classes),
         )
 
-    def encode_modalities(
+    def _build_modal_sequences(
         self,
-        imgs: torch.Tensor,
-        radars: torch.Tensor,
-        lidars: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        return {
-            "image": self.branches["image"](imgs),
-            "radar": self.branches["radar"](radars),
-            "lidar": self.branches["lidar"](lidars),
-        }
+        image_tokens: torch.Tensor,
+        lidar_tokens: torch.Tensor,
+        radar_tokens: torch.Tensor,
+        gps_tokens: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        gps_start = gps_tokens[:, 0, :].unsqueeze(1).expand(-1, self.spatial_len, -1)
+        gps_end = gps_tokens[:, 1, :].unsqueeze(1).expand(-1, self.spatial_len, -1)
+
+        image_tokens = self.image_align(image_tokens)
+        lidar_tokens = self.lidar_align(lidar_tokens)
+        radar_tokens = self.radar_align(radar_tokens)
+
+        seq_c1 = torch.stack([gps_start, image_tokens, lidar_tokens, radar_tokens, gps_end], dim=2)
+        seq_c2 = torch.stack([gps_start, lidar_tokens, radar_tokens, image_tokens, gps_end], dim=2)
+        seq_c3 = torch.stack([gps_start, radar_tokens, image_tokens, lidar_tokens, gps_end], dim=2)
+
+        batch_size, spatial_len, _, d_model = seq_c1.shape
+        seq_c1 = seq_c1.reshape(batch_size, spatial_len * 5, d_model)
+        seq_c2 = seq_c2.reshape(batch_size, spatial_len * 5, d_model)
+        seq_c3 = seq_c3.reshape(batch_size, spatial_len * 5, d_model)
+        return seq_c1, seq_c2, seq_c3
+
+    def _modal_fusion(self, sequences: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        encoded_sequences = []
+        for block, sequence in zip(self.modal_blocks, sequences):
+            encoded = block(sequence)
+            encoded = encoded.reshape(sequence.size(0), self.spatial_len, 5, self.config.d_model)
+            encoded = encoded.mean(dim=2)
+            encoded_sequences.append(encoded)
+
+        fused = encoded_sequences[0] + encoded_sequences[1] + encoded_sequences[2]
+        return fused
 
     def forward(self, imgs: torch.Tensor, radars: torch.Tensor, lidars: torch.Tensor, gps: torch.Tensor) -> torch.Tensor:
-        modality_tokens = self.encode_modalities(imgs, radars, lidars)
-        gps_start = self.gps_projection(gps[:, 0, :]).unsqueeze(1)
-        gps_end = self.gps_projection(gps[:, 1, :]).unsqueeze(1)
+        image_tokens, _ = self.image_branch(imgs)
+        lidar_tokens, _ = self.lidar_branch(lidars)
+        radar_tokens, _ = self.radar_branch(radars)
+        gps_tokens = self.gps_projection(gps)
 
-        fused_sequences = []
-        for fusion_stack, ordering in zip(self.fusion_stacks, self.permutations):
-            sequence = [gps_start]
-            for modality_name in ordering:
-                sequence.append(modality_tokens[modality_name])
-            sequence.append(gps_end)
-            stacked = torch.cat(sequence, dim=1)
-            fused_sequences.append(fusion_stack(stacked))
-
-        fused = torch.stack(fused_sequences, dim=0).mean(dim=0)
-        pooled = fused.mean(dim=1)
-        return self.head(pooled)
+        modal_sequences = self._build_modal_sequences(image_tokens, lidar_tokens, radar_tokens, gps_tokens)
+        fused_tokens = self._modal_fusion(modal_sequences)
+        flattened = fused_tokens.reshape(fused_tokens.size(0), -1)
+        return self.head(flattened)

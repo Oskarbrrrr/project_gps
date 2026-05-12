@@ -33,10 +33,7 @@ class MultimodalDataset(Dataset):
         lidar_motion_min_cells=2,
         lidar_motion_max_cells=48,
         lidar_motion_count_threshold=2.0,
-        lidar_virtual_density_kernel_radius=2,
-        lidar_virtual_component_expand=5,
-        lidar_virtual_density_percentile=88.0,
-        lidar_virtual_min_density=1.0,
+        lidar_virtual_jitter_radius_m=0.1,
     ):
         self.data_dir = data_root
         self.lidar_grid_size = int(lidar_grid_size)
@@ -55,10 +52,7 @@ class MultimodalDataset(Dataset):
         self.lidar_motion_min_cells = int(lidar_motion_min_cells)
         self.lidar_motion_max_cells = int(lidar_motion_max_cells)
         self.lidar_motion_count_threshold = float(lidar_motion_count_threshold)
-        self.lidar_virtual_density_kernel_radius = int(lidar_virtual_density_kernel_radius)
-        self.lidar_virtual_component_expand = int(lidar_virtual_component_expand)
-        self.lidar_virtual_density_percentile = float(lidar_virtual_density_percentile)
-        self.lidar_virtual_min_density = float(lidar_virtual_min_density)
+        self.lidar_virtual_jitter_radius_m = float(lidar_virtual_jitter_radius_m)
 
         if csv_path is None:
             csv_path = os.path.join(split_root, f"{scenario_name}_{mode}.csv")
@@ -259,56 +253,45 @@ class MultimodalDataset(Dataset):
         np.add.at(count_map, (x_idx, y_idx), 1.0)
         return count_map
 
-    def _smooth_count_map(self, count_map, radius):
-        if radius <= 0:
-            return count_map.astype(np.float32)
-
-        radius = int(radius)
-        offsets = range(-radius, radius + 1)
-        kernel_1d = np.array(
-            [np.exp(-(offset * offset) / max(radius, 1)) for offset in offsets],
-            dtype=np.float32,
-        )
-        kernel_1d /= np.sum(kernel_1d)
-
-        padded = np.pad(count_map.astype(np.float32), ((radius, radius), (0, 0)), mode="constant")
-        tmp = np.zeros_like(count_map, dtype=np.float32)
-        for idx, weight in enumerate(kernel_1d):
-            tmp += weight * padded[idx : idx + count_map.shape[0], :]
-
-        padded = np.pad(tmp, ((0, 0), (radius, radius)), mode="constant")
-        out = np.zeros_like(count_map, dtype=np.float32)
-        for idx, weight in enumerate(kernel_1d):
-            out += weight * padded[:, idx : idx + count_map.shape[1]]
-        return out
-
-    def _component_local_virtual_mask(self, raw_motion, density_map):
-        if not np.any(raw_motion):
-            return np.zeros_like(raw_motion, dtype=bool)
-
-        virtual_mask = np.zeros_like(raw_motion, dtype=bool)
-        seed_components = self._connected_components(raw_motion)
-
-        for component in seed_components:
-            component_mask = np.zeros_like(raw_motion, dtype=bool)
-            for x, y in component["coords"]:
-                component_mask[x, y] = True
-
-            expanded_region = self._binary_dilate(component_mask, self.lidar_virtual_component_expand)
-            local_density = density_map[expanded_region]
-            local_density = local_density[local_density > 0]
-            if len(local_density) == 0:
-                continue
-
-            threshold = max(
-                self.lidar_virtual_min_density,
-                float(np.percentile(local_density, self.lidar_virtual_density_percentile)),
+    def _points_to_indices(self, points, grid_size):
+        if points is None or len(points) == 0:
+            return (
+                np.zeros((0,), dtype=np.int32),
+                np.zeros((0,), dtype=np.int32),
             )
-            local_virtual = expanded_region & (density_map >= threshold)
-            local_virtual = self._binary_dilate(local_virtual, self.lidar_virtual_expand)
-            virtual_mask |= local_virtual
 
-        return virtual_mask
+        x, y = points[:, 0], points[:, 1]
+        x_min, x_max = self.lidar_x_range
+        y_min, y_max = self.lidar_y_range
+        x_idx = ((x - x_min) / (x_max - x_min + 1e-6) * (grid_size - 1)).astype(np.int32)
+        y_idx = ((y - y_min) / (y_max - y_min + 1e-6) * (grid_size - 1)).astype(np.int32)
+        x_idx = np.clip(x_idx, 0, grid_size - 1)
+        y_idx = np.clip(y_idx, 0, grid_size - 1)
+        return x_idx, y_idx
+
+    def _generate_virtual_points_from_motion(self, current_points, motion_mask):
+        if current_points is None or len(current_points) == 0 or (not np.any(motion_mask)):
+            return np.zeros((0, 2), dtype=np.float32)
+
+        x_idx, y_idx = self._points_to_indices(current_points, self.lidar_grid_size)
+        motion_points = current_points[motion_mask[x_idx, y_idx]]
+        if len(motion_points) == 0:
+            return np.zeros((0, 2), dtype=np.float32)
+
+        angles = np.random.uniform(0.0, 2.0 * np.pi, size=len(motion_points))
+        radii = np.sqrt(np.random.uniform(0.0, 1.0, size=len(motion_points))) * self.lidar_virtual_jitter_radius_m
+        offsets = np.stack([radii * np.cos(angles), radii * np.sin(angles)], axis=1)
+        virtual_points = motion_points + offsets.astype(np.float32)
+
+        x_min, x_max = self.lidar_x_range
+        y_min, y_max = self.lidar_y_range
+        valid = (
+            (virtual_points[:, 0] >= x_min)
+            & (virtual_points[:, 0] <= x_max)
+            & (virtual_points[:, 1] >= y_min)
+            & (virtual_points[:, 1] <= y_max)
+        )
+        return virtual_points[valid].astype(np.float32)
 
     def _upsample_mask(self, coarse_mask, target_size):
         coarse_h, coarse_w = coarse_mask.shape
@@ -334,30 +317,20 @@ class MultimodalDataset(Dataset):
                 "combined": base_bev.copy(),
             }
 
+        prev_bev = self._points_to_bev(prev_points, self.lidar_grid_size)
         current_count = self._points_to_count_map(current_points, self.lidar_motion_grid_size)
         prev_count = self._points_to_count_map(prev_points, self.lidar_motion_grid_size)
-        prev_support = self._binary_dilate(prev_count > 0, self.lidar_motion_history_dilation)
         count_diff = current_count - prev_count
-        raw_motion_coarse = count_diff >= self.lidar_motion_count_threshold
-        raw_motion_coarse = raw_motion_coarse & (current_count > 0)
-        raw_motion_coarse = raw_motion_coarse | ((count_diff > 0) & (~prev_support))
-
-        filtered_motion_coarse = self._filter_motion_coarse(raw_motion_coarse)
-        motion_coarse = filtered_motion_coarse if np.any(filtered_motion_coarse) else raw_motion_coarse
-
-        raw_motion = self._upsample_mask(motion_coarse, self.lidar_grid_size)
+        raw_motion = (base_bev > 0.5) & (prev_bev <= 0.5)
         region_mask = self._binary_dilate(raw_motion, self.lidar_motion_region_expand)
-
-        base_mask = base_bev > 0.5
-        highres_count = self._points_to_count_map(current_points, self.lidar_grid_size)
-        highres_density = self._smooth_count_map(highres_count, self.lidar_virtual_density_kernel_radius)
         motion_seed = self._binary_dilate(raw_motion, self.lidar_virtual_seed_expand)
-        local_motion = motion_seed & region_mask
-        virtual_mask = self._component_local_virtual_mask(local_motion, highres_density)
+        virtual_points = self._generate_virtual_points_from_motion(current_points, motion_seed)
+        virtual_mask = self._points_to_bev(virtual_points, self.lidar_grid_size) > 0.5
+        if self.lidar_virtual_expand > 0:
+            virtual_mask = self._binary_dilate(virtual_mask, self.lidar_virtual_expand)
 
-        # Keep virtual points independent from the base occupancy so the debug
-        # layer reflects motion-focused enhancement rather than copied edges.
-        virtual_only = virtual_mask
+        virtual_only = virtual_mask.astype(bool)
+        base_mask = base_bev > 0.5
         combined = np.maximum(base_mask.astype(np.float32), virtual_mask.astype(np.float32))
 
         return {

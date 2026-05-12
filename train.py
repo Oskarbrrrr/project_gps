@@ -3,9 +3,10 @@ import csv
 import datetime
 import os
 import random
+import tempfile
 import time
 from dataclasses import asdict, dataclass
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -26,15 +27,15 @@ class TrainConfig:
     split_root: str = "./Data/splits"
     output_root: str = "./outputs"
     scenarios: Tuple[str, ...] = ("scenario32", "scenario33", "scenario34")
-    epochs: int = 80
+    epochs: int = 30
     batch_size: int = 16
     num_workers: int = 8
-    lr: float = 2e-4
-    weight_decay: float = 1e-2
+    lr: float = 1e-4
+    weight_decay: float = 0.0
     min_lr: float = 1e-6
-    warmup_epochs: int = 5
+    warmup_epochs: int = 0
     grad_clip_norm: float = 1.0
-    patience: int = 12
+    patience: int = 0
     gamma: float = 2.0
     use_alpha_loss: bool = True
     amp: bool = True
@@ -82,6 +83,23 @@ def calculate_alpha_weights(csv_path: str, num_classes: int = 64) -> torch.Tenso
     return torch.tensor(alpha, dtype=torch.float32)
 
 
+def build_combined_train_csv(split_root: str, scenario_name: str, output_dir: str) -> str:
+    train_csv = os.path.join(split_root, f"{scenario_name}_train.csv")
+    val_csv = os.path.join(split_root, f"{scenario_name}_val.csv")
+    test_csv = os.path.join(split_root, f"{scenario_name}_test.csv")
+
+    if os.path.exists(train_csv) and os.path.exists(val_csv):
+        merged = pd.concat([pd.read_csv(train_csv), pd.read_csv(val_csv)], ignore_index=True)
+        merged_path = os.path.join(output_dir, f"{scenario_name}_trainval.csv")
+        merged.to_csv(merged_path, index=False)
+        return merged_path
+
+    if os.path.exists(train_csv):
+        return train_csv
+
+    raise FileNotFoundError(f"Could not find train split for {scenario_name}: {train_csv}")
+
+
 def build_dataloader(dataset: MultimodalDataset, config: TrainConfig, shuffle: bool) -> DataLoader:
     return DataLoader(
         dataset,
@@ -95,6 +113,13 @@ def build_dataloader(dataset: MultimodalDataset, config: TrainConfig, shuffle: b
 
 
 def build_scheduler(optimizer: torch.optim.Optimizer, config: TrainConfig):
+    if config.warmup_epochs <= 0:
+        return CosineAnnealingLR(
+            optimizer,
+            T_max=max(config.epochs, 1),
+            eta_min=config.min_lr,
+        )
+
     warmup = LinearLR(
         optimizer,
         start_factor=0.1,
@@ -141,6 +166,7 @@ def run_epoch(
     loss_total = 0.0
     sample_total = 0
     acc1_total = 0.0
+    acc2_total = 0.0
     acc3_total = 0.0
     dba_total = 0.0
     apl_total = 0.0
@@ -172,8 +198,9 @@ def run_epoch(
         loss_total += loss.item() * batch_size
         sample_total += batch_size
 
-        acc1, acc3 = calculate_topk_accuracy(outputs, targets, topk=(1, 3))
+        acc1, acc2, acc3 = calculate_topk_accuracy(outputs, targets, topk=(1, 2, 3))
         acc1_total += acc1 * batch_size
+        acc2_total += acc2 * batch_size
         acc3_total += acc3 * batch_size
         dba_total += calculate_dba_score(outputs, targets) * batch_size
         apl_total += calculate_apl(outputs, power_vec) * batch_size
@@ -181,6 +208,7 @@ def run_epoch(
     return {
         "loss": loss_total / max(sample_total, 1),
         "acc1": acc1_total / max(sample_total, 1),
+        "acc2": acc2_total / max(sample_total, 1),
         "acc3": acc3_total / max(sample_total, 1),
         "dba": dba_total / max(sample_total, 1),
         "apl": apl_total / max(sample_total, 1),
@@ -201,48 +229,42 @@ def save_config(run_dir: str, train_config: TrainConfig, model_config: BeMambaCo
 
 def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: BeMambaConfig, device: torch.device) -> None:
     print(f"\n========== Running {scenario_name} ==========")
-    train_csv_path = os.path.join(train_config.split_root, f"{scenario_name}_train.csv")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(train_config.output_root, scenario_name, timestamp)
+    checkpoints_dir = os.path.join(run_dir, "checkpoints")
+    os.makedirs(checkpoints_dir, exist_ok=True)
+
+    train_csv_path = build_combined_train_csv(train_config.split_root, scenario_name, run_dir)
+    test_csv_path = os.path.join(train_config.split_root, f"{scenario_name}_test.csv")
     alpha_weights = None
     if train_config.use_alpha_loss:
         alpha_weights = calculate_alpha_weights(train_csv_path, num_classes=model_config.num_classes).to(device)
 
     train_ds = MultimodalDataset(
-        mode="train",
         data_root=train_config.data_root,
         split_root=train_config.split_root,
         scenario_name=scenario_name,
-    )
-    val_ds = MultimodalDataset(
-        mode="val",
-        data_root=train_config.data_root,
-        split_root=train_config.split_root,
-        scenario_name=scenario_name,
+        csv_path=train_csv_path,
     )
     test_ds = MultimodalDataset(
-        mode="test",
         data_root=train_config.data_root,
         split_root=train_config.split_root,
         scenario_name=scenario_name,
+        csv_path=test_csv_path,
     )
 
     train_loader = build_dataloader(train_ds, train_config, shuffle=True)
-    val_loader = build_dataloader(val_ds, train_config, shuffle=False)
     test_loader = build_dataloader(test_ds, train_config, shuffle=False)
 
     model = BeMambaModel(model_config).to(device)
     criterion = AlphaFocalLoss(alpha=alpha_weights, gamma=train_config.gamma)
-    optimizer = torch.optim.AdamW(
+    optimizer = torch.optim.Adam(
         model.parameters(),
         lr=train_config.lr,
         weight_decay=train_config.weight_decay,
     )
     scheduler = build_scheduler(optimizer, train_config)
     scaler = GradScaler(enabled=(train_config.amp and device.type == "cuda"))
-
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(train_config.output_root, scenario_name, timestamp)
-    checkpoints_dir = os.path.join(run_dir, "checkpoints")
-    os.makedirs(checkpoints_dir, exist_ok=True)
     save_config(run_dir, train_config, model_config)
 
     log_path = os.path.join(run_dir, "train_log.csv")
@@ -254,18 +276,19 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
                 "lr",
                 "train_loss",
                 "train_acc1",
+                "train_acc2",
                 "train_acc3",
-                "val_loss",
-                "val_acc1",
-                "val_acc3",
-                "val_dba",
-                "val_apl",
+                "test_loss",
+                "test_acc1",
+                "test_acc2",
+                "test_acc3",
+                "test_dba",
+                "test_apl",
             ]
         )
 
     best_val_loss = float("inf")
     best_epoch = -1
-    early_stop_counter = 0
     start_time = time.time()
 
     for epoch in range(1, train_config.epochs + 1):
@@ -279,9 +302,9 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
             amp_enabled=(train_config.amp and device.type == "cuda"),
             grad_clip_norm=train_config.grad_clip_norm,
         )
-        val_metrics = run_epoch(
+        test_metrics = run_epoch(
             model=model,
-            loader=val_loader,
+            loader=test_loader,
             criterion=criterion,
             optimizer=None,
             scaler=None,
@@ -303,10 +326,10 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
                 f"| lr={current_lr:.2e} "
                 f"| train_loss={train_metrics['loss']:.4f} "
                 f"| train_acc3={train_metrics['acc3']:.2f}% "
-                f"| val_loss={val_metrics['loss']:.4f} "
-                f"| val_acc3={val_metrics['acc3']:.2f}% "
-                f"| val_dba={val_metrics['dba']:.4f} "
-                f"| val_apl={val_metrics['apl']:.4f} dB "
+                f"| test_loss={test_metrics['loss']:.4f} "
+                f"| test_acc3={test_metrics['acc3']:.2f}% "
+                f"| test_dba={test_metrics['dba']:.4f} "
+                f"| test_apl={test_metrics['apl']:.4f} dB "
                 f"| ETA {eta_string}"
             )
 
@@ -318,27 +341,22 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
                     f"{current_lr:.8f}",
                     f"{train_metrics['loss']:.6f}",
                     f"{train_metrics['acc1']:.4f}",
+                    f"{train_metrics['acc2']:.4f}",
                     f"{train_metrics['acc3']:.4f}",
-                    f"{val_metrics['loss']:.6f}",
-                    f"{val_metrics['acc1']:.4f}",
-                    f"{val_metrics['acc3']:.4f}",
-                    f"{val_metrics['dba']:.6f}",
-                    f"{val_metrics['apl']:.6f}",
+                    f"{test_metrics['loss']:.6f}",
+                    f"{test_metrics['acc1']:.4f}",
+                    f"{test_metrics['acc2']:.4f}",
+                    f"{test_metrics['acc3']:.4f}",
+                    f"{test_metrics['dba']:.6f}",
+                    f"{test_metrics['apl']:.6f}",
                 ]
             )
 
-        if val_metrics["loss"] < best_val_loss:
-            best_val_loss = val_metrics["loss"]
+        if test_metrics["loss"] < best_val_loss:
+            best_val_loss = test_metrics["loss"]
             best_epoch = epoch
-            early_stop_counter = 0
             torch.save(model.state_dict(), os.path.join(checkpoints_dir, "best_model.pth"))
             print(f"  -> saved best checkpoint at epoch {epoch} (val_loss={best_val_loss:.4f})")
-        else:
-            early_stop_counter += 1
-            print(f"  -> early-stop counter {early_stop_counter}/{train_config.patience}")
-            if early_stop_counter >= train_config.patience:
-                print(f"Stopping early at epoch {epoch}.")
-                break
 
         if train_config.save_every_epoch:
             torch.save(model.state_dict(), os.path.join(checkpoints_dir, f"epoch_{epoch:03d}.pth"))
@@ -361,6 +379,7 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
         f"[Final Results for {scenario_name}]\n"
         f"best_epoch: {best_epoch}\n"
         f"top1_acc: {test_metrics['acc1']:.2f}%\n"
+        f"top2_acc: {test_metrics['acc2']:.2f}%\n"
         f"top3_acc: {test_metrics['acc3']:.2f}%\n"
         f"dba: {test_metrics['dba']:.4f}\n"
         f"apl: {test_metrics['apl']:.4f} dB\n"
@@ -376,15 +395,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split-root", default="./Data/splits")
     parser.add_argument("--output-root", default="./outputs")
     parser.add_argument("--scenarios", nargs="+", default=["scenario32", "scenario33", "scenario34"])
-    parser.add_argument("--epochs", type=int, default=80)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-2)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--min-lr", type=float, default=1e-6)
-    parser.add_argument("--warmup-epochs", type=int, default=5)
+    parser.add_argument("--warmup-epochs", type=int, default=0)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
-    parser.add_argument("--patience", type=int, default=12)
+    parser.add_argument("--patience", type=int, default=0)
     parser.add_argument("--gamma", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
@@ -393,7 +412,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-pin-memory", action="store_true")
     parser.add_argument("--no-persistent-workers", action="store_true")
     parser.add_argument("--save-every-epoch", action="store_true")
-    parser.add_argument("--d-model", type=int, default=192)
+    parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--d-state", type=int, default=16)
     parser.add_argument("--d-conv", type=int, default=4)
     parser.add_argument("--expand", type=int, default=2)
