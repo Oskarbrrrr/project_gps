@@ -18,6 +18,7 @@ class MultimodalDataset(Dataset):
         split_root="./Data/splits",
         scenario_name="scenario32",
         csv_path=None,
+        image_subdir="camera_data",
         lidar_grid_size=256,
         lidar_x_range=(-30.0, 30.0),
         lidar_y_range=(-30.0, 30.0),
@@ -36,6 +37,7 @@ class MultimodalDataset(Dataset):
         lidar_virtual_jitter_radius_m=0.1,
     ):
         self.data_dir = data_root
+        self.image_subdir = image_subdir
         self.lidar_grid_size = int(lidar_grid_size)
         self.lidar_x_range = tuple(lidar_x_range)
         self.lidar_y_range = tuple(lidar_y_range)
@@ -378,13 +380,18 @@ class MultimodalDataset(Dataset):
     def __len__(self):
         return len(self.df)
 
+    def _resolve_image_path(self, rel_path):
+        normalized = rel_path.replace("\\", "/")
+        return normalized.replace("/camera_data/", f"/{self.image_subdir}/")
+
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         imgs, radars, lidars = [], [], []
         prev_points = None
 
         for t in range(1, 6):
-            img_path = os.path.join(self.data_dir, row[f"unit1_rgb_{t}"])
+            img_rel_path = self._resolve_image_path(row[f"unit1_rgb_{t}"])
+            img_path = os.path.join(self.data_dir, img_rel_path)
             imgs.append(self.img_transform(Image.open(img_path).convert("RGB")))
 
             ang_path = os.path.join(

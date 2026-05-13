@@ -25,6 +25,7 @@ class TrainConfig:
     data_root: str = "./Data/Multi_Modal"
     split_root: str = "./Data/splits"
     output_root: str = "./outputs"
+    image_subdir: str = "camera_data"
     scenarios: Tuple[str, ...] = ("scenario32", "scenario33", "scenario34")
     epochs: int = 30
     batch_size: int = 16
@@ -230,12 +231,14 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
         split_root=train_config.split_root,
         scenario_name=scenario_name,
         csv_path=train_csv_path,
+        image_subdir=train_config.image_subdir,
     )
     test_ds = MultimodalDataset(
         data_root=train_config.data_root,
         split_root=train_config.split_root,
         scenario_name=scenario_name,
         csv_path=test_csv_path,
+        image_subdir=train_config.image_subdir,
     )
 
     train_loader = build_dataloader(train_ds, train_config, shuffle=True)
@@ -371,6 +374,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", default="./Data/Multi_Modal")
     parser.add_argument("--split-root", default="./Data/splits")
     parser.add_argument("--output-root", default="./outputs")
+    parser.add_argument("--image-subdir", default="camera_data")
     parser.add_argument("--scenarios", nargs="+", default=["scenario32", "scenario33", "scenario34"])
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -408,6 +412,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         data_root=args.data_root,
         split_root=args.split_root,
         output_root=args.output_root,
+        image_subdir=args.image_subdir,
         scenarios=tuple(args.scenarios),
         epochs=args.epochs,
         batch_size=args.batch_size,
