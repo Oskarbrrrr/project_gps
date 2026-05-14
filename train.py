@@ -246,12 +246,14 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
         csv_path=train_csv_path,
         image_subdir=train_config.image_subdir,
     )
+    gps_stats = train_ds.get_gps_stats()
     test_ds = MultimodalDataset(
         data_root=train_config.data_root,
         split_root=train_config.split_root,
         scenario_name=scenario_name,
         csv_path=test_csv_path,
         image_subdir=train_config.image_subdir,
+        gps_stats=gps_stats,
     )
 
     train_loader = build_dataloader(train_ds, train_config, shuffle=True)

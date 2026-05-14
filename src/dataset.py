@@ -19,6 +19,7 @@ class MultimodalDataset(Dataset):
         scenario_name="scenario32",
         csv_path=None,
         image_subdir="camera_data",
+        gps_stats=None,
         lidar_grid_size=256,
         lidar_x_range=(-30.0, 30.0),
         lidar_y_range=(-30.0, 30.0),
@@ -38,6 +39,7 @@ class MultimodalDataset(Dataset):
     ):
         self.data_dir = data_root
         self.image_subdir = image_subdir
+        self.gps_stats = gps_stats
         self.lidar_grid_size = int(lidar_grid_size)
         self.lidar_x_range = tuple(lidar_x_range)
         self.lidar_y_range = tuple(lidar_y_range)
@@ -74,6 +76,13 @@ class MultimodalDataset(Dataset):
         self._init_gps_normalization()
 
     def _init_gps_normalization(self):
+        if self.gps_stats is not None:
+            self.min_dx = float(self.gps_stats["min_dx"])
+            self.max_dx = float(self.gps_stats["max_dx"])
+            self.min_dy = float(self.gps_stats["min_dy"])
+            self.max_dy = float(self.gps_stats["max_dy"])
+            return
+
         all_dx, all_dy = [], []
         for idx in range(len(self.df)):
             bs_lat, bs_lon = self._read_gps_raw(self.df.iloc[idx]["unit1_loc"])
@@ -88,6 +97,14 @@ class MultimodalDataset(Dataset):
             self.min_dy, self.max_dy = np.min(all_dy), np.max(all_dy)
         else:
             self.min_dx, self.max_dx, self.min_dy, self.max_dy = 0, 1, 0, 1
+
+    def get_gps_stats(self):
+        return {
+            "min_dx": float(self.min_dx),
+            "max_dx": float(self.max_dx),
+            "min_dy": float(self.min_dy),
+            "max_dy": float(self.max_dy),
+        }
 
     def _read_gps_raw(self, rel_path):
         try:
