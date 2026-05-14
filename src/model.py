@@ -157,13 +157,22 @@ class TimeSequenceBranch(nn.Module):
             patch_grid=config.patch_grid,
             pretrained=config.pretrained_backbones,
         )
-        self.channel_encoding = ChannelEncoding(config.d_model)
-        self.tf_mamba = TFMamba(
-            d_model=config.d_model,
-            d_state=config.d_state,
-            d_conv=config.d_conv,
-            expand=config.expand,
-            dropout=config.dropout,
+        self.temporal_blocks = nn.ModuleList(
+            [
+                nn.ModuleDict(
+                    {
+                        "channel_encoding": ChannelEncoding(config.d_model),
+                        "tf_mamba": TFMamba(
+                            d_model=config.d_model,
+                            d_state=config.d_state,
+                            d_conv=config.d_conv,
+                            expand=config.expand,
+                            dropout=config.dropout,
+                        ),
+                    }
+                )
+                for _ in range(config.temporal_layers)
+            ]
         )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -174,8 +183,10 @@ class TimeSequenceBranch(nn.Module):
 
         encoded = encoded.reshape(batch_size, seq_len, d_model, spatial_len)
         time_sequence = encoded.permute(0, 1, 3, 2).reshape(batch_size, seq_len * spatial_len, d_model)
-        channel_encoded = self.channel_encoding(time_sequence)
-        fused_sequence = self.tf_mamba(channel_encoded)
+        fused_sequence = time_sequence
+        for block in self.temporal_blocks:
+            channel_encoded = block["channel_encoding"](fused_sequence)
+            fused_sequence = fused_sequence + block["tf_mamba"](channel_encoded)
 
         per_time = fused_sequence.reshape(batch_size, seq_len, spatial_len, d_model)
         aggregated = per_time.sum(dim=1)
@@ -201,14 +212,19 @@ class BeMambaModel(nn.Module):
 
         self.modal_blocks = nn.ModuleList(
             [
-                MBMamba(
-                    d_model=cfg.d_model,
-                    d_state=cfg.d_state,
-                    d_conv=cfg.d_conv,
-                    expand=cfg.expand,
-                    dropout=cfg.dropout,
+                nn.ModuleList(
+                    [
+                        MBMamba(
+                            d_model=cfg.d_model,
+                            d_state=cfg.d_state,
+                            d_conv=cfg.d_conv,
+                            expand=cfg.expand,
+                            dropout=cfg.dropout,
+                        )
+                        for _ in range(3)
+                    ]
                 )
-                for _ in range(3)
+                for _ in range(cfg.fusion_layers)
             ]
         )
 
@@ -248,10 +264,17 @@ class BeMambaModel(nn.Module):
         return seq_c1, seq_c2, seq_c3
 
     def _modal_fusion(self, sequences: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        running_sequences = list(sequences)
+        for layer_blocks in self.modal_blocks:
+            next_sequences = []
+            for block, sequence in zip(layer_blocks, running_sequences):
+                encoded = block(sequence)
+                next_sequences.append(sequence + encoded)
+            running_sequences = next_sequences
+
         encoded_sequences = []
-        for block, sequence in zip(self.modal_blocks, sequences):
-            encoded = block(sequence)
-            encoded = encoded.reshape(sequence.size(0), self.spatial_len, 5, self.config.d_model)
+        for sequence in running_sequences:
+            encoded = sequence.reshape(sequence.size(0), self.spatial_len, 5, self.config.d_model)
             encoded = encoded.mean(dim=2)
             encoded_sequences.append(encoded)
 
