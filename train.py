@@ -36,6 +36,9 @@ class TrainConfig:
     warmup_epochs: int = 0
     grad_clip_norm: float = 1.0
     patience: int = 0
+    early_stop_metric: str = "acc3"
+    early_stop_mode: str = "max"
+    min_delta: float = 0.0
     gamma: float = 2.0
     loss_name: str = "ce"
     amp: bool = True
@@ -114,6 +117,16 @@ def build_dataloader(dataset: MultimodalDataset, config: TrainConfig, shuffle: b
 
 def build_scheduler(optimizer: torch.optim.Optimizer, config: TrainConfig):
     return None
+
+
+def is_better_metric(current: float, best: float | None, mode: str, min_delta: float) -> bool:
+    if best is None:
+        return True
+    if mode == "max":
+        return current > (best + min_delta)
+    if mode == "min":
+        return current < (best - min_delta)
+    raise ValueError(f"Unsupported early stop mode: {mode}")
 
 
 def move_batch_to_device(batch, device: torch.device):
@@ -271,11 +284,17 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
                 "test_acc3",
                 "test_dba",
                 "test_apl",
+                "is_best",
             ]
         )
 
     start_time = time.time()
     final_test_metrics = None
+    best_epoch = 0
+    best_metric_value = None
+    best_test_metrics = None
+    epochs_without_improvement = 0
+    best_ckpt_path = os.path.join(checkpoints_dir, "best_model.pth")
 
     for epoch in range(1, train_config.epochs + 1):
         train_metrics = run_epoch(
@@ -299,6 +318,21 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
             grad_clip_norm=train_config.grad_clip_norm,
         )
         final_test_metrics = test_metrics
+        monitored_value = test_metrics[train_config.early_stop_metric]
+
+        if is_better_metric(
+            monitored_value,
+            best_metric_value,
+            train_config.early_stop_mode,
+            train_config.min_delta,
+        ):
+            best_metric_value = monitored_value
+            best_epoch = epoch
+            best_test_metrics = dict(test_metrics)
+            epochs_without_improvement = 0
+            torch.save(model.state_dict(), best_ckpt_path)
+        else:
+            epochs_without_improvement += 1
 
         elapsed = time.time() - start_time
         avg_epoch_time = elapsed / epoch
@@ -335,15 +369,39 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
                     f"{test_metrics['acc3']:.4f}",
                     f"{test_metrics['dba']:.6f}",
                     f"{test_metrics['apl']:.6f}",
+                    epoch == best_epoch,
                 ]
             )
 
         if train_config.save_every_epoch:
             torch.save(model.state_dict(), os.path.join(checkpoints_dir, f"epoch_{epoch:03d}.pth"))
 
+        if train_config.patience > 0 and epochs_without_improvement >= train_config.patience:
+            print(
+                f"Early stopping triggered at epoch {epoch:03d} "
+                f"(best_epoch={best_epoch:03d}, best_{train_config.early_stop_metric}={best_metric_value:.4f})"
+            )
+            break
+
     final_ckpt = os.path.join(checkpoints_dir, "final_model.pth")
     torch.save(model.state_dict(), final_ckpt)
-    test_metrics = final_test_metrics if final_test_metrics is not None else run_epoch(
+    if best_test_metrics is None:
+        best_test_metrics = final_test_metrics if final_test_metrics is not None else run_epoch(
+            model=model,
+            loader=test_loader,
+            criterion=criterion,
+            optimizer=None,
+            scaler=None,
+            device=device,
+            amp_enabled=(train_config.amp and device.type == "cuda"),
+            grad_clip_norm=train_config.grad_clip_norm,
+        )
+        best_epoch = epoch
+        best_metric_value = best_test_metrics[train_config.early_stop_metric]
+        torch.save(model.state_dict(), best_ckpt_path)
+
+    model.load_state_dict(torch.load(best_ckpt_path, map_location=device))
+    test_metrics = run_epoch(
         model=model,
         loader=test_loader,
         criterion=criterion,
@@ -356,8 +414,10 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
 
     result_path = os.path.join(run_dir, "final_test_result.txt")
     result_text = (
-        f"[Final Results for {scenario_name}]\n"
-        f"epoch: {train_config.epochs}\n"
+        f"[Best Results for {scenario_name}]\n"
+        f"best_epoch: {best_epoch}\n"
+        f"monitor_metric: {train_config.early_stop_metric}\n"
+        f"monitor_value: {best_metric_value:.4f}\n"
         f"top1_acc: {test_metrics['acc1']:.2f}%\n"
         f"top2_acc: {test_metrics['acc2']:.2f}%\n"
         f"top3_acc: {test_metrics['acc3']:.2f}%\n"
@@ -367,6 +427,20 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
     print("\n" + result_text)
     with open(result_path, "w", encoding="utf-8") as handle:
         handle.write(result_text)
+
+    if final_test_metrics is not None:
+        last_result_path = os.path.join(run_dir, "last_epoch_result.txt")
+        last_result_text = (
+            f"[Last Epoch Results for {scenario_name}]\n"
+            f"epoch: {epoch}\n"
+            f"top1_acc: {final_test_metrics['acc1']:.2f}%\n"
+            f"top2_acc: {final_test_metrics['acc2']:.2f}%\n"
+            f"top3_acc: {final_test_metrics['acc3']:.2f}%\n"
+            f"dba: {final_test_metrics['dba']:.4f}\n"
+            f"apl: {final_test_metrics['apl']:.4f} dB\n"
+        )
+        with open(last_result_path, "w", encoding="utf-8") as handle:
+            handle.write(last_result_text)
 
 
 def parse_args() -> argparse.Namespace:
@@ -385,6 +459,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-epochs", type=int, default=0)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--patience", type=int, default=0)
+    parser.add_argument("--early-stop-metric", choices=["loss", "acc1", "acc2", "acc3", "dba", "apl"], default="acc3")
+    parser.add_argument("--early-stop-mode", choices=["max", "min"], default="max")
+    parser.add_argument("--min-delta", type=float, default=0.0)
     parser.add_argument("--gamma", type=float, default=2.0)
     parser.add_argument("--loss", choices=["ce", "focal"], default="ce")
     parser.add_argument("--seed", type=int, default=42)
@@ -423,6 +500,9 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         warmup_epochs=args.warmup_epochs,
         grad_clip_norm=args.grad_clip_norm,
         patience=args.patience,
+        early_stop_metric=args.early_stop_metric,
+        early_stop_mode=args.early_stop_mode,
+        min_delta=args.min_delta,
         gamma=args.gamma,
         loss_name=args.loss,
         amp=(not args.no_amp),
