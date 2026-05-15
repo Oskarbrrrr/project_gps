@@ -26,11 +26,14 @@ class TrainConfig:
     split_root: str = "./Data/splits"
     output_root: str = "./outputs"
     image_subdir: str = "camera_data"
+    lidar_representation: str = "count"
     scenarios: Tuple[str, ...] = ("scenario32", "scenario33", "scenario34")
     epochs: int = 30
     batch_size: int = 16
     num_workers: int = 8
     lr: float = 1e-4
+    optimizer_name: str = "adamw"
+    scheduler_name: str = "cosine"
     weight_decay: float = 0.0
     min_lr: float = 1e-6
     warmup_epochs: int = 0
@@ -41,6 +44,7 @@ class TrainConfig:
     min_delta: float = 0.0
     gamma: float = 2.0
     loss_name: str = "ce"
+    label_smoothing: float = 0.0
     amp: bool = True
     seed: int = 42
     pin_memory: bool = True
@@ -116,7 +120,18 @@ def build_dataloader(dataset: MultimodalDataset, config: TrainConfig, shuffle: b
 
 
 def build_scheduler(optimizer: torch.optim.Optimizer, config: TrainConfig):
-    return None
+    if config.scheduler_name == "none":
+        return None
+    if config.scheduler_name != "cosine":
+        raise ValueError(f"Unsupported scheduler: {config.scheduler_name}")
+
+    cosine_epochs = max(config.epochs - config.warmup_epochs, 1)
+    cosine = CosineAnnealingLR(optimizer, T_max=cosine_epochs, eta_min=config.min_lr)
+    if config.warmup_epochs <= 0:
+        return cosine
+
+    warmup = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=config.warmup_epochs)
+    return SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[config.warmup_epochs])
 
 
 def is_better_metric(current: float, best: float | None, mode: str, min_delta: float) -> bool:
@@ -222,7 +237,7 @@ def build_criterion(train_config: TrainConfig, alpha_weights: torch.Tensor | Non
     if train_config.loss_name == "focal":
         return AlphaFocalLoss(alpha=alpha_weights, gamma=train_config.gamma)
     if train_config.loss_name == "ce":
-        return nn.CrossEntropyLoss()
+        return nn.CrossEntropyLoss(label_smoothing=train_config.label_smoothing)
     raise ValueError(f"Unsupported loss: {train_config.loss_name}")
 
 
@@ -245,6 +260,7 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
         scenario_name=scenario_name,
         csv_path=train_csv_path,
         image_subdir=train_config.image_subdir,
+        lidar_representation=train_config.lidar_representation,
     )
     gps_stats = train_ds.get_gps_stats()
     test_ds = MultimodalDataset(
@@ -254,6 +270,7 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
         csv_path=test_csv_path,
         image_subdir=train_config.image_subdir,
         gps_stats=gps_stats,
+        lidar_representation=train_config.lidar_representation,
     )
 
     train_loader = build_dataloader(train_ds, train_config, shuffle=True)
@@ -261,11 +278,21 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
 
     model = BeMambaModel(model_config).to(device)
     criterion = build_criterion(train_config, alpha_weights)
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=train_config.lr,
-        weight_decay=train_config.weight_decay,
-    )
+    if train_config.optimizer_name == "adam":
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=train_config.lr,
+            weight_decay=train_config.weight_decay,
+        )
+    elif train_config.optimizer_name == "adamw":
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=train_config.lr,
+            weight_decay=train_config.weight_decay,
+        )
+    else:
+        raise ValueError(f"Unsupported optimizer: {train_config.optimizer_name}")
+    scheduler = build_scheduler(optimizer, train_config)
     scaler = GradScaler(enabled=(train_config.amp and device.type == "cuda"))
     save_config(run_dir, train_config, model_config)
 
@@ -375,6 +402,9 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
                 ]
             )
 
+        if scheduler is not None:
+            scheduler.step()
+
         if train_config.save_every_epoch:
             torch.save(model.state_dict(), os.path.join(checkpoints_dir, f"epoch_{epoch:03d}.pth"))
 
@@ -451,11 +481,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split-root", default="./Data/splits")
     parser.add_argument("--output-root", default="./outputs")
     parser.add_argument("--image-subdir", default="camera_data")
+    parser.add_argument("--lidar-representation", choices=["binary", "count"], default="count")
     parser.add_argument("--scenarios", nargs="+", default=["scenario32", "scenario33", "scenario34"])
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--optimizer", choices=["adam", "adamw"], default="adamw")
+    parser.add_argument("--scheduler", choices=["none", "cosine"], default="cosine")
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--min-lr", type=float, default=1e-6)
     parser.add_argument("--warmup-epochs", type=int, default=0)
@@ -466,6 +499,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-delta", type=float, default=0.0)
     parser.add_argument("--gamma", type=float, default=2.0)
     parser.add_argument("--loss", choices=["ce", "focal"], default="ce")
+    parser.add_argument("--label-smoothing", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--no-amp", action="store_true")
@@ -492,11 +526,14 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         split_root=args.split_root,
         output_root=args.output_root,
         image_subdir=args.image_subdir,
+        lidar_representation=args.lidar_representation,
         scenarios=tuple(args.scenarios),
         epochs=args.epochs,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         lr=args.lr,
+        optimizer_name=args.optimizer,
+        scheduler_name=args.scheduler,
         weight_decay=args.weight_decay,
         min_lr=args.min_lr,
         warmup_epochs=args.warmup_epochs,
@@ -507,6 +544,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         min_delta=args.min_delta,
         gamma=args.gamma,
         loss_name=args.loss,
+        label_smoothing=args.label_smoothing,
         amp=(not args.no_amp),
         seed=args.seed,
         pin_memory=(not args.no_pin_memory),

@@ -20,6 +20,7 @@ class MultimodalDataset(Dataset):
         csv_path=None,
         image_subdir="camera_data",
         gps_stats=None,
+        lidar_representation="binary",
         lidar_grid_size=256,
         lidar_x_range=(-30.0, 30.0),
         lidar_y_range=(-30.0, 30.0),
@@ -40,6 +41,7 @@ class MultimodalDataset(Dataset):
         self.data_dir = data_root
         self.image_subdir = image_subdir
         self.gps_stats = gps_stats
+        self.lidar_representation = lidar_representation
         self.lidar_grid_size = int(lidar_grid_size)
         self.lidar_x_range = tuple(lidar_x_range)
         self.lidar_y_range = tuple(lidar_y_range)
@@ -272,6 +274,16 @@ class MultimodalDataset(Dataset):
         np.add.at(count_map, (x_idx, y_idx), 1.0)
         return count_map
 
+    def _normalize_count_map(self, count_map):
+        count_map = np.asarray(count_map, dtype=np.float32)
+        if count_map.size == 0:
+            return count_map
+        count_map = np.log1p(np.clip(count_map, a_min=0.0, a_max=None))
+        max_value = float(np.max(count_map))
+        if max_value <= 1e-8:
+            return np.zeros_like(count_map, dtype=np.float32)
+        return (count_map / max_value).astype(np.float32)
+
     def _points_to_indices(self, points, grid_size):
         if points is None or len(points) == 0:
             return (
@@ -325,18 +337,23 @@ class MultimodalDataset(Dataset):
         if (not self.use_virtual_points) or prev_points is None or len(prev_points) == 0:
             zeros = np.zeros_like(base_bev, dtype=np.float32)
             zeros_coarse = np.zeros((self.lidar_motion_grid_size, self.lidar_motion_grid_size), dtype=np.float32)
+            base_count = self._normalize_count_map(self._points_to_count_map(current_points, self.lidar_grid_size))
             return {
                 "base": base_bev,
+                "base_count": base_count,
                 "coarse_current": zeros_coarse,
                 "coarse_prev": zeros_coarse,
                 "coarse_diff": zeros_coarse,
                 "raw_motion": zeros,
                 "region_mask": zeros,
                 "virtual": zeros,
+                "virtual_count": zeros,
                 "combined": base_bev.copy(),
+                "combined_count": base_count.copy(),
             }
 
         prev_bev = self._points_to_bev(prev_points, self.lidar_grid_size)
+        base_count_raw = self._points_to_count_map(current_points, self.lidar_grid_size)
         current_count = self._points_to_count_map(current_points, self.lidar_motion_grid_size)
         prev_count = self._points_to_count_map(prev_points, self.lidar_motion_grid_size)
         count_diff = current_count - prev_count
@@ -345,22 +362,27 @@ class MultimodalDataset(Dataset):
         motion_seed = self._binary_dilate(raw_motion, self.lidar_virtual_seed_expand)
         virtual_points = self._generate_virtual_points_from_motion(current_points, motion_seed)
         virtual_mask = self._points_to_bev(virtual_points, self.lidar_grid_size) > 0.5
+        virtual_count_raw = self._points_to_count_map(virtual_points, self.lidar_grid_size)
         if self.lidar_virtual_expand > 0:
             virtual_mask = self._binary_dilate(virtual_mask, self.lidar_virtual_expand)
 
         virtual_only = virtual_mask.astype(bool)
         base_mask = base_bev > 0.5
         combined = np.maximum(base_mask.astype(np.float32), virtual_mask.astype(np.float32))
+        combined_count = self._normalize_count_map(base_count_raw + virtual_count_raw)
 
         return {
             "base": base_bev.astype(np.float32),
+            "base_count": self._normalize_count_map(base_count_raw),
             "coarse_current": current_count.astype(np.float32),
             "coarse_prev": prev_count.astype(np.float32),
             "coarse_diff": np.clip(count_diff, a_min=0.0, a_max=None).astype(np.float32),
             "raw_motion": raw_motion.astype(np.float32),
             "region_mask": region_mask.astype(np.float32),
             "virtual": virtual_only.astype(np.float32),
+            "virtual_count": self._normalize_count_map(virtual_count_raw),
             "combined": combined.astype(np.float32),
+            "combined_count": combined_count.astype(np.float32),
         }
 
     def _resize_tensor(self, tensor, size=(256, 256)):
@@ -375,13 +397,16 @@ class MultimodalDataset(Dataset):
         row = self.df.iloc[idx]
         debug = {
             "base": [],
+            "base_count": [],
             "coarse_current": [],
             "coarse_prev": [],
             "coarse_diff": [],
             "raw_motion": [],
             "region_mask": [],
             "virtual": [],
+            "virtual_count": [],
             "combined": [],
+            "combined_count": [],
         }
         prev_points = None
 
@@ -433,7 +458,8 @@ class MultimodalDataset(Dataset):
             current_points = self._read_lidar_xy(row[f"unit1_lidar_{t}"])
             layers = self._build_lidar_layers(current_points, prev_points)
             prev_points = current_points.copy()
-            lidars.append(self._resize_tensor(torch.tensor(layers["combined"]).unsqueeze(0)))
+            lidar_key = "combined_count" if self.lidar_representation == "count" else "combined"
+            lidars.append(self._resize_tensor(torch.tensor(layers[lidar_key]).unsqueeze(0)))
 
         bs_lat, bs_lon = self._read_gps_raw(row["unit1_loc"])
         u1_lat, u1_lon = self._read_gps_raw(row["unit2_loc_1"])

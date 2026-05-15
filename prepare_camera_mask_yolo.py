@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
 
 try:
     from ultralytics import YOLO
@@ -22,6 +22,7 @@ def parse_args():
     parser.add_argument("--mask-subdir", default="camera_mask")
     parser.add_argument("--mask-name", default=None, help="Optional fixed mask filename inside mask-subdir.")
     parser.add_argument("--masked-subdir", default="camera_data_mask")
+    parser.add_argument("--masked-enhance-subdir", default="camera_data_mask_enhance")
     parser.add_argument("--masked-yolo-subdir", default="camera_data_mask_yolo")
     parser.add_argument("--yolo-model", default="yolov8n.pt")
     parser.add_argument("--img-size", type=int, default=960)
@@ -29,6 +30,13 @@ def parse_args():
     parser.add_argument("--device", default=None)
     parser.add_argument("--skip-yolo", action="store_true")
     parser.add_argument("--box-width", type=int, default=3)
+    parser.add_argument("--background-dim-factor", type=float, default=0.35)
+    parser.add_argument("--background-saturation-factor", type=float, default=0.55)
+    parser.add_argument("--vehicle-brightness-factor", type=float, default=1.18)
+    parser.add_argument("--vehicle-contrast-factor", type=float, default=1.22)
+    parser.add_argument("--vehicle-sharpness-factor", type=float, default=1.15)
+    parser.add_argument("--vehicle-expand", type=int, default=10)
+    parser.add_argument("--vehicle-halo-width", type=int, default=4)
     return parser.parse_args()
 
 
@@ -73,6 +81,23 @@ def apply_mask(image: Image.Image, keep_mask: np.ndarray) -> Image.Image:
     return Image.fromarray(masked_arr)
 
 
+def apply_soft_mask(
+    image: Image.Image,
+    keep_mask: np.ndarray,
+    brightness_factor: float,
+    saturation_factor: float,
+) -> Image.Image:
+    rgb_image = image.convert("RGB")
+    dimmed = ImageEnhance.Brightness(rgb_image).enhance(brightness_factor)
+    dimmed = ImageEnhance.Color(dimmed).enhance(saturation_factor)
+
+    original_arr = np.asarray(rgb_image, dtype=np.uint8)
+    dimmed_arr = np.asarray(dimmed, dtype=np.uint8)
+    keep_mask_3d = keep_mask.astype(bool)[..., None]
+    mixed_arr = np.where(keep_mask_3d, original_arr, dimmed_arr)
+    return Image.fromarray(mixed_arr)
+
+
 def build_yolo(model_name: str):
     if YOLO is None:
         raise ImportError("ultralytics is not installed. Please install it on AutoDL before running YOLO preprocessing.")
@@ -95,16 +120,61 @@ def draw_vehicle_boxes(image: Image.Image, results, box_width: int) -> Image.Ima
     return annotated
 
 
+def enhance_vehicle_regions(
+    image: Image.Image,
+    results,
+    brightness_factor: float,
+    contrast_factor: float,
+    sharpness_factor: float,
+    expand: int,
+    halo_width: int,
+) -> Image.Image:
+    enhanced = image.copy().convert("RGB")
+    draw = ImageDraw.Draw(enhanced)
+    image_w, image_h = enhanced.size
+
+    for box in results.boxes:
+        cls_id = int(box.cls.item())
+        cls_name = results.names.get(cls_id, str(cls_id)).lower()
+        if cls_name not in VEHICLE_CLASSES:
+            continue
+
+        x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
+        x1 = max(0, x1 - expand)
+        y1 = max(0, y1 - expand)
+        x2 = min(image_w, x2 + expand)
+        y2 = min(image_h, y2 + expand)
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        crop = enhanced.crop((x1, y1, x2, y2))
+        crop = ImageEnhance.Brightness(crop).enhance(brightness_factor)
+        crop = ImageEnhance.Contrast(crop).enhance(contrast_factor)
+        crop = ImageEnhance.Sharpness(crop).enhance(sharpness_factor)
+        crop = crop.filter(ImageFilter.UnsharpMask(radius=1, percent=120, threshold=2))
+        enhanced.paste(crop, (x1, y1, x2, y2))
+
+        for offset in range(max(1, halo_width)):
+            draw.rectangle(
+                [x1 - offset, y1 - offset, x2 + offset, y2 + offset],
+                outline=(255, 64, 64),
+            )
+
+    return enhanced
+
+
 def process_scenario(args, scenario_name: str, yolo_model):
     unit1_dir = Path(args.data_root) / scenario_name / "unit1"
     source_dir = unit1_dir / args.source_subdir
     masked_dir = unit1_dir / args.masked_subdir
+    masked_enhance_dir = unit1_dir / args.masked_enhance_subdir
     masked_yolo_dir = unit1_dir / args.masked_yolo_subdir
 
     if not source_dir.exists():
         raise FileNotFoundError(f"Source image directory not found: {source_dir}")
 
     masked_dir.mkdir(parents=True, exist_ok=True)
+    masked_enhance_dir.mkdir(parents=True, exist_ok=True)
     if not args.skip_yolo:
         masked_yolo_dir.mkdir(parents=True, exist_ok=True)
 
@@ -120,6 +190,12 @@ def process_scenario(args, scenario_name: str, yolo_model):
         image = Image.open(image_path).convert("RGB")
         keep_mask = load_binary_mask(mask_path, image.size)
         masked_image = apply_mask(image, keep_mask)
+        soft_masked_image = apply_soft_mask(
+            image,
+            keep_mask,
+            brightness_factor=args.background_dim_factor,
+            saturation_factor=args.background_saturation_factor,
+        )
 
         masked_output_path = masked_dir / image_path.name
         masked_image.save(masked_output_path)
@@ -134,6 +210,18 @@ def process_scenario(args, scenario_name: str, yolo_model):
             )[0]
             annotated = draw_vehicle_boxes(masked_image, results, args.box_width)
             annotated.save(masked_yolo_dir / image_path.name)
+            enhanced = enhance_vehicle_regions(
+                soft_masked_image,
+                results,
+                brightness_factor=args.vehicle_brightness_factor,
+                contrast_factor=args.vehicle_contrast_factor,
+                sharpness_factor=args.vehicle_sharpness_factor,
+                expand=args.vehicle_expand,
+                halo_width=args.vehicle_halo_width,
+            )
+            enhanced.save(masked_enhance_dir / image_path.name)
+        else:
+            soft_masked_image.save(masked_enhance_dir / image_path.name)
 
         if index % 200 == 0 or index == len(image_paths):
             print(f"[{scenario_name}] processed {index}/{len(image_paths)}")
