@@ -37,6 +37,8 @@ def parse_args():
     parser.add_argument("--vehicle-sharpness-factor", type=float, default=1.15)
     parser.add_argument("--vehicle-expand", type=int, default=10)
     parser.add_argument("--vehicle-halo-width", type=int, default=4)
+    parser.add_argument("--mask-fill-small-holes", type=int, default=12000)
+    parser.add_argument("--mask-remove-small-islands", type=int, default=12000)
     return parser.parse_args()
 
 
@@ -59,7 +61,65 @@ def find_mask_path(unit1_dir: Path, scenario_name: str, mask_subdir: str, mask_n
     raise FileNotFoundError(f"Could not find fixed mask for {scenario_name} under {mask_dir}")
 
 
-def load_binary_mask(mask_path: Path, target_size: tuple[int, int]) -> np.ndarray:
+def connected_components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    mask = mask.astype(bool)
+    visited = np.zeros_like(mask, dtype=bool)
+    height, width = mask.shape
+    components = []
+
+    for x in range(height):
+        for y in range(width):
+            if (not mask[x, y]) or visited[x, y]:
+                continue
+
+            stack = [(x, y)]
+            visited[x, y] = True
+            coords = []
+
+            while stack:
+                cx, cy = stack.pop()
+                coords.append((cx, cy))
+
+                for nx in range(max(0, cx - 1), min(height, cx + 2)):
+                    for ny in range(max(0, cy - 1), min(width, cy + 2)):
+                        if mask[nx, ny] and (not visited[nx, ny]):
+                            visited[nx, ny] = True
+                            stack.append((nx, ny))
+
+            components.append(coords)
+
+    return components
+
+
+def clean_fixed_mask(keep_mask: np.ndarray, fill_small_holes: int, remove_small_islands: int) -> np.ndarray:
+    keep_mask = keep_mask.astype(bool)
+
+    if fill_small_holes > 0:
+        masked_area = ~keep_mask
+        for coords in connected_components(masked_area):
+            touches_border = any(
+                x == 0 or y == 0 or x == keep_mask.shape[0] - 1 or y == keep_mask.shape[1] - 1
+                for x, y in coords
+            )
+            if (not touches_border) and len(coords) <= fill_small_holes:
+                for x, y in coords:
+                    keep_mask[x, y] = True
+
+    if remove_small_islands > 0:
+        for coords in connected_components(keep_mask):
+            if len(coords) <= remove_small_islands:
+                for x, y in coords:
+                    keep_mask[x, y] = False
+
+    return keep_mask.astype(np.uint8)
+
+
+def load_binary_mask(
+    mask_path: Path,
+    target_size: tuple[int, int],
+    fill_small_holes: int,
+    remove_small_islands: int,
+) -> np.ndarray:
     mask_img = Image.open(mask_path).convert("RGB").resize(target_size, Image.NEAREST)
     mask_arr = np.asarray(mask_img, dtype=np.uint8)
 
@@ -71,7 +131,7 @@ def load_binary_mask(mask_path: Path, target_size: tuple[int, int]) -> np.ndarra
     if keep_mask.mean() < 0.01:
         gray = np.asarray(mask_img.convert("L"), dtype=np.uint8)
         keep_mask = gray > 127
-    return keep_mask.astype(np.uint8)
+    return clean_fixed_mask(keep_mask, fill_small_holes, remove_small_islands)
 
 
 def apply_mask(image: Image.Image, keep_mask: np.ndarray) -> Image.Image:
@@ -188,7 +248,12 @@ def process_scenario(args, scenario_name: str, yolo_model):
 
     for index, image_path in enumerate(image_paths, start=1):
         image = Image.open(image_path).convert("RGB")
-        keep_mask = load_binary_mask(mask_path, image.size)
+        keep_mask = load_binary_mask(
+            mask_path,
+            image.size,
+            fill_small_holes=args.mask_fill_small_holes,
+            remove_small_islands=args.mask_remove_small_islands,
+        )
         masked_image = apply_mask(image, keep_mask)
         soft_masked_image = apply_soft_mask(
             image,
