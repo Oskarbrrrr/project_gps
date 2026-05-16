@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
+from PIL import Image, ImageDraw
 
 try:
     from ultralytics import YOLO
@@ -21,24 +21,29 @@ def parse_args():
     parser.add_argument("--source-subdir", default="camera_data")
     parser.add_argument("--mask-subdir", default="camera_mask")
     parser.add_argument("--mask-name", default=None, help="Optional fixed mask filename inside mask-subdir.")
+    parser.add_argument("--invert-mask", action="store_true", help="Invert the final keep/drop mask polarity.")
     parser.add_argument("--masked-subdir", default="camera_data_mask")
-    parser.add_argument("--masked-enhance-subdir", default="camera_data_mask_enhance")
     parser.add_argument("--masked-yolo-subdir", default="camera_data_mask_yolo")
     parser.add_argument("--yolo-model", default="yolov8n.pt")
     parser.add_argument("--img-size", type=int, default=960)
     parser.add_argument("--conf", type=float, default=0.2)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--yolo-batch-size", type=int, default=32)
+    parser.add_argument("--half", action="store_true", help="Use FP16 YOLO inference when supported by the GPU.")
     parser.add_argument("--skip-yolo", action="store_true")
     parser.add_argument("--box-width", type=int, default=3)
-    parser.add_argument("--background-dim-factor", type=float, default=0.35)
-    parser.add_argument("--background-saturation-factor", type=float, default=0.55)
-    parser.add_argument("--vehicle-brightness-factor", type=float, default=1.18)
-    parser.add_argument("--vehicle-contrast-factor", type=float, default=1.22)
-    parser.add_argument("--vehicle-sharpness-factor", type=float, default=1.15)
-    parser.add_argument("--vehicle-expand", type=int, default=10)
-    parser.add_argument("--vehicle-halo-width", type=int, default=4)
-    parser.add_argument("--mask-fill-small-holes", type=int, default=12000)
-    parser.add_argument("--mask-remove-small-islands", type=int, default=12000)
+    parser.add_argument(
+        "--fill-hole-max-area",
+        type=int,
+        default=0,
+        help="Fill masked holes up to this pixel area after resizing the fixed mask. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--fill-side-hole-max-area",
+        type=int,
+        default=0,
+        help="Also fill masked regions up to this pixel area when they only touch the left/right image border.",
+    )
     return parser.parse_args()
 
 
@@ -61,67 +66,17 @@ def find_mask_path(unit1_dir: Path, scenario_name: str, mask_subdir: str, mask_n
     raise FileNotFoundError(f"Could not find fixed mask for {scenario_name} under {mask_dir}")
 
 
-def connected_components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
-    mask = mask.astype(bool)
-    visited = np.zeros_like(mask, dtype=bool)
-    height, width = mask.shape
-    components = []
-
-    for x in range(height):
-        for y in range(width):
-            if (not mask[x, y]) or visited[x, y]:
-                continue
-
-            stack = [(x, y)]
-            visited[x, y] = True
-            coords = []
-
-            while stack:
-                cx, cy = stack.pop()
-                coords.append((cx, cy))
-
-                for nx in range(max(0, cx - 1), min(height, cx + 2)):
-                    for ny in range(max(0, cy - 1), min(width, cy + 2)):
-                        if mask[nx, ny] and (not visited[nx, ny]):
-                            visited[nx, ny] = True
-                            stack.append((nx, ny))
-
-            components.append(coords)
-
-    return components
-
-
-def clean_fixed_mask(keep_mask: np.ndarray, fill_small_holes: int, remove_small_islands: int) -> np.ndarray:
-    keep_mask = keep_mask.astype(bool)
-
-    if fill_small_holes > 0:
-        masked_area = ~keep_mask
-        for coords in connected_components(masked_area):
-            touches_border = any(
-                x == 0 or y == 0 or x == keep_mask.shape[0] - 1 or y == keep_mask.shape[1] - 1
-                for x, y in coords
-            )
-            if (not touches_border) and len(coords) <= fill_small_holes:
-                for x, y in coords:
-                    keep_mask[x, y] = True
-
-    if remove_small_islands > 0:
-        for coords in connected_components(keep_mask):
-            if len(coords) <= remove_small_islands:
-                for x, y in coords:
-                    keep_mask[x, y] = False
-
-    return keep_mask.astype(np.uint8)
-
-
-def load_binary_mask(
-    mask_path: Path,
-    target_size: tuple[int, int],
-    fill_small_holes: int,
-    remove_small_islands: int,
-) -> np.ndarray:
+def load_binary_mask(mask_path: Path, target_size: tuple[int, int], invert_mask: bool = False) -> np.ndarray:
     mask_img = Image.open(mask_path).convert("RGB").resize(target_size, Image.NEAREST)
     mask_arr = np.asarray(mask_img, dtype=np.uint8)
+
+    unique_sample = np.unique(mask_arr.reshape(-1, 3), axis=0)
+    if len(unique_sample) <= 4 and np.all((unique_sample < 8) | (unique_sample > 247)):
+        gray = np.asarray(mask_img.convert("L"), dtype=np.uint8)
+        keep_mask = gray > 127
+        if invert_mask:
+            keep_mask = ~keep_mask
+        return keep_mask.astype(np.uint8)
 
     blue_dominant = (mask_arr[..., 2] > 180) & (mask_arr[..., 2] > mask_arr[..., 1] + 40) & (
         mask_arr[..., 2] > mask_arr[..., 0] + 40
@@ -131,7 +86,57 @@ def load_binary_mask(
     if keep_mask.mean() < 0.01:
         gray = np.asarray(mask_img.convert("L"), dtype=np.uint8)
         keep_mask = gray > 127
-    return clean_fixed_mask(keep_mask, fill_small_holes, remove_small_islands)
+    if invert_mask:
+        keep_mask = ~keep_mask
+    return keep_mask.astype(np.uint8)
+
+
+def fill_small_mask_holes(keep_mask: np.ndarray, max_area: int, side_max_area: int = 0) -> np.ndarray:
+    if max_area <= 0 and side_max_area <= 0:
+        return keep_mask
+
+    keep_mask = keep_mask.astype(bool)
+    masked = ~keep_mask
+    visited = np.zeros_like(masked, dtype=bool)
+    height, width = masked.shape
+    filled = keep_mask.copy()
+
+    for start_y in range(height):
+        for start_x in range(width):
+            if not masked[start_y, start_x] or visited[start_y, start_x]:
+                continue
+
+            stack = [(start_y, start_x)]
+            visited[start_y, start_x] = True
+            component = []
+            touches_top_or_bottom = False
+            touches_left_or_right = False
+
+            while stack:
+                y, x = stack.pop()
+                component.append((y, x))
+                if y == 0 or y == height - 1:
+                    touches_top_or_bottom = True
+                if x == 0 or x == width - 1:
+                    touches_left_or_right = True
+
+                for ny in range(max(0, y - 1), min(height, y + 2)):
+                    for nx in range(max(0, x - 1), min(width, x + 2)):
+                        if masked[ny, nx] and not visited[ny, nx]:
+                            visited[ny, nx] = True
+                            stack.append((ny, nx))
+
+            is_enclosed_hole = (not touches_top_or_bottom) and (not touches_left_or_right)
+            is_side_hole = touches_left_or_right and (not touches_top_or_bottom)
+            should_fill = (is_enclosed_hole and len(component) <= max_area) or (
+                is_side_hole and len(component) <= side_max_area
+            )
+
+            if should_fill:
+                ys, xs = zip(*component)
+                filled[np.asarray(ys), np.asarray(xs)] = True
+
+    return filled.astype(np.uint8)
 
 
 def apply_mask(image: Image.Image, keep_mask: np.ndarray) -> Image.Image:
@@ -139,23 +144,6 @@ def apply_mask(image: Image.Image, keep_mask: np.ndarray) -> Image.Image:
     masked_arr = image_arr.copy()
     masked_arr[keep_mask == 0] = 0
     return Image.fromarray(masked_arr)
-
-
-def apply_soft_mask(
-    image: Image.Image,
-    keep_mask: np.ndarray,
-    brightness_factor: float,
-    saturation_factor: float,
-) -> Image.Image:
-    rgb_image = image.convert("RGB")
-    dimmed = ImageEnhance.Brightness(rgb_image).enhance(brightness_factor)
-    dimmed = ImageEnhance.Color(dimmed).enhance(saturation_factor)
-
-    original_arr = np.asarray(rgb_image, dtype=np.uint8)
-    dimmed_arr = np.asarray(dimmed, dtype=np.uint8)
-    keep_mask_3d = keep_mask.astype(bool)[..., None]
-    mixed_arr = np.where(keep_mask_3d, original_arr, dimmed_arr)
-    return Image.fromarray(mixed_arr)
 
 
 def build_yolo(model_name: str):
@@ -180,61 +168,35 @@ def draw_vehicle_boxes(image: Image.Image, results, box_width: int) -> Image.Ima
     return annotated
 
 
-def enhance_vehicle_regions(
-    image: Image.Image,
-    results,
-    brightness_factor: float,
-    contrast_factor: float,
-    sharpness_factor: float,
-    expand: int,
-    halo_width: int,
-) -> Image.Image:
-    enhanced = image.copy().convert("RGB")
-    draw = ImageDraw.Draw(enhanced)
-    image_w, image_h = enhanced.size
+def flush_yolo_batch(yolo_model, pending_items: list[tuple[Path, Path]], args) -> None:
+    if not pending_items:
+        return
 
-    for box in results.boxes:
-        cls_id = int(box.cls.item())
-        cls_name = results.names.get(cls_id, str(cls_id)).lower()
-        if cls_name not in VEHICLE_CLASSES:
-            continue
-
-        x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
-        x1 = max(0, x1 - expand)
-        y1 = max(0, y1 - expand)
-        x2 = min(image_w, x2 + expand)
-        y2 = min(image_h, y2 + expand)
-        if x2 <= x1 or y2 <= y1:
-            continue
-
-        crop = enhanced.crop((x1, y1, x2, y2))
-        crop = ImageEnhance.Brightness(crop).enhance(brightness_factor)
-        crop = ImageEnhance.Contrast(crop).enhance(contrast_factor)
-        crop = ImageEnhance.Sharpness(crop).enhance(sharpness_factor)
-        crop = crop.filter(ImageFilter.UnsharpMask(radius=1, percent=120, threshold=2))
-        enhanced.paste(crop, (x1, y1, x2, y2))
-
-        for offset in range(max(1, halo_width)):
-            draw.rectangle(
-                [x1 - offset, y1 - offset, x2 + offset, y2 + offset],
-                outline=(255, 64, 64),
-            )
-
-    return enhanced
+    results_list = yolo_model.predict(
+        source=[str(masked_path) for masked_path, _ in pending_items],
+        imgsz=args.img_size,
+        conf=args.conf,
+        device=args.device,
+        batch=args.yolo_batch_size,
+        half=args.half,
+        verbose=False,
+    )
+    for (masked_path, yolo_output_path), results in zip(pending_items, results_list):
+        masked_image = Image.open(masked_path).convert("RGB")
+        annotated = draw_vehicle_boxes(masked_image, results, args.box_width)
+        annotated.save(yolo_output_path)
 
 
 def process_scenario(args, scenario_name: str, yolo_model):
     unit1_dir = Path(args.data_root) / scenario_name / "unit1"
     source_dir = unit1_dir / args.source_subdir
     masked_dir = unit1_dir / args.masked_subdir
-    masked_enhance_dir = unit1_dir / args.masked_enhance_subdir
     masked_yolo_dir = unit1_dir / args.masked_yolo_subdir
 
     if not source_dir.exists():
         raise FileNotFoundError(f"Source image directory not found: {source_dir}")
 
     masked_dir.mkdir(parents=True, exist_ok=True)
-    masked_enhance_dir.mkdir(parents=True, exist_ok=True)
     if not args.skip_yolo:
         masked_yolo_dir.mkdir(parents=True, exist_ok=True)
 
@@ -246,50 +208,35 @@ def process_scenario(args, scenario_name: str, yolo_model):
     print(f"[{scenario_name}] source={source_dir}")
     print(f"[{scenario_name}] mask={mask_path}")
 
+    pending_yolo_items = []
+    mask_cache = {}
     for index, image_path in enumerate(image_paths, start=1):
         image = Image.open(image_path).convert("RGB")
-        keep_mask = load_binary_mask(
-            mask_path,
-            image.size,
-            fill_small_holes=args.mask_fill_small_holes,
-            remove_small_islands=args.mask_remove_small_islands,
-        )
+        if image.size not in mask_cache:
+            keep_mask = load_binary_mask(mask_path, image.size, invert_mask=args.invert_mask)
+            keep_mask = fill_small_mask_holes(
+                keep_mask,
+                max_area=args.fill_hole_max_area,
+                side_max_area=args.fill_side_hole_max_area,
+            )
+            mask_cache[image.size] = keep_mask
+        keep_mask = mask_cache[image.size]
         masked_image = apply_mask(image, keep_mask)
-        soft_masked_image = apply_soft_mask(
-            image,
-            keep_mask,
-            brightness_factor=args.background_dim_factor,
-            saturation_factor=args.background_saturation_factor,
-        )
 
         masked_output_path = masked_dir / image_path.name
         masked_image.save(masked_output_path)
 
         if not args.skip_yolo:
-            results = yolo_model.predict(
-                source=np.asarray(masked_image),
-                imgsz=args.img_size,
-                conf=args.conf,
-                device=args.device,
-                verbose=False,
-            )[0]
-            annotated = draw_vehicle_boxes(masked_image, results, args.box_width)
-            annotated.save(masked_yolo_dir / image_path.name)
-            enhanced = enhance_vehicle_regions(
-                soft_masked_image,
-                results,
-                brightness_factor=args.vehicle_brightness_factor,
-                contrast_factor=args.vehicle_contrast_factor,
-                sharpness_factor=args.vehicle_sharpness_factor,
-                expand=args.vehicle_expand,
-                halo_width=args.vehicle_halo_width,
-            )
-            enhanced.save(masked_enhance_dir / image_path.name)
-        else:
-            soft_masked_image.save(masked_enhance_dir / image_path.name)
+            pending_yolo_items.append((masked_output_path, masked_yolo_dir / image_path.name))
+            if len(pending_yolo_items) >= args.yolo_batch_size:
+                flush_yolo_batch(yolo_model, pending_yolo_items, args)
+                pending_yolo_items = []
 
         if index % 200 == 0 or index == len(image_paths):
             print(f"[{scenario_name}] processed {index}/{len(image_paths)}")
+
+    if not args.skip_yolo:
+        flush_yolo_batch(yolo_model, pending_yolo_items, args)
 
 
 def main():

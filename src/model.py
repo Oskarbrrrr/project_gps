@@ -21,6 +21,8 @@ class BeMambaConfig:
     temporal_layers: int = 1
     fusion_layers: int = 1
     freeze_image_stem: bool = False
+    temporal_order: str = "forward"
+    spatial_scan: str = "vertical"
 
 
 class ChannelEncoding(nn.Module):
@@ -68,7 +70,6 @@ class MBMamba(nn.Module):
         self.weight_proj = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.ReLU(),
-            nn.Linear(d_model, d_model),
         )
         self.dropout = nn.Dropout(dropout)
 
@@ -140,6 +141,12 @@ class ModalityBackbone(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d((patch_grid, patch_grid))
         self.project = nn.Identity() if out_channels == d_model else nn.Conv2d(out_channels, d_model, kernel_size=1, bias=False)
 
+    def freeze_stem(self) -> None:
+        for module in (self.features[0], self.features[1]):
+            for parameter in module.parameters():
+                parameter.requires_grad = False
+        self.features[1].eval()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feat = self.features(x)
         feat = self.pool(feat)
@@ -157,6 +164,12 @@ class TimeSequenceBranch(nn.Module):
             patch_grid=config.patch_grid,
             pretrained=config.pretrained_backbones,
         )
+        if config.temporal_order not in {"forward", "reverse"}:
+            raise ValueError(f"Unsupported temporal_order: {config.temporal_order}")
+        if config.spatial_scan not in {"row", "vertical"}:
+            raise ValueError(f"Unsupported spatial_scan: {config.spatial_scan}")
+        self.temporal_order = config.temporal_order
+        self.spatial_scan = config.spatial_scan
         self.temporal_blocks = nn.ModuleList(
             [
                 nn.ModuleDict(
@@ -175,13 +188,29 @@ class TimeSequenceBranch(nn.Module):
             ]
         )
 
+    def freeze_stem(self) -> None:
+        self.encoder.freeze_stem()
+
+    def _flatten_spatial(self, encoded: torch.Tensor) -> torch.Tensor:
+        if self.spatial_scan == "vertical":
+            encoded = encoded.transpose(-1, -2)
+        return encoded.flatten(start_dim=-2)
+
+    def _tokens_to_map(self, tokens: torch.Tensor, pooled_h: int, pooled_w: int) -> torch.Tensor:
+        if self.spatial_scan == "vertical":
+            return tokens.reshape(tokens.size(0), pooled_w, pooled_h, tokens.size(-1)).transpose(1, 2)
+        return tokens.reshape(tokens.size(0), pooled_h, pooled_w, tokens.size(-1))
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, channels, height, width = x.shape
         encoded = self.encoder(x.reshape(batch_size * seq_len, channels, height, width))
         _, d_model, pooled_h, pooled_w = encoded.shape
         spatial_len = pooled_h * pooled_w
 
-        encoded = encoded.reshape(batch_size, seq_len, d_model, spatial_len)
+        encoded = encoded.reshape(batch_size, seq_len, d_model, pooled_h, pooled_w)
+        encoded = self._flatten_spatial(encoded)
+        if self.temporal_order == "reverse":
+            encoded = torch.flip(encoded, dims=[1])
         time_sequence = encoded.permute(0, 1, 3, 2).reshape(batch_size, seq_len * spatial_len, d_model)
         fused_sequence = time_sequence
         for block in self.temporal_blocks:
@@ -190,7 +219,7 @@ class TimeSequenceBranch(nn.Module):
 
         per_time = fused_sequence.reshape(batch_size, seq_len, spatial_len, d_model)
         aggregated = per_time.sum(dim=1)
-        feature_map = aggregated.permute(0, 2, 1).reshape(batch_size, d_model, pooled_h, pooled_w)
+        feature_map = self._tokens_to_map(aggregated, pooled_h, pooled_w).permute(0, 3, 1, 2)
         return aggregated, feature_map
 
 
@@ -200,10 +229,13 @@ class BeMambaModel(nn.Module):
         self.config = config or BeMambaConfig()
         cfg = self.config
         self.spatial_len = cfg.patch_grid * cfg.patch_grid
+        self.freeze_image_stem = cfg.freeze_image_stem
 
         self.image_branch = TimeSequenceBranch("resnet34", 3, cfg)
         self.lidar_branch = TimeSequenceBranch("resnet18", 1, cfg)
         self.radar_branch = TimeSequenceBranch("resnet18", 2, cfg)
+        if cfg.freeze_image_stem:
+            self.image_branch.freeze_stem()
         self.gps_projection = GPSProjection(cfg.d_model, cfg.gps_hidden_dim, cfg.dropout)
 
         self.image_align = nn.Linear(cfg.d_model, cfg.d_model)
@@ -238,6 +270,12 @@ class BeMambaModel(nn.Module):
             nn.Dropout(cfg.dropout),
             nn.Linear(2048, cfg.num_classes),
         )
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_image_stem:
+            self.image_branch.encoder.features[1].eval()
+        return self
 
     def _build_modal_sequences(
         self,

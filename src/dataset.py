@@ -39,6 +39,7 @@ class MultimodalDataset(Dataset):
         lidar_virtual_jitter_radius_m=0.1,
     ):
         self.data_dir = data_root
+        self.mode = mode
         self.image_subdir = image_subdir
         self.gps_stats = gps_stats
         self.lidar_representation = lidar_representation
@@ -309,10 +310,14 @@ class MultimodalDataset(Dataset):
         if len(motion_points) == 0:
             return np.zeros((0, 2), dtype=np.float32)
 
-        angles = np.random.uniform(0.0, 2.0 * np.pi, size=len(motion_points))
-        radii = np.sqrt(np.random.uniform(0.0, 1.0, size=len(motion_points))) * self.lidar_virtual_jitter_radius_m
-        offsets = np.stack([radii * np.cos(angles), radii * np.sin(angles)], axis=1)
-        virtual_points = motion_points + offsets.astype(np.float32)
+        if self.mode == "train" and self.lidar_virtual_jitter_radius_m > 0:
+            angles = np.random.uniform(0.0, 2.0 * np.pi, size=len(motion_points))
+            radii = np.sqrt(np.random.uniform(0.0, 1.0, size=len(motion_points))) * self.lidar_virtual_jitter_radius_m
+            offsets = np.stack([radii * np.cos(angles), radii * np.sin(angles)], axis=1)
+            virtual_points = motion_points + offsets.astype(np.float32)
+        else:
+            # Keep evaluation deterministic: preserve one-to-one virtual points without random perturbation.
+            virtual_points = motion_points.astype(np.float32, copy=True)
 
         x_min, x_max = self.lidar_x_range
         y_min, y_max = self.lidar_y_range

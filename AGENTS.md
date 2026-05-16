@@ -1,5 +1,11 @@
 # AGENTS
 
+## Paper Page Index
+
+- 论文逐页摘要与图片映射见：[PAPER_PAGE_INDEX.md](/D:/code/project_gps/PAPER_PAGE_INDEX.md)
+- 对应图片目录：`paper_pages/001.jpg` 到 `paper_pages/014.jpg`
+- 需要快速查找架构图、公式、主结果、消融表时，优先打开 `PAPER_PAGE_INDEX.md`
+
 ## 1. 项目定位
 
 这是一个用于复现论文 `BeMamba: Efficient Multimodal Sensing-Aided Beamforming via State Space Model` 的本地代码仓库。
@@ -224,150 +230,243 @@ GPS 当前处理为：
 - 真实 beam 落在 top-3 中则记为命中
 - 最终统计测试集 `Top-3 Accuracy`
 
-## 7. 截至 2026-05-15 的最新可信结果
+## 7. 截至 2026-05-17 的最新可信结果
 
-以下结果均指最近这轮“较可信配置”下的 best checkpoint 结果，而不是最后一轮结果。
+以下结果均指当前代码下、best checkpoint 重新评估后的可信结果，而不是最后一轮结果。
 
-### 7.1 scenario33
+### 7.1 scenario32
 
-较优配置：
+当前最优配置：
 
-- `image_subdir = camera_data_mask_yolo`
+- `split_root = ./Data/splits_paper80`
+- `--no-merge-trainval`
+- `image_subdir = camera_data_mask`
 - `temporal_layers = 2`
 - `fusion_layers = 2`
-- `batch_size = 48`
+- `spatial_scan = row`
+- `temporal_order = reverse`
+- `optimizer = adamw`
+- `weight_decay = 1e-4`
+- `dropout = 0.25`
+- `loss = power_soft_ce`
+- `soft_power_temperature = 0.15`
+- `hard_loss_weight = 0.6`
+- `seed = 7`
 
 结果：
 
-- Top-1: `44.14%`
-- Top-2: `67.84%`
-- Top-3: `79.69%`
-- DBA: `0.8726`
-- APL: `0.1361 dB`
+- Top-1: `41.89%`
+- Top-2: `69.98%`
+- Top-3: `82.83%`
+- DBA: `0.8712`
+- APL: `0.0981 dB`
+- best_epoch: `14`
+
+补充说明：
+
+- `temp = 0.2` 也能跑到 `82.83%`
+- 但 `temp = 0.15` 的 DBA / APL 略优，因此当前默认保留 `0.15`
+- `camera_data`
+- `camera_data_mask_yolo`
+- `vertical`
+- `freeze_image_stem`
+
+这些方向都试过，但没有超过当前 best。
+
+### 7.2 scenario33
+
+当前最优配置：
+
+- `split_root = ./Data/splits_paper80`
+- `--no-merge-trainval`
+- `image_subdir = camera_data_mask_yolo`
+- `temporal_layers = 2`
+- `fusion_layers = 2`
+- `spatial_scan = row`
+- `temporal_order = reverse`
+- `optimizer = adamw`
+- `weight_decay = 1e-4`
+- `dropout = 0.25`
+- `loss = power_soft_ce`
+- `soft_power_temperature = 0.15`
+- `hard_loss_weight = 0.6`
+- `seed = 7`
+
+结果：
+
+- Top-1: `45.05%`
+- Top-2: `66.80%`
+- Top-3: `80.99%`
+- DBA: `0.8621`
+- APL: `0.1295 dB`
 - best_epoch: `17`
 
-### 7.2 scenario34
+### 7.3 scenario34
 
-较优配置：
+当前最优配置：
 
+- `split_root = ./Data/splits_paper80`
+- `--no-merge-trainval`
 - `image_subdir = camera_data_mask_yolo`
 - `temporal_layers = 2`
 - `fusion_layers = 2`
-- `batch_size = 48`
+- `spatial_scan = row`
+- `temporal_order = reverse`
+- `optimizer = adamw`
+- `weight_decay = 1e-4`
+- `dropout = 0.25`
+- `loss = power_soft_ce`
+- `soft_power_temperature = 0.15`
+- `hard_loss_weight = 0.6`
+- `seed = 7`
 
 结果：
 
-- Top-1: `41.12%`
-- Top-2: `65.91%`
-- Top-3: `81.64%`
-- DBA: `0.8784`
-- APL: `0.1070 dB`
-- best_epoch: `20`
-
-### 7.3 scenario32
-
-当前测试过的较优配置之一：
-
-- `image_subdir = camera_data`
-- `temporal_layers = 2`
-- `fusion_layers = 2`
-- `batch_size = 48`
-
-最近结果：
-
-- Top-1: `41.25%`
-- Top-2: `66.45%`
-- Top-3: `78.81%`
-- DBA: `0.8653`
-- APL: `0.2861 dB`
-- best_epoch: `16`
-
-此前跑过的相近结果：
-
-- `camera_data`: Top-3 约 `79.78%`
-- `camera_data_mask`: Top-3 约 `79.61%`
-
-结论：
-
-- `scenario32` 目前稳定在 `79%` 左右
-- 仍明显低于论文的 `88.11%`
-- 它的主要瓶颈暂时看起来**不是**图像 mask 目录的选择
+- Top-1: `47.68%`
+- Top-2: `71.16%`
+- Top-3: `85.58%`
+- DBA: `0.8979`
+- APL: `0.0841 dB`
+- best_epoch: `22`
 
 ## 8. 当前与论文的差距
 
-论文表格里，四模态 BeMamba 的 Top-3 Accuracy 为：
+论文表格中，四模态 BeMamba 的 Top-3 Accuracy 为：
 
 - SC32: `88.11%`
 - SC33: `84.94%`
 - SC34: `85.64%`
 
-当前较可信结果与论文差距：
+当前最佳复现结果与论文差距：
 
-- SC32: `78.81%`，差约 `9.30`
-- SC33: `79.69%`，差约 `5.25`
-- SC34: `81.64%`，差约 `4.00`
+- SC32: `82.83%`，差 `5.28`
+- SC33: `80.99%`，差 `3.95`
+- SC34: `85.58%`，差 `0.06`
 
-也就是说：
+整体平均 Top-3：
 
-- `scenario34` 已经进入论文差距 `5%` 以内
-- `scenario33` 已经非常接近 `5%` 以内
-- `scenario32` 仍然是当前最主要短板
+- 论文平均：`86.23%`
+- 当前平均：`83.13%`
+- 平均差距：`3.10`
+
+结论：
+
+- `scenario34` 基本复现到论文水平
+- `scenario33` 已进入论文差距 `5%` 以内
+- `scenario32` 仍是唯一没有进入 `5%` 以内的场景
+- `scenario32` 距离进入 `5%` 以内只差 `0.28`
 
 ## 9. 当前最明确的结论
 
-1. 图像模态对夜景场景收益很大
-   - `scenario33`、`scenario34` 明显受益于 `mask + yolo`
+1. 夜景场景显著受益于 `mask + yolo`
+   - `scenario33`、`scenario34` 推荐优先使用 `camera_data_mask_yolo`
 
-2. 把 `temporal_layers` 和 `fusion_layers` 真正接通以后，结果有实质提升
-   - 尤其是 `scenario33`
+2. `scenario32` 的主要提升不来自 YOLO 红框
+   - 它的 best 来自 `camera_data_mask`
+   - `camera_data_mask_yolo` 不是当前最优方向
 
-3. `scenario32` 的问题不是简单靠 `camera_data_mask_yolo` 就能解决
-   - `camera_data` 和 `camera_data_mask` 都只能到 `79%` 左右
+3. 对 `scenario32` 真正有效的提升来自更贴论文的训练协议
+   - `paper80_20` split
+   - `--no-merge-trainval`
+   - `row + reverse`
+   - `power_soft_ce`
 
-4. GPS 归一化 train/test 不一致已经修复
-   - 这是实现正确性修复
-   - 但它不是当前 `scenario32` 的主要提升来源
+4. 评估稳定性修复是必要的
+   - 已修复 test 侧 LiDAR virtual point jitter 导致的评估抖动
+   - 当前结果比早期实验更可信
 
-5. 当前阶段最值得继续优化的，是：
-   - `scenario32` 的训练策略
-   - 更贴论文的训练细节
-   - 或更进一步检查结构实现与论文是否还有偏差
+5. 当前训练脚本的重要新增能力包括：
+   - `--image-subdir`
+   - `--split-root`
+   - `--no-merge-trainval`
+   - `--spatial-scan`
+   - `--temporal-order`
+   - `--loss power_soft_ce`
+   - best checkpoint
+   - early stopping
 
 ## 10. 当前最推荐的实验配置
 
-### 夜景场景推荐
+### 通用运行前准备
 
-适用于：
+```bash
+export OMP_NUM_THREADS=8
+echo $OMP_NUM_THREADS
+```
 
-- `scenario33`
-- `scenario34`
-
-推荐参数：
+### scenario32 当前最优配置
 
 ```bash
 python train.py \
-  --scenarios scenario33 scenario34 \
+  --split-root ./Data/splits_paper80 \
+  --no-merge-trainval \
+  --scenarios scenario32 \
+  --image-subdir camera_data_mask \
+  --batch-size 48 \
+  --temporal-layers 2 \
+  --fusion-layers 2 \
+  --spatial-scan row \
+  --temporal-order reverse \
+  --optimizer adamw \
+  --weight-decay 1e-4 \
+  --dropout 0.25 \
+  --loss power_soft_ce \
+  --soft-power-temperature 0.15 \
+  --hard-loss-weight 0.6 \
+  --patience 10 \
+  --early-stop-metric acc3 \
+  --early-stop-mode max \
+  --seed 7
+```
+
+### scenario33 推荐配置
+
+```bash
+python train.py \
+  --split-root ./Data/splits_paper80 \
+  --no-merge-trainval \
+  --scenarios scenario33 \
   --image-subdir camera_data_mask_yolo \
   --batch-size 48 \
   --temporal-layers 2 \
   --fusion-layers 2 \
-  --patience 8 \
+  --spatial-scan row \
+  --temporal-order reverse \
+  --optimizer adamw \
+  --weight-decay 1e-4 \
+  --dropout 0.25 \
+  --loss power_soft_ce \
+  --soft-power-temperature 0.15 \
+  --hard-loss-weight 0.6 \
+  --patience 10 \
   --early-stop-metric acc3 \
-  --early-stop-mode max
+  --early-stop-mode max \
+  --seed 7
 ```
 
-### scenario32 推荐起点
+### scenario34 推荐配置
 
 ```bash
 python train.py \
-  --scenarios scenario32 \
-  --image-subdir camera_data \
+  --split-root ./Data/splits_paper80 \
+  --no-merge-trainval \
+  --scenarios scenario34 \
+  --image-subdir camera_data_mask_yolo \
   --batch-size 48 \
   --temporal-layers 2 \
   --fusion-layers 2 \
-  --patience 8 \
+  --spatial-scan row \
+  --temporal-order reverse \
+  --optimizer adamw \
+  --weight-decay 1e-4 \
+  --dropout 0.25 \
+  --loss power_soft_ce \
+  --soft-power-temperature 0.15 \
+  --hard-loss-weight 0.6 \
+  --patience 10 \
   --early-stop-metric acc3 \
-  --early-stop-mode max
+  --early-stop-mode max \
+  --seed 7
 ```
 
 ## 11. 本地与 AutoDL 分工
@@ -405,10 +504,21 @@ python train.py \
 - 正式运行环境：AutoDL
 - 当前目标：高质量复现 BeMamba 论文结果
 - 当前最好用的结构配置：`temporal_layers = 2`, `fusion_layers = 2`
+- 当前默认 split：`./Data/splits_paper80`
 - 当前夜景场景最有效图像输入：`camera_data_mask_yolo`
-- 当前主要短板：`scenario32`
+- 当前白天场景最优图像输入：`camera_data_mask`
+- 当前最好结果：
+  - `scenario32`: Top-3 `82.83%`
+  - `scenario33`: Top-3 `80.99%`
+  - `scenario34`: Top-3 `85.58%`
+- 当前主要短板：`scenario32`，但距离进入论文差距 `5%` 以内只差 `0.28`
 - 当前训练脚本已经支持：
   - `--image-subdir`
+  - `--split-root`
+  - `--no-merge-trainval`
+  - `--spatial-scan`
+  - `--temporal-order`
+  - `--loss power_soft_ce`
   - best checkpoint
   - early stopping
   - 多层 temporal / fusion Mamba

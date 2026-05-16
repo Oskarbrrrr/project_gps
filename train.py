@@ -25,6 +25,7 @@ class TrainConfig:
     data_root: str = "./Data/Multi_Modal"
     split_root: str = "./Data/splits"
     output_root: str = "./outputs"
+    merge_train_val: bool = True
     image_subdir: str = "camera_data"
     lidar_representation: str = "count"
     scenarios: Tuple[str, ...] = ("scenario32", "scenario33", "scenario34")
@@ -45,6 +46,8 @@ class TrainConfig:
     gamma: float = 2.0
     loss_name: str = "ce"
     label_smoothing: float = 0.0
+    soft_power_temperature: float = 0.2
+    hard_loss_weight: float = 0.5
     amp: bool = True
     seed: int = 42
     pin_memory: bool = True
@@ -65,6 +68,29 @@ class AlphaFocalLoss(nn.Module):
         pt = torch.exp(-ce_loss)
         alpha_weight = self.alpha.gather(0, targets) if self.alpha is not None else 1.0
         return (alpha_weight * ((1.0 - pt) ** self.gamma) * ce_loss).mean()
+
+
+class PowerSoftCrossEntropyLoss(nn.Module):
+    def __init__(self, temperature: float = 0.2, hard_weight: float = 0.5, label_smoothing: float = 0.0):
+        super().__init__()
+        self.temperature = temperature
+        self.hard_weight = hard_weight
+        self.hard_loss = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor, power_vec: torch.Tensor) -> torch.Tensor:
+        power_vec = torch.nan_to_num(power_vec.to(inputs.device), nan=0.0, posinf=0.0, neginf=0.0)
+        power_vec = torch.clamp(power_vec, min=0.0)
+        target_power = power_vec / (power_vec.sum(dim=1, keepdim=True) + 1e-8)
+
+        soft_logits = torch.log(target_power + 1e-8) / max(self.temperature, 1e-8)
+        soft_targets = torch.softmax(soft_logits, dim=1)
+        log_probs = nn.functional.log_softmax(inputs, dim=1)
+        soft_loss = -(soft_targets * log_probs).sum(dim=1).mean()
+
+        if self.hard_weight <= 0:
+            return soft_loss
+        hard_loss = self.hard_loss(inputs, targets)
+        return self.hard_weight * hard_loss + (1.0 - self.hard_weight) * soft_loss
 
 
 def set_seed(seed: int) -> None:
@@ -90,12 +116,12 @@ def calculate_alpha_weights(csv_path: str, num_classes: int = 64) -> torch.Tenso
     return torch.tensor(alpha, dtype=torch.float32)
 
 
-def build_combined_train_csv(split_root: str, scenario_name: str, output_dir: str) -> str:
+def build_combined_train_csv(split_root: str, scenario_name: str, output_dir: str, merge_train_val: bool = True) -> str:
     train_csv = os.path.join(split_root, f"{scenario_name}_train.csv")
     val_csv = os.path.join(split_root, f"{scenario_name}_val.csv")
     test_csv = os.path.join(split_root, f"{scenario_name}_test.csv")
 
-    if os.path.exists(train_csv) and os.path.exists(val_csv):
+    if merge_train_val and os.path.exists(train_csv) and os.path.exists(val_csv):
         merged = pd.concat([pd.read_csv(train_csv), pd.read_csv(val_csv)], ignore_index=True)
         merged_path = os.path.join(output_dir, f"{scenario_name}_trainval.csv")
         merged.to_csv(merged_path, index=False)
@@ -186,7 +212,10 @@ def run_epoch(
 
         with autocast(enabled=amp_enabled):
             outputs = model(imgs, radars, lidars, gps)
-            loss = criterion(outputs, targets)
+            if isinstance(criterion, PowerSoftCrossEntropyLoss):
+                loss = criterion(outputs, targets, power_vec)
+            else:
+                loss = criterion(outputs, targets)
 
         if training:
             assert optimizer is not None
@@ -236,6 +265,12 @@ def save_config(run_dir: str, train_config: TrainConfig, model_config: BeMambaCo
 def build_criterion(train_config: TrainConfig, alpha_weights: torch.Tensor | None) -> nn.Module:
     if train_config.loss_name == "focal":
         return AlphaFocalLoss(alpha=alpha_weights, gamma=train_config.gamma)
+    if train_config.loss_name == "power_soft_ce":
+        return PowerSoftCrossEntropyLoss(
+            temperature=train_config.soft_power_temperature,
+            hard_weight=train_config.hard_loss_weight,
+            label_smoothing=train_config.label_smoothing,
+        )
     if train_config.loss_name == "ce":
         return nn.CrossEntropyLoss(label_smoothing=train_config.label_smoothing)
     raise ValueError(f"Unsupported loss: {train_config.loss_name}")
@@ -248,13 +283,19 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
     checkpoints_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(checkpoints_dir, exist_ok=True)
 
-    train_csv_path = build_combined_train_csv(train_config.split_root, scenario_name, run_dir)
+    train_csv_path = build_combined_train_csv(
+        train_config.split_root,
+        scenario_name,
+        run_dir,
+        merge_train_val=train_config.merge_train_val,
+    )
     test_csv_path = os.path.join(train_config.split_root, f"{scenario_name}_test.csv")
     alpha_weights = None
     if train_config.loss_name == "focal":
         alpha_weights = calculate_alpha_weights(train_csv_path, num_classes=model_config.num_classes).to(device)
 
     train_ds = MultimodalDataset(
+        mode="train",
         data_root=train_config.data_root,
         split_root=train_config.split_root,
         scenario_name=scenario_name,
@@ -264,6 +305,7 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
     )
     gps_stats = train_ds.get_gps_stats()
     test_ds = MultimodalDataset(
+        mode="test",
         data_root=train_config.data_root,
         split_root=train_config.split_root,
         scenario_name=scenario_name,
@@ -480,6 +522,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", default="./Data/Multi_Modal")
     parser.add_argument("--split-root", default="./Data/splits")
     parser.add_argument("--output-root", default="./outputs")
+    parser.add_argument("--no-merge-trainval", action="store_true")
     parser.add_argument("--image-subdir", default="camera_data")
     parser.add_argument("--lidar-representation", choices=["binary", "count"], default="count")
     parser.add_argument("--scenarios", nargs="+", default=["scenario32", "scenario33", "scenario34"])
@@ -498,8 +541,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stop-mode", choices=["max", "min"], default="max")
     parser.add_argument("--min-delta", type=float, default=0.0)
     parser.add_argument("--gamma", type=float, default=2.0)
-    parser.add_argument("--loss", choices=["ce", "focal"], default="ce")
+    parser.add_argument("--loss", choices=["ce", "focal", "power_soft_ce"], default="ce")
     parser.add_argument("--label-smoothing", type=float, default=0.0)
+    parser.add_argument("--soft-power-temperature", type=float, default=0.2)
+    parser.add_argument("--hard-loss-weight", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--no-amp", action="store_true")
@@ -513,6 +558,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch-grid", type=int, default=6)
     parser.add_argument("--temporal-layers", type=int, default=2)
     parser.add_argument("--fusion-layers", type=int, default=2)
+    parser.add_argument("--temporal-order", choices=["forward", "reverse"], default="forward")
+    parser.add_argument("--spatial-scan", choices=["vertical", "row"], default="vertical")
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--gps-hidden-dim", type=int, default=96)
     parser.add_argument("--no-pretrained-backbones", action="store_true")
@@ -525,6 +572,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         data_root=args.data_root,
         split_root=args.split_root,
         output_root=args.output_root,
+        merge_train_val=(not args.no_merge_trainval),
         image_subdir=args.image_subdir,
         lidar_representation=args.lidar_representation,
         scenarios=tuple(args.scenarios),
@@ -545,6 +593,8 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         gamma=args.gamma,
         loss_name=args.loss,
         label_smoothing=args.label_smoothing,
+        soft_power_temperature=args.soft_power_temperature,
+        hard_loss_weight=args.hard_loss_weight,
         amp=(not args.no_amp),
         seed=args.seed,
         pin_memory=(not args.no_pin_memory),
@@ -560,6 +610,8 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         patch_grid=args.patch_grid,
         temporal_layers=args.temporal_layers,
         fusion_layers=args.fusion_layers,
+        temporal_order=args.temporal_order,
+        spatial_scan=args.spatial_scan,
         dropout=args.dropout,
         gps_hidden_dim=args.gps_hidden_dim,
         pretrained_backbones=(not args.no_pretrained_backbones),
