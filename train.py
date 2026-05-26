@@ -55,6 +55,16 @@ class TrainConfig:
     log_every: int = 1
     save_every_epoch: bool = False
     device: str = "cuda"
+    missing_enabled: bool = False
+    missing_frame_prob: float = 0.0
+    missing_burst_prob: float = 0.0
+    missing_burst_min: int = 2
+    missing_burst_max: int = 3
+    missing_modality_prob: float = 0.0
+    missing_modality_min: int = 1
+    missing_modality_max: int = 2
+    missing_modalities: str = "img,radar,lidar"
+    missing_seed: int = 42
 
 
 class AlphaFocalLoss(nn.Module):
@@ -171,7 +181,21 @@ def is_better_metric(current: float, best: float | None, mode: str, min_delta: f
 
 
 def move_batch_to_device(batch, device: torch.device):
-    imgs, radars, lidars, gps, targets, power_vec = batch
+    if len(batch) == 6:
+        imgs, radars, lidars, gps, targets, power_vec = batch
+        return (
+            imgs.to(device, non_blocking=True),
+            radars.to(device, non_blocking=True),
+            lidars.to(device, non_blocking=True),
+            gps.to(device, non_blocking=True),
+            targets.to(device, non_blocking=True),
+            power_vec,
+            None,
+            None,
+            None,
+            None,
+        )
+    imgs, radars, lidars, gps, targets, power_vec, img_m, rad_m, lid_m, gps_m = batch
     return (
         imgs.to(device, non_blocking=True),
         radars.to(device, non_blocking=True),
@@ -179,6 +203,10 @@ def move_batch_to_device(batch, device: torch.device):
         gps.to(device, non_blocking=True),
         targets.to(device, non_blocking=True),
         power_vec,
+        img_m.to(device, non_blocking=True),
+        rad_m.to(device, non_blocking=True),
+        lid_m.to(device, non_blocking=True),
+        gps_m.to(device, non_blocking=True),
     )
 
 
@@ -204,14 +232,14 @@ def run_epoch(
     apl_total = 0.0
 
     for batch in loader:
-        imgs, radars, lidars, gps, targets, power_vec = move_batch_to_device(batch, device)
+        imgs, radars, lidars, gps, targets, power_vec, img_mask, radar_mask, lidar_mask, gps_mask = move_batch_to_device(batch, device)
         batch_size = targets.size(0)
 
         if training:
             optimizer.zero_grad(set_to_none=True)
 
         with autocast(enabled=amp_enabled):
-            outputs = model(imgs, radars, lidars, gps)
+            outputs = model(imgs, radars, lidars, gps, img_mask, radar_mask, lidar_mask, gps_mask)
             if isinstance(criterion, PowerSoftCrossEntropyLoss):
                 loss = criterion(outputs, targets, power_vec)
             else:
@@ -302,6 +330,17 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
         csv_path=train_csv_path,
         image_subdir=train_config.image_subdir,
         lidar_representation=train_config.lidar_representation,
+        missing_enabled=train_config.missing_enabled,
+        return_missing_masks=train_config.missing_enabled,
+        missing_frame_prob=train_config.missing_frame_prob,
+        missing_burst_prob=train_config.missing_burst_prob,
+        missing_burst_min=train_config.missing_burst_min,
+        missing_burst_max=train_config.missing_burst_max,
+        missing_modality_prob=train_config.missing_modality_prob,
+        missing_modality_min=train_config.missing_modality_min,
+        missing_modality_max=train_config.missing_modality_max,
+        missing_modalities=train_config.missing_modalities,
+        missing_seed=train_config.missing_seed,
     )
     gps_stats = train_ds.get_gps_stats()
     test_ds = MultimodalDataset(
@@ -368,6 +407,8 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
     best_ckpt_path = os.path.join(checkpoints_dir, "best_model.pth")
 
     for epoch in range(1, train_config.epochs + 1):
+        if train_config.missing_enabled:
+            train_ds.set_missing_epoch(epoch)
         train_metrics = run_epoch(
             model=model,
             loader=train_loader,
@@ -564,6 +605,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gps-hidden-dim", type=int, default=96)
     parser.add_argument("--no-pretrained-backbones", action="store_true")
     parser.add_argument("--freeze-image-stem", action="store_true")
+    parser.add_argument("--missing-enabled", action="store_true")
+    parser.add_argument("--missing-frame-prob", type=float, default=0.0)
+    parser.add_argument("--missing-burst-prob", type=float, default=0.0)
+    parser.add_argument("--missing-burst-min", type=int, default=2)
+    parser.add_argument("--missing-burst-max", type=int, default=3)
+    parser.add_argument("--missing-modality-prob", type=float, default=0.0)
+    parser.add_argument("--missing-modality-min", type=int, default=1)
+    parser.add_argument("--missing-modality-max", type=int, default=2)
+    parser.add_argument("--missing-modalities", default="img,radar,lidar")
+    parser.add_argument("--missing-seed", type=int, default=42)
     return parser.parse_args()
 
 
@@ -601,6 +652,16 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         persistent_workers=(not args.no_persistent_workers),
         save_every_epoch=args.save_every_epoch,
         device=args.device,
+        missing_enabled=args.missing_enabled,
+        missing_frame_prob=args.missing_frame_prob,
+        missing_burst_prob=args.missing_burst_prob,
+        missing_burst_min=args.missing_burst_min,
+        missing_burst_max=args.missing_burst_max,
+        missing_modality_prob=args.missing_modality_prob,
+        missing_modality_min=args.missing_modality_min,
+        missing_modality_max=args.missing_modality_max,
+        missing_modalities=args.missing_modalities,
+        missing_seed=args.missing_seed,
     )
     model_config = BeMambaConfig(
         d_model=args.d_model,
@@ -616,6 +677,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         gps_hidden_dim=args.gps_hidden_dim,
         pretrained_backbones=(not args.no_pretrained_backbones),
         freeze_image_stem=args.freeze_image_stem,
+        missing_enabled=args.missing_enabled,
     )
     return train_config, model_config
 

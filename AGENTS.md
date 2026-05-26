@@ -469,7 +469,79 @@ python train.py \
   --seed 7
 ```
 
-## 11. 本地与 AutoDL 分工
+## 11. 当前创新方向：缺失感知训练
+
+当前已经确定采用第一套创新方案：
+
+- `Missing-Aware Training`：缺失感知训练
+- 目标不是继续单纯追复现指标，而是面向真实传感器采集中的数据缺失问题，提升多模态波束预测鲁棒性
+- 暂不把 `Teacher-Student Distillation`（教师-学生蒸馏）作为主线；它最多作为后续增强方案或对比扩展
+
+### 11.1 方法主线
+
+当前主线为：
+
+1. 分层缺失模拟
+   - `frame-level missing`：帧级缺失
+   - `burst missing`：连续帧缺失
+   - `modality-level missing`：模态级缺失
+   - `hybrid missing`：混合缺失
+
+2. 缺失标记编码
+   - 缺失位置的数据本体可以置零
+   - 同时额外返回 `mask`，明确告诉模型哪些帧/模态缺失
+   - 不建议只置零而不给缺失标记，否则模型难以区分“正常零值”和“缺失零值”
+
+3. 可靠性权重融合
+   - 根据各模态当前可用帧比例或 learned gate 估计可靠性
+   - 缺失少的模态权重更高
+   - 缺失多或整模态缺失的模态权重更低
+
+### 11.2 Dataset 当前待改需求
+
+[src/dataset.py](/D:/code/project_gps/src/dataset.py) 文件末尾当前记录的待改方向为：
+
+- 完成 dataset 侧缺失机制
+- 帧级缺失：每个模态都要支持帧缺失
+  - `imgs`: 5 帧图像，对应 `img_mask: [5]`
+  - `radars`: 5 帧雷达，对应 `radar_mask: [5]`
+  - `lidars`: 5 帧 LiDAR，对应 `lidar_mask: [5]`
+  - `gps`: 2 个时刻，对应 `gps_mask: [2]`
+- 模态级缺失：先留好接口，支持一次缺失 `1-2` 个模态
+- 缺失帧/模态的数据本体先保持原 shape，并将缺失位置置零
+- dataset 返回值后续需要扩展为同时返回数据与 mask，供 [train.py](/D:/code/project_gps/train.py) 和 [src/model.py](/D:/code/project_gps/src/model.py) 使用
+
+推荐第一版先做最稳的实现：
+
+- 训练阶段启用随机缺失增强
+- 测试阶段可通过参数指定缺失协议，用于评估鲁棒性
+- 保持 clean/full input 测试，用来确认新方法不会明显损伤完整输入性能
+
+### 11.3 论文实验口径
+
+后续实验至少区分：
+
+- `Full Input`：完整输入
+- `Random Frame Missing`：随机帧缺失
+- `Burst Missing`：连续帧缺失
+- `Modality Missing`：整模态缺失
+- `Hybrid Missing`：混合缺失
+
+主要仍报告：
+
+- `Top-1`
+- `Top-2`
+- `Top-3`
+- `DBA`
+- `APL`
+
+建议额外记录：
+
+- `Retention Ratio = Acc3_missing / Acc3_full`
+
+用于描述缺失情况下准确率保持能力。
+
+## 12. 本地与 AutoDL 分工
 
 ### 本地负责
 
@@ -485,7 +557,7 @@ python train.py \
 - 保存 checkpoint
 - 保存日志
 
-## 12. 推荐工作流
+## 13. 推荐工作流
 
 推荐闭环：
 
@@ -498,11 +570,11 @@ python train.py \
 
 如果 AutoDL 到 GitHub 网络不稳定，允许直接手动覆盖关键代码文件。
 
-## 13. 开新话题时默认继承的上下文
+## 14. 开新话题时默认继承的上下文
 
 - 本地仓库路径：`D:\code\project_gps`
 - 正式运行环境：AutoDL
-- 当前目标：高质量复现 BeMamba 论文结果
+- 当前目标：在当前较好复现结果基础上，做数据缺失鲁棒性创新，主线为 `Missing-Aware Training`
 - 当前最好用的结构配置：`temporal_layers = 2`, `fusion_layers = 2`
 - 当前默认 split：`./Data/splits_paper80`
 - 当前夜景场景最有效图像输入：`camera_data_mask_yolo`
@@ -512,6 +584,12 @@ python train.py \
   - `scenario33`: Top-3 `80.99%`
   - `scenario34`: Top-3 `85.58%`
 - 当前主要短板：`scenario32`，但距离进入论文差距 `5%` 以内只差 `0.28`
+- 当前创新方案：
+  - 使用方案一：缺失感知训练
+  - 不以教师-学生蒸馏作为主线
+  - dataset 先实现每个模态的帧级缺失 mask
+  - 模态级缺失先留接口，支持一次缺失 `1-2` 个模态
+  - 后续模型侧重点是缺失标记编码与可靠性权重融合
 - 当前训练脚本已经支持：
   - `--image-subdir`
   - `--split-root`

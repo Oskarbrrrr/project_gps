@@ -37,6 +37,17 @@ class MultimodalDataset(Dataset):
         lidar_motion_max_cells=48,
         lidar_motion_count_threshold=2.0,
         lidar_virtual_jitter_radius_m=0.1,
+        missing_enabled=False,
+        return_missing_masks=False,
+        missing_frame_prob=0.0,
+        missing_burst_prob=0.0,
+        missing_burst_min=2,
+        missing_burst_max=3,
+        missing_modality_prob=0.0,
+        missing_modality_min=1,
+        missing_modality_max=2,
+        missing_modalities=None,
+        missing_seed=42,
     ):
         self.data_dir = data_root
         self.mode = mode
@@ -61,6 +72,25 @@ class MultimodalDataset(Dataset):
         self.lidar_motion_count_threshold = float(lidar_motion_count_threshold)
         self.lidar_virtual_jitter_radius_m = float(lidar_virtual_jitter_radius_m)
 
+        self.missing_enabled = bool(missing_enabled)
+        self.return_missing_masks = bool(return_missing_masks)
+        self.missing_frame_prob = self._clip_probability(missing_frame_prob)
+        self.missing_burst_prob = self._clip_probability(missing_burst_prob)
+        self.missing_burst_min = max(1, int(missing_burst_min))
+        self.missing_burst_max = max(self.missing_burst_min, int(missing_burst_max))
+        self.missing_modality_prob = self._clip_probability(missing_modality_prob)
+        self.missing_modality_min = max(1, int(missing_modality_min))
+        self.missing_modality_max = max(self.missing_modality_min, int(missing_modality_max))
+        self.missing_seed = int(missing_seed)
+        self.missing_epoch = 0
+        self.missing_lengths = {
+            "img": 5,
+            "radar": 5,
+            "lidar": 5,
+            "gps": 2,
+        }
+        self.missing_modalities = self._normalize_missing_modalities(missing_modalities)
+
         if csv_path is None:
             csv_path = os.path.join(split_root, f"{scenario_name}_{mode}.csv")
         self.df = pd.read_csv(csv_path)
@@ -77,6 +107,88 @@ class MultimodalDataset(Dataset):
         )
 
         self._init_gps_normalization()
+
+    def _clip_probability(self, value):
+        return float(np.clip(float(value), 0.0, 1.0))
+
+    def set_missing_epoch(self, epoch):
+        self.missing_epoch = int(epoch)
+
+    def _normalize_missing_modalities(self, missing_modalities):
+        if missing_modalities is None:
+            return tuple(self.missing_lengths.keys())
+
+        alias = {
+            "imgs": "img",
+            "image": "img",
+            "images": "img",
+            "camera": "img",
+            "cam": "img",
+            "rgb": "img",
+            "radars": "radar",
+            "lidars": "lidar",
+        }
+        if isinstance(missing_modalities, str):
+            if missing_modalities.lower() == "all":
+                return tuple(self.missing_lengths.keys())
+            items = [
+                item.strip()
+                for item in missing_modalities.replace(";", ",").split(",")
+                if item.strip()
+            ]
+        else:
+            items = list(missing_modalities)
+
+        normalized = []
+        for item in items:
+            name = alias.get(str(item).lower(), str(item).lower())
+            if name not in self.missing_lengths:
+                raise ValueError(f"Unsupported missing modality: {item}")
+            if name not in normalized:
+                normalized.append(name)
+        return tuple(normalized)
+
+    def _missing_rng(self, idx):
+        epoch_offset = self.missing_epoch * max(1, len(self.df))
+        return np.random.default_rng(self.missing_seed + epoch_offset + int(idx))
+
+    def _build_missing_masks(self, idx):
+        masks = {
+            name: torch.ones(length, dtype=torch.float32)
+            for name, length in self.missing_lengths.items()
+        }
+        if not self.missing_enabled:
+            return masks
+
+        rng = self._missing_rng(idx)
+        for name in self.missing_modalities:
+            length = self.missing_lengths[name]
+            if self.missing_frame_prob > 0:
+                frame_missing = rng.random(length) < self.missing_frame_prob
+                masks[name][torch.from_numpy(frame_missing)] = 0.0
+
+            if self.missing_burst_prob > 0 and rng.random() < self.missing_burst_prob:
+                burst_min = min(self.missing_burst_min, length)
+                burst_max = min(self.missing_burst_max, length)
+                burst_len = int(rng.integers(burst_min, burst_max + 1))
+                start = int(rng.integers(0, length - burst_len + 1))
+                masks[name][start : start + burst_len] = 0.0
+
+        if self.missing_modality_prob > 0 and rng.random() < self.missing_modality_prob:
+            candidates = list(self.missing_modalities)
+            if candidates:
+                max_count = min(self.missing_modality_max, len(candidates))
+                min_count = min(self.missing_modality_min, max_count)
+                count = int(rng.integers(min_count, max_count + 1))
+                for name in rng.choice(candidates, size=count, replace=False):
+                    masks[str(name)].zero_()
+
+        return masks
+
+    def _apply_sequence_mask(self, sequence, mask):
+        mask = mask.to(dtype=sequence.dtype, device=sequence.device)
+        view_shape = (mask.shape[0],) + (1,) * (sequence.dim() - 1)
+        return sequence * mask.view(view_shape)
 
     def _init_gps_normalization(self):
         if self.gps_stats is not None:
@@ -476,24 +588,105 @@ class MultimodalDataset(Dataset):
         target = torch.tensor(int(row["unit1_beam"]) - 1, dtype=torch.long)
         power_vec = torch.tensor(self._read_power(row["unit1_pwr_60ghz"]), dtype=torch.float32)
 
-        return torch.stack(imgs), torch.stack(radars), torch.stack(lidars), gps, target, power_vec
+        imgs = torch.stack(imgs)
+        radars = torch.stack(radars)
+        lidars = torch.stack(lidars)
+        missing_masks = self._build_missing_masks(idx)
+
+        if self.missing_enabled:
+            imgs = self._apply_sequence_mask(imgs, missing_masks["img"])
+            radars = self._apply_sequence_mask(radars, missing_masks["radar"])
+            lidars = self._apply_sequence_mask(lidars, missing_masks["lidar"])
+            gps = self._apply_sequence_mask(gps, missing_masks["gps"])
+
+        base_output = (imgs, radars, lidars, gps, target, power_vec)
+        if not self.return_missing_masks:
+            return base_output
+
+        return base_output + (
+            missing_masks["img"],
+            missing_masks["radar"],
+            missing_masks["lidar"],
+            missing_masks["gps"],
+        )
 
 
 if __name__ == "__main__":
-    from torch.utils.data import DataLoader
+    MODE = "train"
+    SCENARIO = "scenario32"
 
-    print(">>> Instantiating MultimodalDataset...")
-    dataset = MultimodalDataset(mode="train", scenario_name="scenario32")
-    print(f">>> Dataset size: {len(dataset)}")
+    # ── Part 1: basic shapes (no missing) ──────────────────────────────
+    print("=" * 70)
+    print("Part 1: Basic dataset (no missing) — verify shapes")
+    print("=" * 70)
+    ds_basic = MultimodalDataset(mode=MODE, scenario_name=SCENARIO)
+    imgs, radars, lidars, gps, target, power_vec = ds_basic[0]
+    print(f"  imgs   : {tuple(imgs.shape)}")
+    print(f"  radars : {tuple(radars.shape)}")
+    print(f"  lidars : {tuple(lidars.shape)}")
+    print(f"  gps    : {tuple(gps.shape)}")
+    print(f"  target : {target.item()}  (beam class, 0-63)")
+    print(f"  power  : {tuple(power_vec.shape)}")
 
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
-    imgs, radars, lidars, gps, targets, power_vec = next(iter(dataloader))
+    # ── Part 2: missing enabled, show masks ────────────────────────────
+    print("\n" + "=" * 70)
+    print("Part 2: Missing-aware dataset — visualize masks")
+    print("=" * 70)
+    ds_miss = MultimodalDataset(
+        mode=MODE,
+        scenario_name=SCENARIO,
+        missing_enabled=True,
+        return_missing_masks=True,
+        missing_frame_prob=0.3,
+        missing_burst_prob=0.3,
+        missing_burst_min=2,
+        missing_burst_max=3,
+        missing_modality_prob=0.2,
+        missing_modalities="img,radar,lidar",
+        missing_seed=42,
+    )
 
-    print("\n" + "=" * 50)
-    print(f"1. RGB shape:      {imgs.shape}")
-    print(f"2. Radar shape:    {radars.shape}")
-    print(f"3. LiDAR BEV:      {lidars.shape}")
-    print(f"4. GPS shape:      {gps.shape}")
-    print(f"5. Target shape:   {targets.shape}")
-    print(f"6. Power shape:    {power_vec.shape}")
-    print("=" * 50 + "\n")
+    def visualize_mask(name, mask, length):
+        """Print a frame-level mask as a visual bar."""
+        bar = "".join("█" if mask[i] > 0.5 else "·" for i in range(length))
+        ratio = mask.sum().item() / length * 100
+        values = " ".join(f"{mask[i]:.0f}" for i in range(length))
+        print(f"  {name:>6s}  [{values}]  {bar}  avail={ratio:.0f}%")
+
+    print("\nSamples with missing enabled (seed=42, epoch=0):\n")
+    for idx in range(6):
+        data = ds_miss[idx]
+        imgs, radars, lidars, gps, target, power_vec = data[:6]
+        img_m, rad_m, lid_m, gps_m = data[6:]
+
+        print(f"  ── sample {idx}  |  target_beam = {target.item():2d} ──")
+        visualize_mask("img", img_m, 5)
+        visualize_mask("radar", rad_m, 5)
+        visualize_mask("lidar", lid_m, 5)
+        visualize_mask("gps", gps_m, 2)
+        print()
+
+    # ── Part 3: epoch stability demo ───────────────────────────────────
+    print("=" * 70)
+    print("Part 3: Epoch reproducibility — same idx, same mask within epoch")
+    print("=" * 70)
+    a = ds_miss[0]
+    b = ds_miss[0]
+    img_m_a = a[6]
+    img_m_b = b[6]
+    same = torch.equal(img_m_a, img_m_b)
+    print(f"  ds_miss[0] called twice → masks identical? {same}")
+    print(f"  img_mask: [{', '.join(f'{img_m_a[i]:.0f}' for i in range(5))}]")
+
+    ds_miss.set_missing_epoch(1)
+    data_ep1 = ds_miss[0]
+    img_m_ep1 = data_ep1[6]
+    same_ep = torch.equal(img_m_a, img_m_ep1)
+    print(f"\n  After set_missing_epoch(1), same idx[0] → masks identical? {same_ep}")
+    print(f"  epoch=0 img_mask: [{', '.join(f'{img_m_a[i]:.0f}' for i in range(5))}]")
+    print(f"  epoch=1 img_mask: [{', '.join(f'{img_m_ep1[i]:.0f}' for i in range(5))}]")
+    print("\n(epoch changes → mask pattern changes, but stays deterministic)")
+
+    print("\n" + "=" * 70)
+    print("Done. Run on AutoDL with:  python src/dataset.py")
+    print("=" * 70)
