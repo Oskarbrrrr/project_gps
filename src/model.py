@@ -94,40 +94,42 @@ class GPSProjection(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, d_model),
         )
+        self.mask_proj = nn.Linear(1, 1)
+        self.mask_fuse = nn.Linear(d_model + 1, d_model)
 
-    def forward(self, gps: torch.Tensor) -> torch.Tensor:
-        return self.net(gps)
+    def forward(
+        self, gps: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        tokens = self.net(gps)
+        if mask is not None:
+            mask_emb = self.mask_proj(mask.unsqueeze(-1))
+            tokens = torch.cat([tokens, mask_emb], dim=-1)
+            tokens = self.mask_fuse(tokens)
+        return tokens
 
 
-class MaskEncoder(nn.Module):
-    def __init__(self, seq_len: int, d_model: int):
+class CrossModalAttention(nn.Module):
+    def __init__(self, d_model: int, nhead: int = 4, dropout: float = 0.1):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(seq_len, d_model),
-            nn.SiLU(),
-            nn.Linear(d_model, d_model),
+        self.norm_q = nn.LayerNorm(d_model)
+        self.norm_kv = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.norm_out = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, d_model),
         )
+        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, mask: torch.Tensor) -> torch.Tensor:
-        return self.net(mask)
-
-
-class ReliabilityGate(nn.Module):
-    def __init__(self, d_model: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(3, d_model),
-            nn.SiLU(),
-            nn.Linear(d_model, 3),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, img_mask: torch.Tensor, radar_mask: torch.Tensor, lidar_mask: torch.Tensor) -> torch.Tensor:
-        ratios = torch.stack(
-            [img_mask.mean(dim=1), radar_mask.mean(dim=1), lidar_mask.mean(dim=1)],
-            dim=1,
-        )
-        return self.net(ratios)
+    def forward(self, query: torch.Tensor, key_value: torch.Tensor) -> torch.Tensor:
+        q = self.norm_q(query)
+        kv = self.norm_kv(key_value)
+        attn_out, _ = self.attn(q, kv, kv)
+        out = query + self.dropout(attn_out)
+        out = out + self.ffn(self.norm_out(out))
+        return out
 
 
 class ModalityBackbone(nn.Module):
@@ -219,6 +221,8 @@ class TimeSequenceBranch(nn.Module):
                 for _ in range(config.temporal_layers)
             ]
         )
+        self.mask_proj = nn.Linear(1, 1)
+        self.mask_fuse = nn.Conv1d(config.d_model + 1, config.d_model, kernel_size=1)
 
     def freeze_stem(self) -> None:
         self.encoder.freeze_stem()
@@ -233,7 +237,9 @@ class TimeSequenceBranch(nn.Module):
             return tokens.reshape(tokens.size(0), pooled_w, pooled_h, tokens.size(-1)).transpose(1, 2)
         return tokens.reshape(tokens.size(0), pooled_h, pooled_w, tokens.size(-1))
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, channels, height, width = x.shape
         encoded = self.encoder(x.reshape(batch_size * seq_len, channels, height, width))
         _, d_model, pooled_h, pooled_w = encoded.shape
@@ -241,6 +247,16 @@ class TimeSequenceBranch(nn.Module):
 
         encoded = encoded.reshape(batch_size, seq_len, d_model, pooled_h, pooled_w)
         encoded = self._flatten_spatial(encoded)
+
+        if mask is not None:
+            mask_emb = self.mask_proj(mask.unsqueeze(-1))
+            mask_emb = mask_emb.unsqueeze(-1).expand(-1, -1, -1, spatial_len)
+            encoded = torch.cat([encoded, mask_emb], dim=2)
+            B, T, _, S = encoded.shape
+            encoded = encoded.reshape(B * T, d_model + 1, S)
+            encoded = self.mask_fuse(encoded)
+            encoded = encoded.reshape(B, T, d_model, S)
+
         if self.temporal_order == "reverse":
             encoded = torch.flip(encoded, dims=[1])
         time_sequence = encoded.permute(0, 1, 3, 2).reshape(batch_size, seq_len * spatial_len, d_model)
@@ -275,12 +291,9 @@ class BeMambaModel(nn.Module):
         self.lidar_align = nn.Linear(cfg.d_model, cfg.d_model)
         self.radar_align = nn.Linear(cfg.d_model, cfg.d_model)
 
-        if self.missing_enabled:
-            self.img_mask_encoder = MaskEncoder(5, cfg.d_model)
-            self.radar_mask_encoder = MaskEncoder(5, cfg.d_model)
-            self.lidar_mask_encoder = MaskEncoder(5, cfg.d_model)
-            self.gps_mask_encoder = MaskEncoder(2, cfg.d_model)
-            self.reliability_gate = ReliabilityGate(cfg.d_model)
+        self.cross_attn_0 = CrossModalAttention(cfg.d_model, dropout=cfg.dropout)
+        self.cross_attn_1 = CrossModalAttention(cfg.d_model, dropout=cfg.dropout)
+        self.cross_attn_2 = CrossModalAttention(cfg.d_model, dropout=cfg.dropout)
 
         self.modal_blocks = nn.ModuleList(
             [
@@ -344,7 +357,6 @@ class BeMambaModel(nn.Module):
     def _modal_fusion(
         self,
         sequences: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        reliability_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         running_sequences = list(sequences)
         for layer_blocks in self.modal_blocks:
@@ -360,16 +372,16 @@ class BeMambaModel(nn.Module):
             encoded = encoded.mean(dim=2)
             encoded_sequences.append(encoded)
 
-        if reliability_weights is None:
-            fused = encoded_sequences[0] + encoded_sequences[1] + encoded_sequences[2]
-        else:
-            w = reliability_weights  # [B, 3]
-            w = w.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, 3]
-            fused = (
-                w[:, :, :, 0] * encoded_sequences[0]
-                + w[:, :, :, 1] * encoded_sequences[1]
-                + w[:, :, :, 2] * encoded_sequences[2]
-            )
+        s0, s1, s2 = encoded_sequences
+        kv_0 = torch.cat([s1, s2], dim=1)
+        kv_1 = torch.cat([s0, s2], dim=1)
+        kv_2 = torch.cat([s0, s1], dim=1)
+
+        enhanced_0 = self.cross_attn_0(s0, kv_0)
+        enhanced_1 = self.cross_attn_1(s1, kv_1)
+        enhanced_2 = self.cross_attn_2(s2, kv_2)
+
+        fused = enhanced_0 + enhanced_1 + enhanced_2
         return fused
 
     def forward(
@@ -383,26 +395,17 @@ class BeMambaModel(nn.Module):
         lidar_mask: torch.Tensor | None = None,
         gps_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        image_tokens, _ = self.image_branch(imgs)
-        lidar_tokens, _ = self.lidar_branch(lidars)
-        radar_tokens, _ = self.radar_branch(radars)
-        gps_tokens = self.gps_projection(gps)
+        img_mask_in = img_mask if self.missing_enabled else None
+        radar_mask_in = radar_mask if self.missing_enabled else None
+        lidar_mask_in = lidar_mask if self.missing_enabled else None
+        gps_mask_in = gps_mask if self.missing_enabled else None
 
-        if self.missing_enabled and img_mask is not None:
-            image_tokens = image_tokens + self.img_mask_encoder(img_mask).unsqueeze(1)
-        if self.missing_enabled and radar_mask is not None:
-            radar_tokens = radar_tokens + self.radar_mask_encoder(radar_mask).unsqueeze(1)
-        if self.missing_enabled and lidar_mask is not None:
-            lidar_tokens = lidar_tokens + self.lidar_mask_encoder(lidar_mask).unsqueeze(1)
-        if self.missing_enabled and gps_mask is not None:
-            gps_tokens = gps_tokens + self.gps_mask_encoder(gps_mask)
+        image_tokens, _ = self.image_branch(imgs, mask=img_mask_in)
+        lidar_tokens, _ = self.lidar_branch(lidars, mask=lidar_mask_in)
+        radar_tokens, _ = self.radar_branch(radars, mask=radar_mask_in)
+        gps_tokens = self.gps_projection(gps, mask=gps_mask_in)
 
         modal_sequences = self._build_modal_sequences(image_tokens, lidar_tokens, radar_tokens, gps_tokens)
-
-        reliability_weights = None
-        if self.missing_enabled and img_mask is not None:
-            reliability_weights = self.reliability_gate(img_mask, radar_mask, lidar_mask)
-
-        fused_tokens = self._modal_fusion(modal_sequences, reliability_weights)
+        fused_tokens = self._modal_fusion(modal_sequences)
         flattened = fused_tokens.reshape(fused_tokens.size(0), -1)
         return self.head(flattened)
