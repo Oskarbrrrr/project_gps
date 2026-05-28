@@ -304,6 +304,110 @@ def build_criterion(train_config: TrainConfig, alpha_weights: torch.Tensor | Non
     raise ValueError(f"Unsupported loss: {train_config.loss_name}")
 
 
+def run_missing_robustness_tests(
+    model: BeMambaModel,
+    train_config: TrainConfig,
+    scenario_name: str,
+    gps_stats: dict,
+    test_csv_path: str,
+    device: torch.device,
+    criterion: nn.Module,
+    run_dir: str,
+) -> list:
+    test_protocols = [
+        ("clean", 0.0, 0.0, 0.0),
+        ("frame_p01", 0.1, 0.0, 0.0),
+        ("frame_p02", 0.2, 0.0, 0.0),
+        ("frame_p03", 0.3, 0.0, 0.0),
+        ("burst_p01", 0.0, 0.1, 0.0),
+        ("burst_p02", 0.0, 0.2, 0.0),
+        ("modal_p01", 0.0, 0.0, 0.1),
+        ("modal_p02", 0.0, 0.0, 0.2),
+        (
+            "hybrid",
+            train_config.missing_frame_prob,
+            train_config.missing_burst_prob,
+            train_config.missing_modality_prob,
+        ),
+    ]
+
+    test_seed = train_config.missing_seed + 10000
+    print(f"\n{'='*60}")
+    print(f"  Missing Robustness Tests — {scenario_name}")
+    print(f"{'='*60}")
+    print(f"{'Protocol':<14} {'Top-1':>7} {'Top-2':>7} {'Top-3':>7} {'DBA':>8} {'APL':>9} {'Ret':>7}")
+    print("-" * 62)
+
+    clean_acc3 = None
+    results = []
+
+    for name, fp, bp, mp in test_protocols:
+        has_missing = name != "clean"
+        ds = MultimodalDataset(
+            mode="test",
+            data_root=train_config.data_root,
+            split_root=train_config.split_root,
+            scenario_name=scenario_name,
+            csv_path=test_csv_path,
+            image_subdir=train_config.image_subdir,
+            gps_stats=gps_stats,
+            lidar_representation=train_config.lidar_representation,
+            missing_enabled=has_missing,
+            return_missing_masks=has_missing,
+            missing_frame_prob=fp,
+            missing_burst_prob=bp,
+            missing_modality_prob=mp,
+            missing_seed=test_seed,
+        )
+        loader = build_dataloader(ds, train_config, shuffle=False)
+        metrics = run_epoch(model, loader, criterion, None, None, device, False, 0.0)
+
+        if name == "clean":
+            clean_acc3 = metrics["acc3"]
+
+        retention = (metrics["acc3"] / clean_acc3 * 100) if clean_acc3 and clean_acc3 > 0 else 0.0
+        results.append((name, metrics, retention))
+
+        print(
+            f"{name:<14} {metrics['acc1']:>6.2f}% {metrics['acc2']:>6.2f}% "
+            f"{metrics['acc3']:>6.2f}% {metrics['dba']:>7.4f} {metrics['apl']:>8.4f} dB "
+            f"{retention:>6.1f}%"
+        )
+
+    result_path = os.path.join(run_dir, "missing_test_result.txt")
+    with open(result_path, "w", encoding="utf-8") as f:
+        f.write(f"Missing Robustness Test Results ({scenario_name})\n")
+        f.write(f"Reference clean Top-3: {clean_acc3:.2f}%\n\n")
+        header = f"{'Protocol':<14} {'Top-1':>7} {'Top-2':>7} {'Top-3':>7} {'DBA':>8} {'APL':>9} {'Ret':>7}\n"
+        f.write(header)
+        f.write("-" * 62 + "\n")
+        for name, metrics, retention in results:
+            f.write(
+                f"{name:<14} {metrics['acc1']:>6.2f}% {metrics['acc2']:>6.2f}% "
+                f"{metrics['acc3']:>6.2f}% {metrics['dba']:>7.4f} {metrics['apl']:>8.4f} dB "
+                f"{retention:>6.1f}%\n"
+            )
+
+    csv_path = os.path.join(run_dir, "missing_test_result.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["protocol", "acc1", "acc2", "acc3", "dba", "apl", "retention_pct"])
+        for name, metrics, retention in results:
+            writer.writerow(
+                [
+                    name,
+                    f"{metrics['acc1']:.4f}",
+                    f"{metrics['acc2']:.4f}",
+                    f"{metrics['acc3']:.4f}",
+                    f"{metrics['dba']:.6f}",
+                    f"{metrics['apl']:.6f}",
+                    f"{retention:.2f}",
+                ]
+            )
+
+    return results
+
+
 def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: BeMambaConfig, device: torch.device) -> None:
     print(f"\n========== Running {scenario_name} ==========")
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -542,6 +646,18 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
     print("\n" + result_text)
     with open(result_path, "w", encoding="utf-8") as handle:
         handle.write(result_text)
+
+    if train_config.missing_enabled:
+        run_missing_robustness_tests(
+            model=model,
+            train_config=train_config,
+            scenario_name=scenario_name,
+            gps_stats=gps_stats,
+            test_csv_path=test_csv_path,
+            device=device,
+            criterion=criterion,
+            run_dir=run_dir,
+        )
 
     if final_test_metrics is not None:
         last_result_path = os.path.join(run_dir, "last_epoch_result.txt")
