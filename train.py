@@ -232,41 +232,42 @@ def run_epoch(
     apl_total = 0.0
 
     for batch in loader:
-        imgs, radars, lidars, gps, targets, power_vec, img_mask, radar_mask, lidar_mask, gps_mask = move_batch_to_device(batch, device)
-        batch_size = targets.size(0)
+            imgs, radars, lidars, gps, targets, power_vec, img_mask, radar_mask, lidar_mask, gps_mask = move_batch_to_device(batch, device)
+            batch_size = targets.size(0)
 
-        if training:
-            optimizer.zero_grad(set_to_none=True)
+            if training:
+                optimizer.zero_grad(set_to_none=True)
 
-        with autocast(enabled=amp_enabled):
-            outputs = model(imgs, radars, lidars, gps, img_mask, radar_mask, lidar_mask, gps_mask)
-            if isinstance(criterion, PowerSoftCrossEntropyLoss):
-                loss = criterion(outputs, targets, power_vec)
-            else:
-                loss = criterion(outputs, targets)
+            with torch.set_grad_enabled(training):
+                with autocast(enabled=amp_enabled):
+                    outputs = model(imgs, radars, lidars, gps, img_mask, radar_mask, lidar_mask, gps_mask)
+                    if isinstance(criterion, PowerSoftCrossEntropyLoss):
+                        loss = criterion(outputs, targets, power_vec)
+                    else:
+                        loss = criterion(outputs, targets)
 
-        if training:
-            assert optimizer is not None
-            if scaler is not None and amp_enabled:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-                optimizer.step()
+            if training:
+                assert optimizer is not None
+                if scaler is not None and amp_enabled:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                    optimizer.step()
 
-        loss_total += loss.item() * batch_size
-        sample_total += batch_size
+            loss_total += loss.item() * batch_size
+            sample_total += batch_size
 
-        acc1, acc2, acc3 = calculate_topk_accuracy(outputs, targets, topk=(1, 2, 3))
-        acc1_total += acc1 * batch_size
-        acc2_total += acc2 * batch_size
-        acc3_total += acc3 * batch_size
-        dba_total += calculate_dba_score(outputs, targets) * batch_size
-        apl_total += calculate_apl(outputs, power_vec) * batch_size
+            acc1, acc2, acc3 = calculate_topk_accuracy(outputs, targets, topk=(1, 2, 3))
+            acc1_total += acc1 * batch_size
+            acc2_total += acc2 * batch_size
+            acc3_total += acc3 * batch_size
+            dba_total += calculate_dba_score(outputs, targets) * batch_size
+            apl_total += calculate_apl(outputs, power_vec) * batch_size
 
     return {
         "loss": loss_total / max(sample_total, 1),
@@ -367,6 +368,10 @@ def run_missing_robustness_tests(
 
         retention = (metrics["acc3"] / clean_acc3 * 100) if clean_acc3 and clean_acc3 > 0 else 0.0
         results.append((name, metrics, retention))
+
+        del loader, ds
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         print(
             f"{name:<14} {metrics['acc1']:>6.2f}% {metrics['acc2']:>6.2f}% "
