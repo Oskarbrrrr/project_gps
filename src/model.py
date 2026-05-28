@@ -373,15 +373,20 @@ class BeMambaModel(nn.Module):
             encoded_sequences.append(encoded)
 
         s0, s1, s2 = encoded_sequences
-        kv_0 = torch.cat([s1, s2], dim=1)
-        kv_1 = torch.cat([s0, s2], dim=1)
-        kv_2 = torch.cat([s0, s1], dim=1)
 
-        enhanced_0 = self.cross_attn_0(s0, kv_0)
-        enhanced_1 = self.cross_attn_1(s1, kv_1)
-        enhanced_2 = self.cross_attn_2(s2, kv_2)
+        if self.missing_enabled:
+            kv_0 = torch.cat([s1, s2], dim=1)
+            kv_1 = torch.cat([s0, s2], dim=1)
+            kv_2 = torch.cat([s0, s1], dim=1)
 
-        fused = enhanced_0 + enhanced_1 + enhanced_2
+            enhanced_0 = self.cross_attn_0(s0, kv_0)
+            enhanced_1 = self.cross_attn_1(s1, kv_1)
+            enhanced_2 = self.cross_attn_2(s2, kv_2)
+
+            fused = enhanced_0 + enhanced_1 + enhanced_2
+        else:
+            fused = s0 + s1 + s2
+
         return fused
 
     def forward(
