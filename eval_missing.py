@@ -1,0 +1,180 @@
+"""Evaluate a saved checkpoint under missing-data robustness protocols."""
+import argparse
+import os
+import torch
+import torch.nn as nn
+
+from src.dataset import MultimodalDataset
+from src.model import BeMambaConfig, BeMambaModel
+from src.utils import calculate_apl, calculate_dba_score, calculate_topk_accuracy
+from train import (
+    TrainConfig,
+    build_criterion,
+    build_dataloader,
+    move_batch_to_device,
+    run_epoch,
+)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Missing robustness evaluation for a saved checkpoint.")
+    parser.add_argument("--ckpt", required=True, help="Path to best_model.pth or other checkpoint")
+    parser.add_argument("--data-root", default="./Data/Multi_Modal")
+    parser.add_argument("--split-root", default="./Data/splits_paper80")
+    parser.add_argument("--scenario", default="scenario32")
+    parser.add_argument("--image-subdir", default="camera_data_mask")
+    parser.add_argument("--lidar-representation", choices=["binary", "count"], default="count")
+    parser.add_argument("--batch-size", type=int, default=48)
+    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--loss", choices=["ce", "focal", "power_soft_ce"], default="power_soft_ce")
+    parser.add_argument("--soft-power-temperature", type=float, default=0.15)
+    parser.add_argument("--hard-loss-weight", type=float, default=0.6)
+    parser.add_argument("--missing-frame-prob", type=float, default=0.2)
+    parser.add_argument("--missing-burst-prob", type=float, default=0.1)
+    parser.add_argument("--missing-modality-prob", type=float, default=0.1)
+    parser.add_argument("--missing-seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--d-model", type=int, default=128)
+    parser.add_argument("--temporal-layers", type=int, default=2)
+    parser.add_argument("--fusion-layers", type=int, default=2)
+    parser.add_argument("--temporal-order", default="reverse")
+    parser.add_argument("--spatial-scan", default="row")
+    parser.add_argument("--dropout", type=float, default=0.25)
+    parser.add_argument("--device", default="cuda")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+
+    model_config = BeMambaConfig(
+        d_model=args.d_model,
+        temporal_layers=args.temporal_layers,
+        fusion_layers=args.fusion_layers,
+        temporal_order=args.temporal_order,
+        spatial_scan=args.spatial_scan,
+        dropout=args.dropout,
+        missing_enabled=True,
+    )
+
+    train_config = TrainConfig(
+        data_root=args.data_root,
+        split_root=args.split_root,
+        image_subdir=args.image_subdir,
+        lidar_representation=args.lidar_representation,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        loss_name=args.loss,
+        soft_power_temperature=args.soft_power_temperature,
+        hard_loss_weight=args.hard_loss_weight,
+        missing_enabled=True,
+        missing_frame_prob=args.missing_frame_prob,
+        missing_burst_prob=args.missing_burst_prob,
+        missing_modality_prob=args.missing_modality_prob,
+        missing_seed=args.missing_seed,
+        seed=args.seed,
+    )
+
+    print(f"Loading checkpoint: {args.ckpt}")
+    model = BeMambaModel(model_config).to(device)
+    state = torch.load(args.ckpt, map_location=device)
+    model.load_state_dict(state)
+    model.eval()
+
+    train_csv_path = os.path.join(args.split_root, f"{args.scenario}_train.csv")
+    temp_ds = MultimodalDataset(
+        mode="train",
+        data_root=args.data_root,
+        split_root=args.split_root,
+        scenario_name=args.scenario,
+        csv_path=train_csv_path,
+        image_subdir=args.image_subdir,
+        lidar_representation=args.lidar_representation,
+    )
+    gps_stats = temp_ds.get_gps_stats()
+
+    test_csv_path = os.path.join(args.split_root, f"{args.scenario}_test.csv")
+    criterion = build_criterion(train_config, None)
+
+    test_protocols = [
+        ("clean", 0.0, 0.0, 0.0),
+        ("frame_p01", 0.1, 0.0, 0.0),
+        ("frame_p02", 0.2, 0.0, 0.0),
+        ("frame_p03", 0.3, 0.0, 0.0),
+        ("burst_p01", 0.0, 0.1, 0.0),
+        ("burst_p02", 0.0, 0.2, 0.0),
+        ("modal_p01", 0.0, 0.0, 0.1),
+        ("modal_p02", 0.0, 0.0, 0.2),
+        ("hybrid", args.missing_frame_prob, args.missing_burst_prob, args.missing_modality_prob),
+    ]
+
+    test_seed = args.missing_seed + 10000
+    ckpt_dir = os.path.dirname(os.path.dirname(args.ckpt))
+    if not ckpt_dir:
+        ckpt_dir = "."
+
+    print(f"\n{'='*60}")
+    print(f"  Missing Robustness Tests — {args.scenario}")
+    print(f"{'='*60}")
+    print(f"{'Protocol':<14} {'Top-1':>7} {'Top-2':>7} {'Top-3':>7} {'DBA':>8} {'APL':>9} {'Ret':>7}")
+    print("-" * 62)
+
+    clean_acc3 = None
+    results = []
+
+    for name, fp, bp, mp in test_protocols:
+        has_missing = name != "clean"
+        ds = MultimodalDataset(
+            mode="test",
+            data_root=args.data_root,
+            split_root=args.split_root,
+            scenario_name=args.scenario,
+            csv_path=test_csv_path,
+            image_subdir=args.image_subdir,
+            gps_stats=gps_stats,
+            lidar_representation=args.lidar_representation,
+            missing_enabled=has_missing,
+            return_missing_masks=has_missing,
+            missing_frame_prob=fp,
+            missing_burst_prob=bp,
+            missing_modality_prob=mp,
+            missing_seed=test_seed,
+        )
+        loader = build_dataloader(ds, train_config, shuffle=False)
+        metrics = run_epoch(model, loader, criterion, None, None, device, False, 0.0)
+
+        if name == "clean":
+            clean_acc3 = metrics["acc3"]
+
+        retention = (metrics["acc3"] / clean_acc3 * 100) if clean_acc3 and clean_acc3 > 0 else 0.0
+        results.append((name, metrics, retention))
+
+        print(
+            f"{name:<14} {metrics['acc1']:>6.2f}% {metrics['acc2']:>6.2f}% "
+            f"{metrics['acc3']:>6.2f}% {metrics['dba']:>7.4f} {metrics['apl']:>8.4f} dB "
+            f"{retention:>6.1f}%"
+        )
+
+        del loader, ds
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    result_path = os.path.join(ckpt_dir, "missing_test_result.txt")
+    with open(result_path, "w", encoding="utf-8") as f:
+        f.write(f"Missing Robustness Test Results ({args.scenario})\n")
+        f.write(f"Reference clean Top-3: {clean_acc3:.2f}%\n\n")
+        header = f"{'Protocol':<14} {'Top-1':>7} {'Top-2':>7} {'Top-3':>7} {'DBA':>8} {'APL':>9} {'Ret':>7}\n"
+        f.write(header)
+        f.write("-" * 62 + "\n")
+        for name, metrics, retention in results:
+            f.write(
+                f"{name:<14} {metrics['acc1']:>6.2f}% {metrics['acc2']:>6.2f}% "
+                f"{metrics['acc3']:>6.2f}% {metrics['dba']:>7.4f} {metrics['apl']:>8.4f} dB "
+                f"{retention:>6.1f}%\n"
+            )
+    print(f"\nSaved to {result_path}")
+
+
+if __name__ == "__main__":
+    main()
