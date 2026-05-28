@@ -400,10 +400,17 @@ class BeMambaModel(nn.Module):
         lidar_mask: torch.Tensor | None = None,
         gps_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        img_mask_in = img_mask if self.missing_enabled else None
-        radar_mask_in = radar_mask if self.missing_enabled else None
-        lidar_mask_in = lidar_mask if self.missing_enabled else None
-        gps_mask_in = gps_mask if self.missing_enabled else None
+        if self.missing_enabled:
+            B, device = imgs.shape[0], imgs.device
+            img_mask_in = img_mask if img_mask is not None else torch.ones(B, 5, device=device)
+            radar_mask_in = radar_mask if radar_mask is not None else torch.ones(B, 5, device=device)
+            lidar_mask_in = lidar_mask if lidar_mask is not None else torch.ones(B, 5, device=device)
+            gps_mask_in = gps_mask if gps_mask is not None else torch.ones(B, 2, device=device)
+        else:
+            img_mask_in = None
+            radar_mask_in = None
+            lidar_mask_in = None
+            gps_mask_in = None
 
         image_tokens, _ = self.image_branch(imgs, mask=img_mask_in)
         lidar_tokens, _ = self.lidar_branch(lidars, mask=lidar_mask_in)
