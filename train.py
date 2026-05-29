@@ -16,7 +16,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 
 from src.dataset import MultimodalDataset
-from src.model import BeMambaConfig, BeMambaModel
+from src.model import BeMambaConfig, BeMambaModel, load_checkpoint
 from src.utils import calculate_apl, calculate_dba_score, calculate_topk_accuracy
 
 
@@ -646,7 +646,7 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
         best_metric_value = best_test_metrics[train_config.early_stop_metric]
         torch.save(model.state_dict(), best_ckpt_path)
 
-    model.load_state_dict(torch.load(best_ckpt_path, map_location=device))
+    load_checkpoint(model, best_ckpt_path, device)
     test_metrics = run_epoch(
         model=model,
         loader=test_loader,

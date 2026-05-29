@@ -746,3 +746,93 @@ class BeMambaModel(nn.Module):
         # Phase 7: Classification head
         # ═══════════════════════════════════════════════════════════
         return self.head(fused.reshape(B, -1))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Checkpoint migration: old TimeSequenceBranch → new modular architecture
+# ═══════════════════════════════════════════════════════════════════════════
+
+def migrate_legacy_state_dict(state_dict: dict) -> dict:
+    """Map old architecture keys to new modular architecture keys.
+
+    Old (TimeSequenceBranch):          New (modular):
+      image_branch.encoder.*      →    img_backbone.*
+      image_branch.temporal_*     →    img_temporal.temporal_*
+      image_branch.mask_embed.*   →    img_mask_encoder.mask_embed.*
+      cross_attn_0/1/2.*         →    cross_modal_fusion.img/radar/lidar_cross.*
+      gps_projection.mask_embed.* →    gps_mask_encoder.mask_embed.*
+    """
+    KEY_MAP = [
+        # ── Backbones (encoder → backbone) ──
+        ("image_branch.encoder.", "img_backbone."),
+        ("lidar_branch.encoder.", "lidar_backbone."),
+        ("radar_branch.encoder.", "radar_backbone."),
+        # ── Temporal processors ──
+        ("image_branch.temporal_blocks.", "img_temporal.temporal_blocks."),
+        ("lidar_branch.temporal_blocks.", "lidar_temporal.temporal_blocks."),
+        ("radar_branch.temporal_blocks.", "radar_temporal.temporal_blocks."),
+        # ── Mask embeddings (branch-internal → standalone MaskEncoder) ──
+        ("image_branch.mask_embed.", "img_mask_encoder.mask_embed."),
+        ("lidar_branch.mask_embed.", "lidar_mask_encoder.mask_embed."),
+        ("radar_branch.mask_embed.", "radar_mask_encoder.mask_embed."),
+        ("gps_projection.mask_embed.", "gps_mask_encoder.mask_embed."),
+        # ── Cross-attention (top-level → nested in CrossModalFusion) ──
+        ("cross_attn_0.", "cross_modal_fusion.img_cross."),
+        ("cross_attn_1.", "cross_modal_fusion.radar_cross."),
+        ("cross_attn_2.", "cross_modal_fusion.lidar_cross."),
+        # ── GPS projection net (unchanged path) ──
+        # "gps_projection.net." stays "gps_projection.net."
+        # ── Unchanged keys (pass through) ──
+        # image_align, lidar_align, radar_align, modal_blocks, head,
+        # img_reliability, radar_reliability, lidar_reliability, gps_reliability
+    ]
+
+    new_state = {}
+    for old_key, value in state_dict.items():
+        new_key = old_key
+        for old_prefix, new_prefix in KEY_MAP:
+            if old_key.startswith(old_prefix):
+                new_key = old_key.replace(old_prefix, new_prefix, 1)
+                break
+        new_state[new_key] = value
+
+    return new_state
+
+
+def load_checkpoint(model: "BeMambaModel", ckpt_path: str, device: torch.device) -> set:
+    """Load a checkpoint, auto-migrating from old architecture if needed.
+
+    Returns:
+        missing_keys: set of model keys not found in checkpoint
+                      (empty if migration was clean)
+    """
+    state = torch.load(ckpt_path, map_location=device)
+
+    # ── Try direct load (new checkpoint) ──
+    try:
+        model.load_state_dict(state, strict=True)
+        return set()  # clean load
+    except RuntimeError:
+        pass
+
+    # ── Migrate from old architecture ──
+    migrated = migrate_legacy_state_dict(state)
+    result = model.load_state_dict(migrated, strict=False)
+
+    # Only report keys that aren't expected new DMAF modules
+    expected_new_modules = (
+        "img_mask_encoder", "radar_mask_encoder", "lidar_mask_encoder", "gps_mask_encoder",
+        "img_temporal", "radar_temporal", "lidar_temporal",
+        "img_reliability", "radar_reliability", "lidar_reliability", "gps_reliability",
+        "cross_modal_fusion",
+    )
+    real_missing = [k for k in result.missing_keys
+                    if not any(m in k for m in expected_new_modules)]
+
+    if real_missing:
+        print(f"  [WARN] Missing keys (non-DMAF): {real_missing[:5]}...")
+    if result.unexpected_keys:
+        print(f"  [WARN] Unexpected keys (ignored): {len(result.unexpected_keys)} keys")
+
+    print(f"  Loaded legacy checkpoint from {ckpt_path}")
+    return set(real_missing)

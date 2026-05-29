@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 from src.dataset import MultimodalDataset
-from src.model import BeMambaConfig, BeMambaModel
+from src.model import BeMambaConfig, BeMambaModel, load_checkpoint
 from src.utils import calculate_apl, calculate_dba_score, calculate_topk_accuracy
 from train import (
     TrainConfig,
@@ -105,8 +105,7 @@ def main():
 
     print(f"Loading checkpoint: {args.ckpt}")
     model = BeMambaModel(model_config).to(device)
-    state = torch.load(args.ckpt, map_location=device)
-    model.load_state_dict(state)
+    load_checkpoint(model, args.ckpt, device)
     model.eval()
 
     train_csv_path = os.path.join(args.split_root, f"{args.scenario}_train.csv")
