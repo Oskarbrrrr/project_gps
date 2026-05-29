@@ -1,11 +1,15 @@
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn as nn
 from mamba_ssm import Mamba
 from torchvision import models
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Configuration
+# ═══════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class BeMambaConfig:
@@ -25,6 +29,16 @@ class BeMambaConfig:
     spatial_scan: str = "vertical"
     missing_enabled: bool = False
 
+    # ── DMAF ablation switches ──
+    # All default True — use --no-* flags to disable individual components.
+    use_mask_embed: bool = True
+    use_cross_attn: bool = True
+    use_reliability: bool = True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Shared building blocks (unchanged from original)
+# ═══════════════════════════════════════════════════════════════════════════
 
 class ChannelEncoding(nn.Module):
     def __init__(self, d_model: int):
@@ -85,54 +99,17 @@ class MBMamba(nn.Module):
         return self.dropout(weight * forward + weight * backward)
 
 
-class GPSProjection(nn.Module):
-    def __init__(self, d_model: int, hidden_dim: int, dropout: float):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(2, hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, d_model),
-        )
-        self.mask_proj = nn.Linear(1, 1)
-        self.mask_fuse = nn.Linear(d_model + 1, d_model)
-
-    def forward(
-        self, gps: torch.Tensor, mask: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        tokens = self.net(gps)
-        if mask is not None:
-            mask_emb = self.mask_proj(mask.unsqueeze(-1))
-            tokens = torch.cat([tokens, mask_emb], dim=-1)
-            tokens = self.mask_fuse(tokens)
-        return tokens
-
-
-class CrossModalAttention(nn.Module):
-    def __init__(self, d_model: int, nhead: int = 4, dropout: float = 0.1):
-        super().__init__()
-        self.norm_q = nn.LayerNorm(d_model)
-        self.norm_kv = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
-        self.norm_out = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 2, d_model),
-        )
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, query: torch.Tensor, key_value: torch.Tensor) -> torch.Tensor:
-        q = self.norm_q(query)
-        kv = self.norm_kv(key_value)
-        attn_out, _ = self.attn(q, kv, kv)
-        out = query + self.dropout(attn_out)
-        out = out + self.ffn(self.norm_out(out))
-        return out
-
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 1: Spatial encoders
+# ═══════════════════════════════════════════════════════════════════════════
 
 class ModalityBackbone(nn.Module):
+    """Per-frame spatial feature extraction via ResNet.
+
+    Input:  [B, C, H, W]
+    Output: [B, d_model, patch_grid, patch_grid]
+    """
+
     def __init__(self, backbone_name: str, in_channels: int, d_model: int, patch_grid: int, pretrained: bool):
         super().__init__()
         if backbone_name == "resnet34":
@@ -185,115 +162,390 @@ class ModalityBackbone(nn.Module):
         feat = self.features(x)
         feat = self.pool(feat)
         feat = self.project(feat)
-        return feat
+        return feat  # [B, d_model, patch_grid, patch_grid]
 
 
-class TimeSequenceBranch(nn.Module):
-    def __init__(self, backbone_name: str, in_channels: int, config: BeMambaConfig):
+class GPSProjection(nn.Module):
+    """Pure GPS feature projection (no mask handling — see MaskEncoder).
+
+    Input:  [B, 2, 2]  (2 time points × {dist, angle})
+    Output: [B, 2, d_model]
+    """
+
+    def __init__(self, d_model: int, hidden_dim: int, dropout: float):
         super().__init__()
-        self.encoder = ModalityBackbone(
-            backbone_name=backbone_name,
-            in_channels=in_channels,
-            d_model=config.d_model,
-            patch_grid=config.patch_grid,
-            pretrained=config.pretrained_backbones,
+        self.net = nn.Sequential(
+            nn.Linear(2, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
         )
-        if config.temporal_order not in {"forward", "reverse"}:
-            raise ValueError(f"Unsupported temporal_order: {config.temporal_order}")
-        if config.spatial_scan not in {"row", "vertical"}:
-            raise ValueError(f"Unsupported spatial_scan: {config.spatial_scan}")
-        self.temporal_order = config.temporal_order
-        self.spatial_scan = config.spatial_scan
+
+    def forward(self, gps: torch.Tensor) -> torch.Tensor:
+        return self.net(gps)  # [B, 2, d_model]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 2: Mask Encoder (standalone — NEW)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class MaskEncoder(nn.Module):
+    """Standalone mask embedding injection.
+
+    Learns two d_model-dimensional vectors:
+      - index 0 → "missing" signature
+      - index 1 → "present" signature
+
+    Injects these signatures into per-frame features before temporal processing,
+    so the SSM can distinguish "real zero" from "missing frame".
+
+    Works for both:
+      - spatial features  [B, seq_len, d_model, H, W]
+      - vector features   [B, seq_len, d_model]
+    """
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.mask_embed = nn.Embedding(2, d_model)
+        nn.init.normal_(self.mask_embed.weight, std=0.02)
+
+    def forward(self, features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Inject mask embedding into features.
+
+        Args:
+            features: [B, seq_len, ..., d_model]
+            mask:     [B, seq_len]  (0 = missing, 1 = present)
+
+        Returns:
+            mask-aware features, same shape as input.
+        """
+        mask_emb = self.mask_embed(mask.long())  # [B, seq_len, d_model]
+
+        # Insert singleton dims between seq_len and d_model to match features
+        n_extra = features.dim() - mask_emb.dim()
+        for _ in range(n_extra):
+            mask_emb = mask_emb.unsqueeze(-1)  # insert before last dim
+
+        mask_emb = mask_emb.expand_as(features)
+        return features + mask_emb
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 3: Temporal Processor (extracted from TimeSequenceBranch — NEW)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TemporalProcessor(nn.Module):
+    """TFMamba temporal processing + mask-weighted aggregation.
+
+    Takes per-frame spatial features, processes them through TFMamba
+    to model temporal dependencies, then aggregates via mask-weighted mean.
+
+    Input:  [B, seq_len, d_model, pooled_h, pooled_w]
+    Output: [B, spatial_len, d_model]
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int,
+        d_conv: int,
+        expand: int,
+        dropout: float,
+        temporal_layers: int,
+        temporal_order: str,
+        spatial_scan: str,
+    ):
+        super().__init__()
+        if temporal_order not in {"forward", "reverse"}:
+            raise ValueError(f"Unsupported temporal_order: {temporal_order}")
+        if spatial_scan not in {"row", "vertical"}:
+            raise ValueError(f"Unsupported spatial_scan: {spatial_scan}")
+
+        self.temporal_order = temporal_order
+        self.spatial_scan = spatial_scan
+
         self.temporal_blocks = nn.ModuleList(
             [
                 nn.ModuleDict(
                     {
-                        "channel_encoding": ChannelEncoding(config.d_model),
+                        "channel_encoding": ChannelEncoding(d_model),
                         "tf_mamba": TFMamba(
-                            d_model=config.d_model,
-                            d_state=config.d_state,
-                            d_conv=config.d_conv,
-                            expand=config.expand,
-                            dropout=config.dropout,
+                            d_model=d_model,
+                            d_state=d_state,
+                            d_conv=d_conv,
+                            expand=expand,
+                            dropout=dropout,
                         ),
                     }
                 )
-                for _ in range(config.temporal_layers)
+                for _ in range(temporal_layers)
             ]
         )
-        self.mask_proj = nn.Linear(1, 1)
-        self.mask_fuse = nn.Conv1d(config.d_model + 1, config.d_model, kernel_size=1)
 
-    def freeze_stem(self) -> None:
-        self.encoder.freeze_stem()
-
-    def _flatten_spatial(self, encoded: torch.Tensor) -> torch.Tensor:
+    def _flatten_spatial(self, x: torch.Tensor) -> torch.Tensor:
+        """Flatten spatial dims according to scan mode."""
         if self.spatial_scan == "vertical":
-            encoded = encoded.transpose(-1, -2)
-        return encoded.flatten(start_dim=-2)
-
-    def _tokens_to_map(self, tokens: torch.Tensor, pooled_h: int, pooled_w: int) -> torch.Tensor:
-        if self.spatial_scan == "vertical":
-            return tokens.reshape(tokens.size(0), pooled_w, pooled_h, tokens.size(-1)).transpose(1, 2)
-        return tokens.reshape(tokens.size(0), pooled_h, pooled_w, tokens.size(-1))
+            x = x.transpose(-1, -2)
+        return x.flatten(start_dim=-2)  # [B, seq, d_model, spatial]
 
     def forward(
         self, x: torch.Tensor, mask: torch.Tensor | None = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size, seq_len, channels, height, width = x.shape
-        encoded = self.encoder(x.reshape(batch_size * seq_len, channels, height, width))
-        _, d_model, pooled_h, pooled_w = encoded.shape
+    ) -> torch.Tensor:
+        """Process temporal dimension and aggregate.
+
+        Args:
+            x:    [B, seq_len, d_model, pooled_h, pooled_w]
+            mask: [B, seq_len] or None — used for weighted aggregation
+
+        Returns:
+            tokens: [B, spatial_len, d_model]
+        """
+        B, seq_len, d_model, pooled_h, pooled_w = x.shape
         spatial_len = pooled_h * pooled_w
 
-        encoded = encoded.reshape(batch_size, seq_len, d_model, pooled_h, pooled_w)
-        encoded = self._flatten_spatial(encoded)
+        # Flatten spatial dimensions
+        x = self._flatten_spatial(x)  # [B, seq_len, d_model, spatial_len]
 
-        if mask is not None:
-            mask_emb = self.mask_proj(mask.unsqueeze(-1))
-            mask_emb = mask_emb.unsqueeze(-1).expand(-1, -1, -1, spatial_len)
-            encoded = torch.cat([encoded, mask_emb], dim=2)
-            B, T, _, S = encoded.shape
-            encoded = encoded.reshape(B * T, d_model + 1, S)
-            encoded = self.mask_fuse(encoded)
-            encoded = encoded.reshape(B, T, d_model, S)
-
+        # Reverse temporal order if configured
         if self.temporal_order == "reverse":
-            encoded = torch.flip(encoded, dims=[1])
-        time_sequence = encoded.permute(0, 1, 3, 2).reshape(batch_size, seq_len * spatial_len, d_model)
-        fused_sequence = time_sequence
+            x = torch.flip(x, dims=[1])
+
+        # Reshape for TFMamba: [B, seq_len * spatial_len, d_model]
+        time_sequence = x.permute(0, 1, 3, 2).reshape(B, seq_len * spatial_len, d_model)
+
+        # TFMamba processing
+        fused = time_sequence
         for block in self.temporal_blocks:
-            channel_encoded = block["channel_encoding"](fused_sequence)
-            fused_sequence = fused_sequence + block["tf_mamba"](channel_encoded)
+            channel_encoded = block["channel_encoding"](fused)
+            fused = fused + block["tf_mamba"](channel_encoded)
 
-        per_time = fused_sequence.reshape(batch_size, seq_len, spatial_len, d_model)
-        aggregated = per_time.sum(dim=1)
-        feature_map = self._tokens_to_map(aggregated, pooled_h, pooled_w).permute(0, 3, 1, 2)
-        return aggregated, feature_map
+        # Reshape back to per-frame: [B, seq_len, spatial_len, d_model]
+        per_time = fused.reshape(B, seq_len, spatial_len, d_model)
 
+        # Mask-weighted aggregation
+        if mask is not None:
+            agg_mask = torch.flip(mask, dims=[1]) if self.temporal_order == "reverse" else mask
+            weights = agg_mask.unsqueeze(-1).unsqueeze(-1)  # [B, seq_len, 1, 1]
+            aggregated = (per_time * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1)
+        else:
+            aggregated = per_time.sum(dim=1)
+
+        return aggregated  # [B, spatial_len, d_model]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 4: Reliability Estimator (unchanged logic)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ReliabilityEstimator(nn.Module):
+    """Estimates per-modality reliability from mask ratio and feature statistics.
+
+    For each modality, combines:
+      - Feature statistics (mean + std over tokens)
+      - Mask availability ratio
+
+    Outputs a d_model-dimensional reliability vector in (0, 1]
+    that scales modality tokens before fusion.
+    """
+
+    def __init__(self, d_model: int, dropout: float = 0.1):
+        super().__init__()
+        inner_dim = max(d_model // 4, 8)
+
+        self.feat_proj = nn.Sequential(
+            nn.Linear(d_model * 2, inner_dim),
+            nn.GELU(),
+        )
+        self.mask_proj = nn.Linear(1, inner_dim)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(inner_dim * 2, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Estimate reliability for a single modality.
+
+        Args:
+            tokens: [B, N, d_model] or [B, seq_len, d_model]
+            mask:   [B, seq_len]  (binary, 1=present, 0=missing)
+
+        Returns:
+            reliability: [B, d_model] in (0, 1]
+        """
+        feat_mean = tokens.mean(dim=1)  # [B, d_model]
+        feat_std = tokens.std(dim=1, unbiased=False)  # [B, d_model]
+        feat_stats = torch.cat([feat_mean, feat_std], dim=-1)  # [B, 2*d_model]
+
+        mask_ratio = mask.mean(dim=1, keepdim=True)  # [B, 1]
+
+        feat_encoded = self.feat_proj(feat_stats)  # [B, inner_dim]
+        mask_encoded = self.mask_proj(mask_ratio)  # [B, inner_dim]
+
+        combined = torch.cat([feat_encoded, mask_encoded], dim=-1)
+        return self.mlp(combined)  # [B, d_model] in (0, 1]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 5: Cross-Modal Fusion (direct modality-pair attention — NEW)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class CrossModalAttention(nn.Module):
+    """Single-head cross-attention block with FFN.
+
+    Q attends to KV; residual connection + FFN.
+    """
+
+    def __init__(self, d_model: int, nhead: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.norm_q = nn.LayerNorm(d_model)
+        self.norm_kv = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.norm_out = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, d_model),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, query: torch.Tensor, key_value: torch.Tensor) -> torch.Tensor:
+        q = self.norm_q(query)
+        kv = self.norm_kv(key_value)
+        attn_out, _ = self.attn(q, kv, kv)
+        out = query + self.dropout(attn_out)
+        out = out + self.ffn(self.norm_out(out))
+        return out
+
+
+class CrossModalFusion(nn.Module):
+    """Direct cross-modal attention between image, radar, and lidar tokens.
+
+    Each modality serves as query, attending to the other two modalities'
+    tokens as key-value. This enables direct cross-modal compensation:
+      - Missing image  → borrow from radar + lidar
+      - Missing lidar  → borrow from image + radar
+      - Missing radar  → borrow from image + lidar
+
+    GPS is handled separately through the MBMamba sequence bookends.
+    """
+
+    def __init__(self, d_model: int, nhead: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.img_cross = CrossModalAttention(d_model, nhead, dropout)
+        self.radar_cross = CrossModalAttention(d_model, nhead, dropout)
+        self.lidar_cross = CrossModalAttention(d_model, nhead, dropout)
+
+    def forward(
+        self,
+        img: torch.Tensor,
+        radar: torch.Tensor,
+        lidar: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Cross-modal fusion across spatial modalities.
+
+        Args:
+            img:   [B, N, d]
+            radar: [B, N, d]
+            lidar: [B, N, d]
+
+        Returns:
+            Enhanced tokens, same shapes.
+        """
+        # Image attends to radar + lidar
+        kv_for_img = torch.cat([radar, lidar], dim=1)  # [B, 2N, d]
+        img_enh = self.img_cross(img, kv_for_img)
+
+        # Radar attends to image + lidar
+        kv_for_radar = torch.cat([img, lidar], dim=1)  # [B, 2N, d]
+        radar_enh = self.radar_cross(radar, kv_for_radar)
+
+        # Lidar attends to image + radar
+        kv_for_lidar = torch.cat([img, radar], dim=1)  # [B, 2N, d]
+        lidar_enh = self.lidar_cross(lidar, kv_for_lidar)
+
+        return img_enh, radar_enh, lidar_enh
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Main Model
+# ═══════════════════════════════════════════════════════════════════════════
 
 class BeMambaModel(nn.Module):
+    """BeMamba with DMAF (Dynamic Mask Adaptive Fusion).
+
+    Architecture pipeline (when missing_enabled=True):
+      Phase 1: Spatial Encoding  → per-frame features
+      Phase 2: Mask Encoding     → mask-aware features
+      Phase 3: Temporal Proc.    → aggregated tokens
+      Phase 4: Reliability Est.  → scaled tokens
+      Phase 5: Cross-Modal Fusion → modality compensation
+      Phase 6: MBMamba Fusion    → sequence fusion
+      Phase 7: Classification    → beam prediction
+
+    When missing_enabled=False, Phases 2/4/5 are skipped → baseline BeMamba.
+    """
+
     def __init__(self, config: BeMambaConfig | None = None):
         super().__init__()
         self.config = config or BeMambaConfig()
         cfg = self.config
         self.spatial_len = cfg.patch_grid * cfg.patch_grid
-        self.freeze_image_stem = cfg.freeze_image_stem
         self.missing_enabled = cfg.missing_enabled
 
-        self.image_branch = TimeSequenceBranch("resnet34", 3, cfg)
-        self.lidar_branch = TimeSequenceBranch("resnet18", 1, cfg)
-        self.radar_branch = TimeSequenceBranch("resnet18", 2, cfg)
+        # Resolve ablation flags — all False when missing is disabled
+        self.use_mask_embed = cfg.missing_enabled and cfg.use_mask_embed
+        self.use_cross_attn = cfg.missing_enabled and cfg.use_cross_attn
+        self.use_reliability = cfg.missing_enabled and cfg.use_reliability
+
+        # ── Phase 1: Spatial encoders ──
+        self.img_backbone = ModalityBackbone("resnet34", 3, cfg.d_model, cfg.patch_grid, cfg.pretrained_backbones)
+        self.radar_backbone = ModalityBackbone("resnet18", 2, cfg.d_model, cfg.patch_grid, cfg.pretrained_backbones)
+        self.lidar_backbone = ModalityBackbone("resnet18", 1, cfg.d_model, cfg.patch_grid, cfg.pretrained_backbones)
         if cfg.freeze_image_stem:
-            self.image_branch.freeze_stem()
+            self.img_backbone.freeze_stem()
+
         self.gps_projection = GPSProjection(cfg.d_model, cfg.gps_hidden_dim, cfg.dropout)
 
+        # ── Phase 2: Mask encoders (standalone) ──
+        self.img_mask_encoder = MaskEncoder(cfg.d_model)
+        self.radar_mask_encoder = MaskEncoder(cfg.d_model)
+        self.lidar_mask_encoder = MaskEncoder(cfg.d_model)
+        self.gps_mask_encoder = MaskEncoder(cfg.d_model)
+
+        # ── Phase 3: Temporal processors ──
+        temporal_kwargs = dict(
+            d_model=cfg.d_model,
+            d_state=cfg.d_state,
+            d_conv=cfg.d_conv,
+            expand=cfg.expand,
+            dropout=cfg.dropout,
+            temporal_layers=cfg.temporal_layers,
+            temporal_order=cfg.temporal_order,
+            spatial_scan=cfg.spatial_scan,
+        )
+        self.img_temporal = TemporalProcessor(**temporal_kwargs)
+        self.radar_temporal = TemporalProcessor(**temporal_kwargs)
+        self.lidar_temporal = TemporalProcessor(**temporal_kwargs)
+
+        # ── Phase 4: Reliability estimators ──
+        self.img_reliability = ReliabilityEstimator(cfg.d_model, cfg.dropout)
+        self.radar_reliability = ReliabilityEstimator(cfg.d_model, cfg.dropout)
+        self.lidar_reliability = ReliabilityEstimator(cfg.d_model, cfg.dropout)
+        self.gps_reliability = ReliabilityEstimator(cfg.d_model, cfg.dropout)
+
+        # ── Phase 5: Cross-modal fusion ──
+        self.cross_modal_fusion = CrossModalFusion(cfg.d_model, dropout=cfg.dropout)
+
+        # ── Phase 6: Alignment + MBMamba fusion ──
         self.image_align = nn.Linear(cfg.d_model, cfg.d_model)
         self.lidar_align = nn.Linear(cfg.d_model, cfg.d_model)
         self.radar_align = nn.Linear(cfg.d_model, cfg.d_model)
-
-        self.cross_attn_0 = CrossModalAttention(cfg.d_model, dropout=cfg.dropout)
-        self.cross_attn_1 = CrossModalAttention(cfg.d_model, dropout=cfg.dropout)
-        self.cross_attn_2 = CrossModalAttention(cfg.d_model, dropout=cfg.dropout)
 
         self.modal_blocks = nn.ModuleList(
             [
@@ -313,6 +565,7 @@ class BeMambaModel(nn.Module):
             ]
         )
 
+        # ── Phase 7: Classification head ──
         flattened_dim = cfg.d_model * self.spatial_len
         self.head = nn.Sequential(
             nn.Linear(flattened_dim, 2048),
@@ -326,9 +579,30 @@ class BeMambaModel(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
-        if self.freeze_image_stem:
-            self.image_branch.encoder.features[1].eval()
+        if self.config.freeze_image_stem:
+            self.img_backbone.features[1].eval()
         return self
+
+    # ── Helper: apply 2D backbone to 5-frame sequence ────────────────
+
+    @staticmethod
+    def _encode_frames(backbone: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        """Apply a ModalityBackbone to a batch of frame sequences.
+
+        Args:
+            backbone: ModalityBackbone instance
+            x:        [B, seq_len, C, H, W]
+
+        Returns:
+            [B, seq_len, d_model, patch_grid, patch_grid]
+        """
+        B, S, C, H, W = x.shape
+        flat = x.reshape(B * S, C, H, W)
+        encoded = backbone(flat)  # [B*S, d_model, ph, pw]
+        _, d, ph, pw = encoded.shape
+        return encoded.reshape(B, S, d, ph, pw)
+
+    # ── Phase 6 helpers ──────────────────────────────────────────────
 
     def _build_modal_sequences(
         self,
@@ -337,8 +611,14 @@ class BeMambaModel(nn.Module):
         radar_tokens: torch.Tensor,
         gps_tokens: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        gps_start = gps_tokens[:, 0, :].unsqueeze(1).expand(-1, self.spatial_len, -1)
-        gps_end = gps_tokens[:, 1, :].unsqueeze(1).expand(-1, self.spatial_len, -1)
+        """Build three mixed-modality sequences (BeMamba paper Eq. 11-13).
+
+        Each sequence is a different permutation of [gps_start, img, lidar, radar, gps_end],
+        to handle Mamba's order sensitivity.
+        """
+        N = self.spatial_len
+        gps_start = gps_tokens[:, 0, :].unsqueeze(1).expand(-1, N, -1)  # [B, N, d]
+        gps_end = gps_tokens[:, 1, :].unsqueeze(1).expand(-1, N, -1)
 
         image_tokens = self.image_align(image_tokens)
         lidar_tokens = self.lidar_align(lidar_tokens)
@@ -348,46 +628,36 @@ class BeMambaModel(nn.Module):
         seq_c2 = torch.stack([gps_start, lidar_tokens, radar_tokens, image_tokens, gps_end], dim=2)
         seq_c3 = torch.stack([gps_start, radar_tokens, image_tokens, lidar_tokens, gps_end], dim=2)
 
-        batch_size, spatial_len, _, d_model = seq_c1.shape
-        seq_c1 = seq_c1.reshape(batch_size, spatial_len * 5, d_model)
-        seq_c2 = seq_c2.reshape(batch_size, spatial_len * 5, d_model)
-        seq_c3 = seq_c3.reshape(batch_size, spatial_len * 5, d_model)
+        B, N, _, d = seq_c1.shape
+        seq_c1 = seq_c1.reshape(B, N * 5, d)
+        seq_c2 = seq_c2.reshape(B, N * 5, d)
+        seq_c3 = seq_c3.reshape(B, N * 5, d)
         return seq_c1, seq_c2, seq_c3
 
     def _modal_fusion(
         self,
         sequences: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
+        """MBMamba fusion → mean-reduce → sum.
+
+        No cross-attention here — that's handled by CrossModalFusion (Phase 5).
+        """
         running_sequences = list(sequences)
         for layer_blocks in self.modal_blocks:
             next_sequences = []
             for block, sequence in zip(layer_blocks, running_sequences):
-                encoded = block(sequence)
-                next_sequences.append(sequence + encoded)
+                next_sequences.append(sequence + block(sequence))
             running_sequences = next_sequences
 
+        # Mean-reduce the 5-modality dimension, then sum the 3 orderings
         encoded_sequences = []
         for sequence in running_sequences:
-            encoded = sequence.reshape(sequence.size(0), self.spatial_len, 5, self.config.d_model)
-            encoded = encoded.mean(dim=2)
-            encoded_sequences.append(encoded)
+            seq = sequence.reshape(sequence.size(0), self.spatial_len, 5, self.config.d_model)
+            encoded_sequences.append(seq.mean(dim=2))  # [B, N, d]
 
-        s0, s1, s2 = encoded_sequences
+        return encoded_sequences[0] + encoded_sequences[1] + encoded_sequences[2]
 
-        if self.missing_enabled:
-            kv_0 = torch.cat([s1, s2], dim=1)
-            kv_1 = torch.cat([s0, s2], dim=1)
-            kv_2 = torch.cat([s0, s1], dim=1)
-
-            enhanced_0 = self.cross_attn_0(s0, kv_0)
-            enhanced_1 = self.cross_attn_1(s1, kv_1)
-            enhanced_2 = self.cross_attn_2(s2, kv_2)
-
-            fused = enhanced_0 + enhanced_1 + enhanced_2
-        else:
-            fused = s0 + s1 + s2
-
-        return fused
+    # ── Main forward ─────────────────────────────────────────────────
 
     def forward(
         self,
@@ -400,24 +670,79 @@ class BeMambaModel(nn.Module):
         lidar_mask: torch.Tensor | None = None,
         gps_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Forward pass with modular 7-phase pipeline.
+
+        Args:
+            imgs:   [B, 5, 3, H, W]
+            radars: [B, 5, 2, H, W]
+            lidars: [B, 5, 1, H, W]
+            gps:    [B, 2, 2]
+            *_mask: [B, seq_len] or None  (0=missing, 1=present)
+
+        Returns:
+            logits: [B, num_classes]
+        """
+        B = imgs.shape[0]
+        device = imgs.device
+
+        # ── Auto-generate all-ones masks for clean input (DMAF mode) ──
         if self.missing_enabled:
-            B, device = imgs.shape[0], imgs.device
-            img_mask_in = img_mask if img_mask is not None else torch.ones(B, 5, device=device)
-            radar_mask_in = radar_mask if radar_mask is not None else torch.ones(B, 5, device=device)
-            lidar_mask_in = lidar_mask if lidar_mask is not None else torch.ones(B, 5, device=device)
-            gps_mask_in = gps_mask if gps_mask is not None else torch.ones(B, 2, device=device)
-        else:
-            img_mask_in = None
-            radar_mask_in = None
-            lidar_mask_in = None
-            gps_mask_in = None
+            img_mask = img_mask if img_mask is not None else torch.ones(B, 5, device=device)
+            radar_mask = radar_mask if radar_mask is not None else torch.ones(B, 5, device=device)
+            lidar_mask = lidar_mask if lidar_mask is not None else torch.ones(B, 5, device=device)
+            gps_mask = gps_mask if gps_mask is not None else torch.ones(B, 2, device=device)
 
-        image_tokens, _ = self.image_branch(imgs, mask=img_mask_in)
-        lidar_tokens, _ = self.lidar_branch(lidars, mask=lidar_mask_in)
-        radar_tokens, _ = self.radar_branch(radars, mask=radar_mask_in)
-        gps_tokens = self.gps_projection(gps, mask=gps_mask_in)
+        # ═══════════════════════════════════════════════════════════
+        # Phase 1: Spatial Encoding
+        # ═══════════════════════════════════════════════════════════
+        img_spatial = self._encode_frames(self.img_backbone, imgs)      # [B, 5, d, ph, pw]
+        radar_spatial = self._encode_frames(self.radar_backbone, radars)
+        lidar_spatial = self._encode_frames(self.lidar_backbone, lidars)
+        gps_feat = self.gps_projection(gps)                              # [B, 2, d]
 
-        modal_sequences = self._build_modal_sequences(image_tokens, lidar_tokens, radar_tokens, gps_tokens)
-        fused_tokens = self._modal_fusion(modal_sequences)
-        flattened = fused_tokens.reshape(fused_tokens.size(0), -1)
-        return self.head(flattened)
+        # ═══════════════════════════════════════════════════════════
+        # Phase 2: Mask Encoding (standalone)
+        # ═══════════════════════════════════════════════════════════
+        if self.use_mask_embed:
+            img_spatial = self.img_mask_encoder(img_spatial, img_mask)
+            radar_spatial = self.radar_mask_encoder(radar_spatial, radar_mask)
+            lidar_spatial = self.lidar_mask_encoder(lidar_spatial, lidar_mask)
+            gps_feat = self.gps_mask_encoder(gps_feat, gps_mask)
+
+        # ═══════════════════════════════════════════════════════════
+        # Phase 3: Temporal Processing
+        # ═══════════════════════════════════════════════════════════
+        # Pass masks for weighted aggregation (active whenever masks exist)
+        img_tokens = self.img_temporal(img_spatial, mask=img_mask if self.missing_enabled else None)
+        radar_tokens = self.radar_temporal(radar_spatial, mask=radar_mask if self.missing_enabled else None)
+        lidar_tokens = self.lidar_temporal(lidar_spatial, mask=lidar_mask if self.missing_enabled else None)
+        gps_tokens = gps_feat  # [B, 2, d] — no temporal processing for 2 GPS points
+
+        # ═══════════════════════════════════════════════════════════
+        # Phase 4: Reliability Estimation
+        # ═══════════════════════════════════════════════════════════
+        if self.use_reliability:
+            img_tokens = img_tokens * self.img_reliability(img_tokens, img_mask).unsqueeze(1)
+            radar_tokens = radar_tokens * self.radar_reliability(radar_tokens, radar_mask).unsqueeze(1)
+            lidar_tokens = lidar_tokens * self.lidar_reliability(lidar_tokens, lidar_mask).unsqueeze(1)
+            gps_rel = self.gps_reliability(gps_tokens, gps_mask).unsqueeze(1)
+            gps_tokens = gps_tokens * gps_rel
+
+        # ═══════════════════════════════════════════════════════════
+        # Phase 5: Cross-Modal Fusion (direct modality-pair)
+        # ═══════════════════════════════════════════════════════════
+        if self.use_cross_attn:
+            img_tokens, radar_tokens, lidar_tokens = self.cross_modal_fusion(
+                img_tokens, radar_tokens, lidar_tokens
+            )
+
+        # ═══════════════════════════════════════════════════════════
+        # Phase 6: Build sequences + MBMamba fusion
+        # ═══════════════════════════════════════════════════════════
+        sequences = self._build_modal_sequences(img_tokens, lidar_tokens, radar_tokens, gps_tokens)
+        fused = self._modal_fusion(sequences)  # [B, N, d]
+
+        # ═══════════════════════════════════════════════════════════
+        # Phase 7: Classification head
+        # ═══════════════════════════════════════════════════════════
+        return self.head(fused.reshape(B, -1))

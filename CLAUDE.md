@@ -89,63 +89,120 @@
 3. 转成极坐标特征
 4. 以两个时刻的特征进入后续融合
 
+**GPS 缺失策略**：GPS 共有 2 个时间点（起点/终点），从物理意义上看 GPS 缺失通常意味着整个模块故障，而非单个时间点丢失。因此 GPS **不参与帧级和连续帧级缺失**，只受模态级缺失（`missing_modality_prob`）影响。`_build_missing_masks` 中帧级/burst 循环使用 `missing_frame_modalities`（自动排除 gps），模态级循环仍使用 `missing_modalities`（可包含 gps）。
+
 ## 4. 当前模型结构状态
 
 [src/model.py](/D:/code/project_gps/src/model.py) 包含 Baseline 和 DMAF 两套结构。
 
 ### 4.1 Baseline 结构（`missing_enabled=False`）
 
-1. 图像 / LiDAR / Radar 分别经 CNN（ResNet34/ResNet18/ResNet18）提特征
-2. 三个感知模态都经过 Time Sequence Mamba（TFMamba）
+当 `missing_enabled=False` 时，Phases 2/4/5 自动跳过，等价于原始 BeMamba：
+
+1. 图像 / LiDAR / Radar 分别经 CNN（ResNet34/ResNet18/ResNet18）提每帧特征
+2. 三个感知模态经 TFMamba 时序处理 → sum 聚合为 tokens
 3. GPS 用 MLP 投影到同一特征空间
 4. 构造三种 mixed modal combinations（c1/c2/c3，不同模态排列顺序）
-5. 用 MBMamba 做模态融合
-6. 三个序列简单求和 → MLP head 预测 64 类 beam
+5. 用 MBMamba 做模态融合 → 三个序列简单求和
+6. MLP head 预测 64 类 beam
 
 关键超参：`d_model=128`, `patch_grid=6`
 
-### 4.2 DMAF 结构（`missing_enabled=True`）
+### 4.2 DMAF v4 结构（`missing_enabled=True`）
 
-在 Baseline 基础上增加两个创新模块：
-
-**创新点 1：逐帧 Mask 注入**（`TimeSequenceBranch.forward`）
+**模块化 7 阶段 Pipeline**（每个阶段有独立的类，可单独开关）：
 
 ```
-mask [B, 5] → Linear(1,1) → [B, 5, 1] → expand → [B, 5, 1, 36]
-                                                    ↓ concat
-encoded [B, 5, 128, 36]  →  [B, 5, 129, 36] → Conv1d → [B, 5, 128, 36]
-                                                    ↓
-                                            TFMamba 逐帧感知缺失
+Phase 1: Spatial Encoding     ModalityBackbone × 3 + GPSProjection
+         → per-frame features [B, seq, d, H, W]
+
+Phase 2: Mask Encoding        MaskEncoder × 4  ← NEW 独立模块
+         → mask-aware features (Embedding(2, d_model) 注入)
+
+Phase 3: Temporal Processing  TemporalProcessor × 3  ← NEW 独立模块
+         → TFMamba + mask-weighted aggregation → [B, N, d]
+
+Phase 4: Reliability Est.     ReliabilityEstimator × 4
+         → mask ratio + feat stats → per-modality (0,1] weight
+
+Phase 5: Cross-Modal Fusion   CrossModalFusion × 1  ← NEW 独立模块
+         → 直接模态对交叉注意力: img↔{radar,lidar}, radar↔{img,lidar}, lidar↔{img,radar}
+
+Phase 6: MBMamba Fusion       _build_modal_sequences + _modal_fusion
+         → 3 combo sequences → MBMamba → mean → simple sum
+
+Phase 7: Classification       MLP head → 64-class beam
 ```
 
-之前（已废弃）：mask [5] → MaskEncoder 压缩成全局 128 维向量 → Add 到所有空间位置
-现在：每帧的 0/1 变成标量拼到该帧特征 channel 后面，TFMamba 扫描时知道"这一帧丢了"
+**三个创新模块**：
 
-**创新点 2：Cross-Attention 模态融合**（`_modal_fusion`）
+**创新点 1：MaskEncoder + 加权聚合**（Phase 2 + Phase 3）
 
 ```
-三个序列 (s0, s1, s2) 各自 [B, 36, 128]
-
-s0 → CrossAttn(Q=s0, KV=[s1,s2]) → enhanced_0
-s1 → CrossAttn(Q=s1, KV=[s0,s2]) → enhanced_1
-s2 → CrossAttn(Q=s2, KV=[s0,s1]) → enhanced_2
-
-fused = enhanced_0 + enhanced_1 + enhanced_2
+mask [B, 5] → Embedding(2, d_model) → [B, 5, d_model] → expand → [B, 5, d_model, H, W]
+                                                                      ↓ add
+encoded [B, 5, d_model, H, W] + mask_emb → TFMamba → per_time [B, 5, N, d_model]
+                                                                      ↓
+                                                        mask-weighted mean (dim=1)
 ```
 
-之前（已废弃）：ReliabilityGate 算 3 个标量权重做加权求和
-现在：每个 token 能从其他序列的对应位置"借"信息，缺失模态自动向完好模态倾斜
+- `Embedding(2, d_model)` 学到两个 d_model 维向量（缺失/正常），直接加到 per-frame 特征上
+- 时序聚合使用 mask 加权 `mean`：缺失帧自动降权
+- MaskEncoder 是独立模块，对 GPS（[B, 2, d]）和 spatial features（[B, 5, d, H, W]）均适用
+- v1（已废弃）：MaskEncoder 全局 add；v2（已废弃）：Linear(1,1) concat
 
-**自动全1 Mask**：clean 测试时自动生成全 1 mask，确保训练/测试输入分布一致
+**创新点 2：CrossModalFusion — 直接模态对注意力**（Phase 5）
+
+```
+img_tokens   [B, N, d] → CrossAttn(Q=img,   KV=[radar,lidar]) → img_enh
+radar_tokens [B, N, d] → CrossAttn(Q=radar, KV=[img,lidar])   → radar_enh
+lidar_tokens [B, N, d] → CrossAttn(Q=lidar, KV=[img,radar])   → lidar_enh
+```
+
+- 旧版（已废弃）：序列均值之间的 cross-attention（间接）
+- 新版：每个模态直接查询其他两个模态的 token，互补更直接
+- 当 image 缺失时，img_tokens 被 reliability 衰减，cross-attn 从 radar+lidar 拉信息
+
+**创新点 3：ReliabilityEstimator 可靠性估计**（Phase 4）
+
+```
+tokens [B, N, d_model]  →  feat_mean + feat_std [B, 2*d_model]  ─┐
+mask   [B, seq_len]      →  mask_ratio [B, 1]                   ─┤
+                                                                  ↓
+                                     concat → MLP → Sigmoid → reliability [B, d_model]
+                                                                  ↓
+                                          tokens = tokens * reliability.unsqueeze(1)
+```
+
+- 每个模态一个 `ReliabilityEstimator`（~37K 参数），共 4 个
+- 输入：特征统计量（均值+标准差）+ 掩码可用率
+- 输出：(0, 1] 范围的逐样本可靠性向量
+- clean 输入时 mask_ratio=1.0 → 可靠性接近 1.0，行为与 baseline 一致
+
+**自动全1 Mask**：clean 测试时 `forward()` 自动生成全 1 mask，确保训练/测试输入分布一致
+
+**消融开关**（新增，Phase 2 实验就绪）：
+
+| CLI flag | Phase | 效果 |
+|----------|:---:|------|
+| `--no-mask-embed` | 2 | 跳过 MaskEncoder；Phase 3 保留 mask 加权聚合 |
+| `--no-cross-attn` | 5 | 跳过 CrossModalFusion；Phase 6 纯 MBMamba + sum |
+| `--no-reliability` | 4 | 跳过 ReliabilityEstimator；等权进入 fusion |
+
+三者可任意组合，`missing_enabled=False` 时全部自动为 False。
 
 ### 4.3 代码结构
 
-- `BeMambaConfig`：统一配置类，`missing_enabled` 控制 DMAF 开关
-- `TimeSequenceBranch`：逐帧 mask 注入 + TFMamba 时序处理
-- `GPSProjection`：GPS 特征投影 + mask 注入
+- `BeMambaConfig`：统一配置类，含 `use_mask_embed/cross_attn/reliability` 消融开关
+- `ModalityBackbone`：ResNet 空间编码器（图像/Radar/LiDAR）
+- `GPSProjection`：纯 MLP GPS 投影（不含 mask 逻辑）
+- `MaskEncoder`（NEW）：独立 mask 嵌入模块 — `Embedding(2, d_model)` 注入
+- `TemporalProcessor`（NEW）：TFMamba 时序处理 + mask 加权聚合
+- `ReliabilityEstimator`：逐模态可靠性估计 — 特征统计量 + mask ratio → (0,1] 权重
 - `CrossModalAttention`：多头交叉注意力 + FFN + 残差连接
+- `CrossModalFusion`（NEW）：直接模态对交叉注意力 (img↔radar↔lidar)
 - `MBMamba`：双向 Mamba 模态融合
-- `BeMambaModel`：主模型，`_build_modal_sequences` + `_modal_fusion`
+- `BeMambaModel`：主模型，`forward()` 7 阶段 pipeline 清晰可读
 
 ## 5. 当前训练协议
 
@@ -176,8 +233,13 @@ fused = enhanced_0 + enhanced_1 + enhanced_2
 | `--missing-burst-min/max` | 连续缺失帧数范围 | 2/3 |
 | `--missing-modality-prob` | 整模态缺失概率 | 0.05 |
 | `--missing-modality-min/max` | 缺失模态数量范围 | 1/2 |
-| `--missing-modalities` | 可缺失的模态列表 | img,radar,lidar |
+| `--missing-modalities` | 可缺失的模态列表 | img,radar,lidar,gps |
 | `--missing-seed` | 缺失随机种子 | 42 |
+| `--no-mask-embed` | 关闭 MaskEncoder | - |
+| `--no-cross-attn` | 关闭 CrossModalFusion | - |
+| `--no-reliability` | 关闭 ReliabilityEstimator | - |
+
+> **GPS 特殊处理**：帧级缺失和连续帧缺失只作用于 `missing_frame_modalities`（自动排除 gps），GPS 仅受模态级缺失影响。理由：GPS 只有 2 个时间点，单点丢失没有物理意义，真实场景下 GPS 是整个模块故障。
 
 ### 5.4 训练输出
 
@@ -243,100 +305,458 @@ SC34 基本复现到论文水平，SC32 仍是主要短板。
 
 ## 8. DMAF 实现与实验状态
 
-### 8.1 已完成
+### 8.1 版本演进
 
-- [x] 数据集缺失模拟（帧级 / 连续帧 / 模态级 / 混合）
-- [x] 逐帧 mask 注入（TimeSequenceBranch + GPSProjection）
-- [x] Cross-Attention 模态融合（替代 ReliabilityGate）
-- [x] Clean 测试自动全 1 mask
-- [x] 训练结束后自动鲁棒性评估（9 种协议）
-- [x] 独立评估脚本 `eval_missing.py`
-- [x] `--no-dmaf` 开关（评估 baseline 模型用）
+| 版本 | Mask 注入 | 时序聚合 | 模态融合 | 可靠性估计 | 架构 | 状态 |
+|------|-----------|----------|----------|:---:|------|:---:|
+| v1 | MaskEncoder 全局加和 | sum | ReliabilityGate | 无 | 耦合在 branch 内 | 废弃 |
+| v2 | Linear(1,1) concat 到 channel | sum | ReliabilityGate | 无 | 耦合在 branch 内 | 废弃 |
+| v3 | Embedding(2, d_model) | mask-weighted mean | Cross-Attn (序列均值间) | 无 | 耦合在 branch 内 | 废弃 |
+| **v4** | **MaskEncoder (独立)** | **mask-weighted mean** | **CrossModalFusion (直接模态对)** | **ReliabilityEstimator** | **7 阶段模块化** | **当前** |
 
-### 8.2 第一次 DMAF 实验（SC32，缺失率偏高，已存档）
+v4 架构（2026-05-29 重构）：
+- MaskEncoder / TemporalProcessor / CrossModalFusion 均为独立模块，`forward()` 7 阶段 pipeline 清晰
+- Cross-Attention 从序列均值间改为直接模态对 (img↔radar↔lidar)，互补更直接
+- 消融开关 `--no-mask-embed/--no-cross-attn/--no-reliability` 已就绪
 
-训练参数：`frame=0.2, burst=0.1, modal=0.1`
+### 8.2 DMAF v2 实验（SC32，低缺失率，Linear(1,1) mask）
 
-| 协议 | Baseline (clean训练) | DMAF (缺失训练) |
+训练参数：`frame=0.1, burst=0.05, modal=0.05`，mask 注入方式：`Linear(1,1)` + concat
+
+| 协议 | Baseline (clean训练) | DMAF v2 (缺失训练) |
 |------|:---:|:---:|
-| clean | **81.54%** | 78.49% |
-| frame 10% | **78.97%** | 72.71% |
-| frame 20% | **74.80%** | 67.74% |
-| frame 30% | **70.63%** | 59.71% |
-| burst 10% | **74.80%** | 70.14% |
-| burst 20% | **69.02%** | 63.40% |
-| modal 10% | **78.33%** | 75.28% |
-| modal 20% | **74.16%** | 71.91% |
-| hybrid | **63.88%** | 55.22% |
+| clean | **81.54%** | 81.22% |
+| frame 10% | **78.97%** | 75.28% |
+| frame 20% | **74.80%** | 71.11% |
+| frame 30% | **70.63%** | 64.04% |
+| burst 10% | **74.80%** | 73.84% |
+| burst 20% | **69.02%** | 67.26% |
+| modal 10% | **78.33%** | 77.37% |
+| modal 20% | **74.16%** | 73.84% |
+| hybrid | 63.88% | 70.30% |
 
-DMAF 全面落后。原因：缺失率太高，训练数据太脏，模型学不到有效特征。Baseline 用完整数据训练，ResNet+Mamba 本身有一定抗噪能力。
+Clean 差距 0.32%（在 ±1% 内），但帧缺失全面落后（-3.69% 到 -6.59%）。mask 信号太弱（1/129 维度），SSM 无法有效区分缺失帧。
 
-### 8.3 当前方案：降低缺失率
+### 8.3 DMAF v3 → v4 改进
 
-将缺失率降到温和水平，保证足够多的干净训练样本：
+v3 改进（已完成）：
+1. **Mask 信号强化**：`Linear(1,1)` → `Embedding(2, d_model)`，缺失/正常各学一个 128 维向量，直接加到特征上
+2. **Mask 加权聚合**：盲 `sum` → mask 加权 `mean`，缺失帧自动降权
+3. **GPS 加入缺失**：`--missing-modalities` 默认包含 `gps`
 
-```
---missing-frame-prob 0.1      (从 0.2 降)
---missing-burst-prob 0.05     (从 0.1 降)
---missing-modality-prob 0.05  (从 0.1 降)
-```
+v4 新增（2026-05-29）：
+4. **GPS 仅模态级缺失**：GPS 从帧级/burst 循环中排除（`missing_frame_modalities`），只受模态级缺失影响
+5. **Reliability Estimation**：新增 `ReliabilityEstimator` 模块，用特征统计量 + mask ratio 学习逐模态可靠性权重
+6. **验证/测试固定模式**：`set_missing_epoch` 对 val/test 模式直接返回，缺失模式保持 epoch=0
+7. **三大实验类型分离**：测试协议拆分为三种独立类型（帧随机/连续帧/模态缺失），各测多个强度
 
-目标：clean Top-3 回到 81%+，missing retention 超过 baseline。
+训练参数保持不变：`frame=0.1, burst=0.05, modal=0.05`
 
-### 8.4 鲁棒性评估协议（9 种）
+### 8.4 鲁棒性评估协议（12 种，v4 更新）
 
-训练结束后自动运行，`eval_missing.py` 可独立评估已有 checkpoint：
+训练结束后自动运行，`eval_missing.py` 可独立评估已有 checkpoint。
 
+三种独立实验类型，参数严格互斥（同一协议只有一种缺失机制启用）：
+
+**A. Clean 基准：**
 | # | 协议名 | 描述 |
 |:--:|--------|------|
-| 1 | clean | 完整数据（baseline 基准） |
-| 2 | frame_p01 | 10% 帧随机缺失 |
-| 3 | frame_p02 | 20% 帧随机缺失 |
-| 4 | frame_p03 | 30% 帧随机缺失 |
-| 5 | burst_p01 | 10% 连续帧缺失 |
-| 6 | burst_p02 | 20% 连续帧缺失 |
-| 7 | modal_p01 | 10% 模态缺失 |
-| 8 | modal_p02 | 20% 模态缺失 |
-| 9 | hybrid | 训练配置的混合缺失 |
+| 1 | clean | 完整数据 |
+
+**B. 随机帧缺失（仅 frame_prob，burst=modality=0）：**
+| # | 协议名 | frame_prob |
+|:--:|--------|:---:|
+| 2 | frame_p01 | 10% |
+| 3 | frame_p03 | 30% |
+| 4 | frame_p05 | 50% |
+
+**C. 连续帧缺失（仅 burst_prob，frame=modality=0，burst_min=2 burst_max=3）：**
+| # | 协议名 | burst_prob |
+|:--:|--------|:---:|
+| 5 | burst_p02 | 20% |
+| 6 | burst_p04 | 40% |
+| 7 | burst_p06 | 60% |
+
+**D. 模态缺失（仅 modality_prob，frame=burst=0，modality_min=max=1）：**
+| # | 协议名 | modality_prob |
+|:--:|--------|:---:|
+| 8 | modal_p02 | 20% |
+| 9 | modal_p04 | 40% |
+| 10 | modal_p06 | 60% |
+
+**E. 混合：**
+| # | 协议名 | 描述 |
+|:--:|--------|------|
+| 11 | hybrid | 训练配置的混合缺失 |
 
 所有指标报告 Top-1/2/3、DBA、APL、Retention Ratio。
 
-## 9. 论文实验规划
+### 8.5 已完成清单
+
+- [x] 数据集缺失模拟（帧级 / 连续帧 / 模态级）
+- [x] GPS 仅模态级缺失（帧级/burst 自动排除 gps）
+- [x] 逐帧 mask 注入 v4：MaskEncoder 独立模块，Embedding(2, d_model) 强信号
+- [x] Mask 加权时序聚合（替代盲 sum）
+- [x] CrossModalFusion：直接模态对交叉注意力（替代序列均值间 CrossAttn + ReliabilityGate）
+- [x] Reliability Estimation 模块
+- [x] Clean 测试自动全 1 mask
+- [x] 验证/测试集固定缺失模式（`set_missing_epoch` guard）
+- [x] 训练结束后自动鲁棒性评估（12 种协议，3 种独立实验类型）
+- [x] 独立评估脚本 `eval_missing.py`（支持动态协议配置）
+- [x] `--no-dmaf` 开关（评估 baseline 模型用）
+- [x] 消融开关 `--no-mask-embed / --no-cross-attn / --no-reliability`（Phase 2 实验就绪）
+- [x] 7 阶段模块化架构重构（MaskEncoder / TemporalProcessor / CrossModalFusion 独立模块）
+- [x] `run_missing_robustness_tests` 显式传递 `missing_modalities` 参数
+- [ ] v4 实验验证（三个场景）
+
+## 9. 实验计划与进度跟踪
 
 ### 9.1 故事线
 
-> 实际部署中传感器数据经常缺失（硬件故障、延迟、天气），现有方法一缺就崩。我们提出 DMAF——用逐帧 mask 注入 + Cross-Attention 融合，让模型在残缺输入下仍然预测准确。
+> 实际部署中传感器数据经常缺失（硬件故障、延迟、天气），现有方法一缺就崩。我们提出 DMAF——用逐帧 mask 注入 + Cross-Attention 融合 + Reliability Estimation，让模型在残缺输入下仍然预测准确。
 
-### 9.2 实验矩阵
+### 9.2 实验总览
 
-**A 组：Clean Baseline（3 实验）**
-证明 DMAF 不破坏完整数据性能。三个场景各跑一次 clean 训练 + DMAF 训练，对比 clean Top-3。差距应在 ±1% 以内。
+| 阶段 | 实验ID | 训练? | 场景 | 描述 | 优先级 | 预计耗时 |
+|------|:--:|:---:|------|------|:---:|:---:|
+| **Pre** | P0 | ❌ eval | SC32/33/34 | Baseline 鲁棒性评估（12 协议 × 3 场景） | 🔴 最高 | ~30 min |
+| **Phase 1** | D1 | ✅ train | SC32 | DMAF v4 完整训练 + 12 协议 | 🔴 最高 | ~15 h |
+| **Phase 1** | D2 | ✅ train | SC33 | DMAF v4 完整训练 + 12 协议 | 🟡 次高 | ~15 h |
+| **Phase 1** | D3 | ✅ train | SC34 | DMAF v4 完整训练 + 12 协议 | 🟡 次高 | ~15 h |
+| **Phase 2** | A2 | ✅ train | SC32 | 消融：w/o CrossAttn (`--no-cross-attn`) | 🟢 中等 | ~15 h |
+| **Phase 2** | A3 | ✅ train | SC32 | 消融：w/o Reliability (`--no-reliability`) | 🟢 中等 | ~15 h |
+| **Phase 2** | A4 | ✅ train | SC32 | 消融：w/o MaskEmbed (`--no-mask-embed`) | 🟢 中等 | ~15 h |
+| **Phase 3** | C1 | ❌ eval | SC32 | 缺失率曲线（DMAF + Baseline 对比） | 🔵 较低 | ~30 min |
+| **Phase 3** | C2 | ❌ eval | SC33 | 缺失率曲线（DMAF + Baseline 对比） | 🔵 较低 | ~30 min |
+| **Phase 3** | C3 | ❌ eval | SC34 | 缺失率曲线（DMAF + Baseline 对比） | 🔵 较低 | ~30 min |
 
-**B 组：缺失去实验（核心 Table）**
-Baseline vs DMAF，9 种缺失协议 × 3 场景。关键指标：Top-3 + Retention Ratio。
+**总计**：4 次训练（D1 + A2/A3/A4，SC33/34 与 SC32 并行则额外 2 次）+ 纯 eval 工作
 
-**C 组：消融实验（~12 实验）**
-拆开两个组件：
+---
 
-| 变体 | Mask 注入 | 融合方式 |
-|------|:---:|:---:|
-| Baseline | 无 | 简单求和 |
-| DMAF w/o CrossAttn | 逐帧 concat | 简单求和 |
-| DMAF w/o MaskInj | 全局加和（旧） | Cross-Attn |
-| DMAF Full | 逐帧 concat | Cross-Attn |
+### 9.3 依赖关系
 
-**D 组：缺失率曲线（可选）**
-frame p=0.05~0.5，画缺失率 vs Top-3 曲线。
+```
+Pre (Baseline 鲁棒性) ─────────────────────────────┐
+                                                    ↓
+Phase 1 D1 (SC32 DMAF v4) ─── 确认方案有效 ───→ D2 (SC33) + D3 (SC34)
+    ↓                                                   ↓
+    ├──→ Phase 2 A2/A3/A4 (消融，依赖 D1 做对比)       │
+    └──→ Phase 3 C1 (SC32 曲线)                        │
+                                                        ↓
+                                            Phase 3 C2 + C3 (SC33/34 曲线)
+```
 
-**E 组：跨场景泛化**
-SC32（白天）、SC33（夜景）、SC34（夜景），B 组自动覆盖。
+**关键路径**：Pre → D1 → 确认结果 → D2/D3 + A2/A3/A4 并行 → C1/C2/C3
 
-### 9.3 当前优先级
+---
 
-1. **SC32 DMAF 低缺失率训练** — 验证降低缺失率后 DMAF 能否超越 Baseline
-2. **SC33 + SC34 clean baseline** — 补全 A 组
-3. **SC33 + SC34 DMAF 训练** — 补全 B 组
-4. **消融实验** — C 组（1 场景 × 2 变体即可）
+### 9.4 Pre: Baseline 鲁棒性评估（无训练，先跑）
+
+**目标**：获取三个场景 Baseline 模型在 12 种缺失协议下的性能，作为 DMAF v4 的对比基线。
+
+**前提**：已有 B1/B2/B3 的 `best_model.pth` checkpoint。
+
+**为什么先跑**：跑完才知道 DMAF 要超越的具体数字是多少。Baseline 在缺失下应该明显掉点——这就是 DMAF 要解决的问题。
+
+```bash
+# P0-SC32: Baseline 鲁棒性
+python eval_missing.py \
+  --ckpt ./outputs/scenario32/<TIMESTAMP>/checkpoints/best_model.pth \
+  --split-root ./Data/splits_paper80 \
+  --scenario scenario32 \
+  --image-subdir camera_data_mask \
+  --batch-size 48 \
+  --no-dmaf
+
+# P0-SC33: Baseline 鲁棒性
+python eval_missing.py \
+  --ckpt ./outputs/scenario33/<TIMESTAMP>/checkpoints/best_model.pth \
+  --split-root ./Data/splits_paper80 \
+  --scenario scenario33 \
+  --image-subdir camera_data_mask_yolo \
+  --batch-size 48 \
+  --no-dmaf
+
+# P0-SC34: Baseline 鲁棒性
+python eval_missing.py \
+  --ckpt ./outputs/scenario34/<TIMESTAMP>/checkpoints/best_model.pth \
+  --split-root ./Data/splits_paper80 \
+  --scenario scenario34 \
+  --image-subdir camera_data_mask_yolo \
+  --batch-size 48 \
+  --no-dmaf
+```
+
+**产出**：每个场景一个 `missing_test_result.txt`（在 checkpoint 所在 outputs 目录下）
+
+**期望观察**：
+- Clean 协议：与训练时的 `final_test_result.txt` 一致
+- Frame/Burst/Modal 协议：Top-3 随缺失率上升明显下降
+- 尤其 frame 缺失：Baseline 掉点严重（无 mask 感知，靠猜零值）
+
+---
+
+### Phase 0: Clean Baseline ✅
+
+| # | 场景 | 配置 | Top-3 | DBA | best_epoch | 状态 |
+|:--:|------|------|:---:|:---:|:---:|:---:|
+| B1 | SC32 | camera_data_mask, power_soft_ce, seed=7 | 81.54% | 0.8722 | 14 | ✅ |
+| B2 | SC33 | camera_data_mask_yolo, power_soft_ce, seed=7 | 80.99% | 0.8621 | 17 | ✅ |
+| B3 | SC34 | camera_data_mask_yolo, power_soft_ce, seed=7 | 85.58% | 0.8979 | 22 | ✅ |
+
+命令见 [第10节](#10-当前最优配置与命令)。
+
+---
+
+### Phase 1: DMAF v4 主实验 🔴
+
+**目标**：证明 DMAF v4 在三种缺失类型下全面超越 Baseline，且 clean 性能不掉。
+
+**训练参数**（三个场景统一）：
+```
+frame=0.1, burst=0.05, modal=0.05, seed=7
+```
+
+**12 协议自动评估**：训练完成后自动运行，无需额外操作。
+
+| # | 场景 | 图像子目录 | 描述 | 状态 | 预计产出 |
+|:--:|------|------------|------|:---:|------|
+| D1 | **SC32** | camera_data_mask | 白天，最难场景，Baseline 81.54% | 🔴 | `missing_test_result.txt` |
+| D2 | **SC33** | camera_data_mask_yolo | 夜景，Baseline 80.99% | 🔴 | `missing_test_result.txt` |
+| D3 | **SC34** | camera_data_mask_yolo | 夜景，Baseline 85.58% 最好 | 🔴 | `missing_test_result.txt` |
+
+**判断标准**（每个场景对比 Pre 的 Baseline 鲁棒性结果）：
+
+| 协议类型 | 期望 |
+|----------|------|
+| Clean Top-3 | 与 Baseline 差距在 ±1% 以内（不掉点） |
+| Frame 缺失（10%/30%/50%） | Retention Ratio **显著高于** Baseline（DMAF 核心优势） |
+| Burst 缺失（20%/40%/60%） | Retention Ratio 高于 Baseline |
+| Modal 缺失（20%/40%/60%） | Retention Ratio 高于 Baseline |
+| Hybrid | Retention Ratio 高于 Baseline |
+
+**D1 命令**（SC32，最高优先级）：
+```bash
+python train.py \
+  --split-root ./Data/splits_paper80 \
+  --no-merge-trainval \
+  --scenarios scenario32 \
+  --image-subdir camera_data_mask \
+  --batch-size 48 \
+  --temporal-layers 2 \
+  --fusion-layers 2 \
+  --spatial-scan row \
+  --temporal-order reverse \
+  --optimizer adamw \
+  --weight-decay 1e-4 \
+  --dropout 0.25 \
+  --loss power_soft_ce \
+  --soft-power-temperature 0.15 \
+  --hard-loss-weight 0.6 \
+  --patience 10 \
+  --early-stop-metric acc3 \
+  --early-stop-mode max \
+  --seed 7 \
+  --missing-enabled \
+  --missing-frame-prob 0.1 \
+  --missing-burst-prob 0.05 \
+  --missing-modality-prob 0.05
+```
+
+**D2 命令**（改两处）：
+```bash
+# 与 D1 相同，只改 --scenarios 和 --image-subdir
+  --scenarios scenario33 \
+  --image-subdir camera_data_mask_yolo \
+```
+
+**D3 命令**（改两处）：
+```bash
+  --scenarios scenario34 \
+  --image-subdir camera_data_mask_yolo \
+```
+
+**如果 D1 结果不符合预期**：
+1. 检查 `train_log.csv`：train/test loss 是否正常收敛
+2. 检查 `missing_test_result.txt`：哪个协议最差？frame/burst/modal？
+3. 可能调整：提高训练缺失率（frame=0.15→0.2）或增加 `fusion_layers`
+4. 如果 Clean 掉点 >1%：降低缺失率或增加 `hard_loss_weight`
+
+---
+
+### Phase 2: 消融实验 🔴
+
+**目标**：量化 MaskEncoder、CrossModalFusion、ReliabilityEstimator 各自贡献。
+
+**前提**：Phase 1 D1 完成且结果达标。
+
+**只跑 SC32**（场景差异最大，组件贡献最明显）。3 次训练 + 复用 D1 和 B1。
+
+| # | 变体 | 命令差异 | mask | cross | rel | 对比目标 |
+|:--:|------|----------|:---:|:---:|:---:|------|
+| A1 | **DMAF Full** | (无) | ✅ | ✅ | ✅ | 复用 D1 |
+| A2 | **w/o CrossAttn** | `--no-cross-attn` | ✅ | ❌ | ✅ | vs A1：CrossModalFusion 贡献 |
+| A3 | **w/o Reliability** | `--no-reliability` | ✅ | ✅ | ❌ | vs A1：ReliabilityEstimator 贡献 |
+| A4 | **w/o MaskEmbed** | `--no-mask-embed` | ❌ | ✅ | ✅ | vs A1：MaskEncoder 贡献 |
+| A5 | **Baseline** | (无 `--missing-enabled`) | ❌ | ❌ | ❌ | 复用 B1，下界 |
+
+**期望**：每个模块被拆掉后，鲁棒性都有可测量的下降。贡献排序（猜测）：MaskEmbed ≈ CrossAttn > Reliability。
+
+**A2 命令**（在 D1 命令基础上加一个 flag）：
+```bash
+python train.py \
+  --split-root ./Data/splits_paper80 \
+  --no-merge-trainval \
+  --scenarios scenario32 \
+  --image-subdir camera_data_mask \
+  --batch-size 48 \
+  --temporal-layers 2 \
+  --fusion-layers 2 \
+  --spatial-scan row \
+  --temporal-order reverse \
+  --optimizer adamw \
+  --weight-decay 1e-4 \
+  --dropout 0.25 \
+  --loss power_soft_ce \
+  --soft-power-temperature 0.15 \
+  --hard-loss-weight 0.6 \
+  --patience 10 \
+  --early-stop-metric acc3 \
+  --early-stop-mode max \
+  --seed 7 \
+  --missing-enabled \
+  --missing-frame-prob 0.1 \
+  --missing-burst-prob 0.05 \
+  --missing-modality-prob 0.05 \
+  --no-cross-attn
+```
+
+**A3**：把 `--no-cross-attn` 换成 `--no-reliability`
+**A4**：把 `--no-cross-attn` 换成 `--no-mask-embed`
+
+---
+
+### Phase 3: 缺失率曲线 🔴
+
+**目标**：画三种缺失类型下 Top-3 vs 缺失率的完整曲线，证明 DMAF 在任何缺失强度下都优于 Baseline，且衰减更平缓。
+
+**无需额外训练**——用 Phase 1 + Phase 0 产出的 best checkpoint。
+
+**每个场景跑 6 条命令**（3 种缺失类型 × 2 个模型），产出 6 组数据：
+
+```bash
+CKPT_DMAF="./outputs/scenario32/<D1_TIMESTAMP>/checkpoints/best_model.pth"
+CKPT_BASE="./outputs/scenario32/<B1_TIMESTAMP>/checkpoints/best_model.pth"
+
+# ─── Frame 缺失率曲线（DMAF）───
+python eval_missing.py \
+  --ckpt $CKPT_DMAF \
+  --split-root ./Data/splits_paper80 \
+  --scenario scenario32 \
+  --image-subdir camera_data_mask \
+  --batch-size 48 \
+  --test-frame-probs 0.05 0.1 0.15 0.2 0.25 0.3 0.4 0.5 0.6 0.7 \
+  --test-burst-probs "" --test-modality-probs "" --skip-hybrid
+
+# ─── Frame 缺失率曲线（Baseline）───
+python eval_missing.py \
+  --ckpt $CKPT_BASE \
+  --split-root ./Data/splits_paper80 \
+  --scenario scenario32 \
+  --image-subdir camera_data_mask \
+  --batch-size 48 \
+  --no-dmaf \
+  --test-frame-probs 0.05 0.1 0.15 0.2 0.25 0.3 0.4 0.5 0.6 0.7 \
+  --test-burst-probs "" --test-modality-probs "" --skip-hybrid
+
+# ─── Burst 缺失率曲线（DMAF）───
+python eval_missing.py \
+  --ckpt $CKPT_DMAF \
+  --split-root ./Data/splits_paper80 \
+  --scenario scenario32 \
+  --image-subdir camera_data_mask \
+  --batch-size 48 \
+  --test-frame-probs "" \
+  --test-burst-probs 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 \
+  --test-modality-probs "" --skip-hybrid
+
+# ─── Burst 缺失率曲线（Baseline）───
+python eval_missing.py \
+  --ckpt $CKPT_BASE \
+  --split-root ./Data/splits_paper80 \
+  --scenario scenario32 \
+  --image-subdir camera_data_mask \
+  --batch-size 48 \
+  --no-dmaf \
+  --test-frame-probs "" \
+  --test-burst-probs 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 \
+  --test-modality-probs "" --skip-hybrid
+
+# ─── Modal 缺失率曲线（DMAF）───
+python eval_missing.py \
+  --ckpt $CKPT_DMAF \
+  --split-root ./Data/splits_paper80 \
+  --scenario scenario32 \
+  --image-subdir camera_data_mask \
+  --batch-size 48 \
+  --test-frame-probs "" --test-burst-probs "" \
+  --test-modality-probs 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 \
+  --skip-hybrid
+
+# ─── Modal 缺失率曲线（Baseline）───
+python eval_missing.py \
+  --ckpt $CKPT_BASE \
+  --split-root ./Data/splits_paper80 \
+  --scenario scenario32 \
+  --image-subdir camera_data_mask \
+  --batch-size 48 \
+  --no-dmaf \
+  --test-frame-probs "" --test-burst-probs "" \
+  --test-modality-probs 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 \
+  --skip-hybrid
+```
+
+**SC33/SC34** 同理，替换 `--scenario`、`--image-subdir`、`--ckpt` 即可。
+
+**期望**：
+- DMAF 在所有缺失率下 Retention Ratio **始终高于** Baseline
+- Baseline 随缺失率上升呈**线性或超线性**下降
+- DMAF 衰减**更平缓**（尤其在 frame 缺失场景——这是 mask embedding 的核心优势）
+- 高缺失率（>50%）下 DMAF 仍保留显著预测能力，而 Baseline 接近随机
+
+---
+
+### 9.5 推荐执行顺序
+
+```
+AutoDL 上按以下顺序执行：
+
+第1天：
+  ┌─ Pre: Baseline 鲁棒性评估（3 个 eval，~30 min）
+  │    产出：Baseline 在 12 协议下的具体数字
+  │    确认：Baseline 在缺失下确实掉点 → DMAF 有发挥空间
+  │
+  └─ Phase 1 D1: SC32 DMAF v4 训练（~15 h，挂机过夜）
+       产出：DMAF v4 在 SC32 的 clean + 12 协议结果
+       判断：Clean 不掉点？Frame/Burst/Modal Retention 显著 > Baseline？
+
+第2天：
+  ┌─ 分析 D1 结果
+  │   如果达标 → 启动 Phase 1 D2 + D3（可并行） + Phase 2 A2/A3/A4（可并行）
+  │   如果不达标 → 排查问题（见 Phase 1 排查指南）
+  │
+  └─ D2 (SC33) + D3 (SC34) + A2 + A3 + A4 并行提交（5 个训练任务，各自 ~15 h）
+
+第3天：
+  ┌─ 收集 D2/D3/A2/A3/A4 结果
+  │   产出：完整主表格 + 消融表
+  │
+  └─ Phase 3: 缺失率曲线（6 条 eval 命令 × 3 场景 = 18 条，纯 eval ~1 h）
+       产出：6 张曲线图的数据（帧/Burst/Modal × DMAF/Baseline × 3 场景）
+```
+
+**当前下一步**：在 AutoDL 上先跑 **Pre（Baseline 鲁棒性评估）**，然后挂 **Phase 1 D1（SC32 DMAF v4）**。
 
 ## 10. 当前最优配置与命令
 
@@ -453,7 +873,7 @@ python train.py \
 ### eval_missing.py 独立使用
 
 ```bash
-# 评估 DMAF 模型（默认）
+# 评估 DMAF 模型（默认，使用默认测试协议）
 python eval_missing.py \
   --ckpt ./outputs/scenario32/TIMESTAMP/checkpoints/best_model.pth \
   --batch-size 48 --num-workers 8
@@ -462,6 +882,22 @@ python eval_missing.py \
 python eval_missing.py \
   --ckpt ./outputs/scenario32/TIMESTAMP/checkpoints/best_model.pth \
   --batch-size 48 --num-workers 8 --no-dmaf
+
+# 自定义测试协议强度
+python eval_missing.py \
+  --ckpt ./outputs/scenario32/TIMESTAMP/checkpoints/best_model.pth \
+  --batch-size 48 \
+  --test-frame-probs 0.1 0.3 0.5 0.7 \
+  --test-burst-probs 0.2 0.4 0.6 \
+  --test-modality-probs 0.2 0.4 0.6 \
+  --test-burst-min 2 --test-burst-max 3 \
+  --test-modality-min 1 --test-modality-max 1
+
+# 只测帧缺失，其他跳过
+python eval_missing.py \
+  --ckpt PATH --batch-size 48 \
+  --test-frame-probs 0.1 0.3 0.5 \
+  --test-burst-probs "" --test-modality-probs "" --skip-hybrid
 ```
 
 ## 11. 本地与 AutoDL 分工
@@ -490,9 +926,12 @@ python eval_missing.py \
 - AutoDL 项目路径：`/root/autodl-tmp/project_gps`
 - 正式运行环境：AutoDL
 - 当前目标：在 BeMamba 复现基础上完成 DMAF 创新，提升缺失数据鲁棒性
-- 创新方案主线：Missing-Aware Training（DMAF）
-  - Point 1: 逐帧 mask concat 注入（替代全局 MaskEncoder add）
+- 创新方案主线：Missing-Aware Training（DMAF v4）
+  - Point 1: 逐帧 mask Embedding 注入（替代全局 MaskEncoder add）
   - Point 2: Cross-Attention 模态融合（替代 ReliabilityGate 标量加权）
+  - Point 3: Reliability Estimation 可靠性估计（v4 新增）— 模态级可靠性加权
+  - GPS 仅模态级缺失（帧级/burst 自动排除）
+  - 验证/测试集缺失模式固定（`set_missing_epoch` guard）
 - 数据划分：`./Data/splits_paper80`，`--no-merge-trainval`
 - 结构配置：`temporal_layers=2, fusion_layers=2`
 - 扫描顺序：`spatial_scan=row, temporal_order=reverse`
@@ -505,11 +944,11 @@ python eval_missing.py \
   - SC32: Top-3 `81.54%`, DBA `0.8722`
   - SC33: Top-3 `80.99%`, DBA `0.8621`
   - SC34: Top-3 `85.58%`, DBA `0.8979`
-- DMAF 当前状态：
-  - 高缺失率（0.2/0.1/0.1）效果差于 Baseline
-  - 正在验证低缺失率（0.1/0.05/0.05）
-  - 当前推荐跑低缺失率训练作为第一优先
+- DMAF v4 当前状态：
+  - 代码已完成，待跑实验验证
+  - 12 种鲁棒性评估协议（帧/连续帧/模态三种类型独立）
+  - 训练推荐：`frame=0.1, burst=0.05, modal=0.05`
 - 已支持的工具：
   - 训练自动输出：`final_test_result.txt` + `missing_test_result.txt/csv`
-  - 独立评估：`python eval_missing.py --ckpt PATH [--no-dmaf]`
+  - 独立评估（支持动态协议）：`python eval_missing.py --ckpt PATH [--no-dmaf] [--test-*-probs ...]`
 - 蒸馏（KD）暂不作主线

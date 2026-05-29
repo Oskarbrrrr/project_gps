@@ -63,8 +63,11 @@ class TrainConfig:
     missing_modality_prob: float = 0.0
     missing_modality_min: int = 1
     missing_modality_max: int = 2
-    missing_modalities: str = "img,radar,lidar"
+    missing_modalities: str = "img,radar,lidar,gps"
     missing_seed: int = 42
+    use_mask_embed: bool = True
+    use_cross_attn: bool = True
+    use_reliability: bool = True
 
 
 class AlphaFocalLoss(nn.Module):
@@ -315,20 +318,34 @@ def run_missing_robustness_tests(
     criterion: nn.Module,
     run_dir: str,
 ) -> list:
+    # Protocol format: (name, frame_prob, burst_prob, modality_prob,
+    #                    burst_min, burst_max, mod_min, mod_max)
+    # None means "use dataset defaults" — only set when the protocol overrides.
     test_protocols = [
-        ("clean", 0.0, 0.0, 0.0),
-        ("frame_p01", 0.1, 0.0, 0.0),
-        ("frame_p02", 0.2, 0.0, 0.0),
-        ("frame_p03", 0.3, 0.0, 0.0),
-        ("burst_p01", 0.0, 0.1, 0.0),
-        ("burst_p02", 0.0, 0.2, 0.0),
-        ("modal_p01", 0.0, 0.0, 0.1),
-        ("modal_p02", 0.0, 0.0, 0.2),
+        # ── Clean baseline ──
+        ("clean",       0.0, 0.0, 0.0, None, None, None, None),
+        # ── Random frame missing (no burst, no modality) ──
+        ("frame_p01",   0.1, 0.0, 0.0, None, None, None, None),
+        ("frame_p03",   0.3, 0.0, 0.0, None, None, None, None),
+        ("frame_p05",   0.5, 0.0, 0.0, None, None, None, None),
+        # ── Burst missing: consecutive frames, no frame/modality ──
+        ("burst_p02",   0.0, 0.2, 0.0, 2,    3,    None, None),
+        ("burst_p04",   0.0, 0.4, 0.0, 2,    3,    None, None),
+        ("burst_p06",   0.0, 0.6, 0.0, 2,    3,    None, None),
+        # ── Modality missing: exactly 1 modality at a time ──
+        ("modal_p02",   0.0, 0.0, 0.2, None, None, 1,    1),
+        ("modal_p04",   0.0, 0.0, 0.4, None, None, 1,    1),
+        ("modal_p06",   0.0, 0.0, 0.6, None, None, 1,    1),
+        # ── Training-config hybrid (for reference) ──
         (
             "hybrid",
             train_config.missing_frame_prob,
             train_config.missing_burst_prob,
             train_config.missing_modality_prob,
+            train_config.missing_burst_min,
+            train_config.missing_burst_max,
+            train_config.missing_modality_min,
+            train_config.missing_modality_max,
         ),
     ]
 
@@ -342,7 +359,7 @@ def run_missing_robustness_tests(
     clean_acc3 = None
     results = []
 
-    for name, fp, bp, mp in test_protocols:
+    for name, fp, bp, mp, b_min, b_max, m_min, m_max in test_protocols:
         has_missing = name != "clean"
         ds = MultimodalDataset(
             mode="test",
@@ -357,7 +374,12 @@ def run_missing_robustness_tests(
             return_missing_masks=has_missing,
             missing_frame_prob=fp,
             missing_burst_prob=bp,
+            missing_burst_min=b_min if b_min is not None else 2,
+            missing_burst_max=b_max if b_max is not None else 3,
             missing_modality_prob=mp,
+            missing_modality_min=m_min if m_min is not None else 1,
+            missing_modality_max=m_max if m_max is not None else 2,
+            missing_modalities=train_config.missing_modalities,
             missing_seed=test_seed,
         )
         loader = build_dataloader(ds, train_config, shuffle=False)
@@ -734,8 +756,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--missing-modality-prob", type=float, default=0.0)
     parser.add_argument("--missing-modality-min", type=int, default=1)
     parser.add_argument("--missing-modality-max", type=int, default=2)
-    parser.add_argument("--missing-modalities", default="img,radar,lidar")
+    parser.add_argument("--missing-modalities", default="img,radar,lidar,gps")
     parser.add_argument("--missing-seed", type=int, default=42)
+    parser.add_argument("--no-mask-embed", action="store_true",
+                        help="Disable MaskEncoder (mask embedding injection + weighted aggregation)")
+    parser.add_argument("--no-cross-attn", action="store_true",
+                        help="Disable CrossModalFusion (direct cross-modal attention)")
+    parser.add_argument("--no-reliability", action="store_true",
+                        help="Disable ReliabilityEstimator (per-modality reliability weighting)")
     return parser.parse_args()
 
 
@@ -783,6 +811,9 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         missing_modality_max=args.missing_modality_max,
         missing_modalities=args.missing_modalities,
         missing_seed=args.missing_seed,
+        use_mask_embed=not args.no_mask_embed,
+        use_cross_attn=not args.no_cross_attn,
+        use_reliability=not args.no_reliability,
     )
     model_config = BeMambaConfig(
         d_model=args.d_model,
@@ -799,6 +830,9 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         pretrained_backbones=(not args.no_pretrained_backbones),
         freeze_image_stem=args.freeze_image_stem,
         missing_enabled=args.missing_enabled,
+        use_mask_embed=not args.no_mask_embed,
+        use_cross_attn=not args.no_cross_attn,
+        use_reliability=not args.no_reliability,
     )
     return train_config, model_config
 

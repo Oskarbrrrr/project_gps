@@ -35,6 +35,28 @@ def parse_args():
     parser.add_argument("--missing-seed", type=int, default=42)
     parser.add_argument("--no-dmaf", action="store_true",
                         help="Evaluate as baseline model (no mask injection, no cross-attention)")
+    # ── Test protocol configuration ──
+    parser.add_argument("--test-frame-probs", type=float, nargs="+",
+                        default=[0.1, 0.3, 0.5],
+                        help="Frame missing probabilities for testing (default: 0.1 0.3 0.5)")
+    parser.add_argument("--test-burst-probs", type=float, nargs="+",
+                        default=[0.2, 0.4, 0.6],
+                        help="Burst missing probabilities for testing (default: 0.2 0.4 0.6)")
+    parser.add_argument("--test-modality-probs", type=float, nargs="+",
+                        default=[0.2, 0.4, 0.6],
+                        help="Modality missing probabilities for testing (default: 0.2 0.4 0.6)")
+    parser.add_argument("--test-burst-min", type=int, default=2)
+    parser.add_argument("--test-burst-max", type=int, default=3)
+    parser.add_argument("--test-modality-min", type=int, default=1)
+    parser.add_argument("--test-modality-max", type=int, default=1)
+    parser.add_argument("--skip-hybrid", action="store_true",
+                        help="Skip the hybrid (training config) protocol")
+    parser.add_argument("--no-mask-embed", action="store_true",
+                        help="Disable MaskEncoder (mask embedding injection)")
+    parser.add_argument("--no-cross-attn", action="store_true",
+                        help="Disable CrossModalFusion (direct cross-modal attention)")
+    parser.add_argument("--no-reliability", action="store_true",
+                        help="Disable ReliabilityEstimator (per-modality reliability weighting)")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--temporal-layers", type=int, default=2)
@@ -58,6 +80,9 @@ def main():
         spatial_scan=args.spatial_scan,
         dropout=args.dropout,
         missing_enabled=not args.no_dmaf,
+        use_mask_embed=not args.no_mask_embed,
+        use_cross_attn=not args.no_cross_attn,
+        use_reliability=not args.no_reliability,
     )
 
     train_config = TrainConfig(
@@ -99,17 +124,28 @@ def main():
     test_csv_path = os.path.join(args.split_root, f"{args.scenario}_test.csv")
     criterion = build_criterion(train_config, None)
 
+    # Build test protocols dynamically from CLI args
+    # Protocol format: (name, frame_prob, burst_prob, modality_prob,
+    #                    burst_min, burst_max, mod_min, mod_max)
     test_protocols = [
-        ("clean", 0.0, 0.0, 0.0),
-        ("frame_p01", 0.1, 0.0, 0.0),
-        ("frame_p02", 0.2, 0.0, 0.0),
-        ("frame_p03", 0.3, 0.0, 0.0),
-        ("burst_p01", 0.0, 0.1, 0.0),
-        ("burst_p02", 0.0, 0.2, 0.0),
-        ("modal_p01", 0.0, 0.0, 0.1),
-        ("modal_p02", 0.0, 0.0, 0.2),
-        ("hybrid", args.missing_frame_prob, args.missing_burst_prob, args.missing_modality_prob),
+        ("clean", 0.0, 0.0, 0.0, None, None, None, None),
     ]
+    for p in args.test_frame_probs:
+        test_protocols.append((f"frame_p{int(p*100):02d}", p, 0.0, 0.0, None, None, None, None))
+    for p in args.test_burst_probs:
+        test_protocols.append((f"burst_p{int(p*100):02d}", 0.0, p, 0.0,
+                                args.test_burst_min, args.test_burst_max, None, None))
+    for p in args.test_modality_probs:
+        test_protocols.append((f"modal_p{int(p*100):02d}", 0.0, 0.0, p,
+                                None, None, args.test_modality_min, args.test_modality_max))
+    if not args.skip_hybrid:
+        test_protocols.append(
+            ("hybrid",
+             args.missing_frame_prob,
+             args.missing_burst_prob,
+             args.missing_modality_prob,
+             None, None, None, None)
+        )
 
     test_seed = args.missing_seed + 10000
     ckpt_dir = os.path.dirname(os.path.dirname(args.ckpt))
@@ -125,7 +161,7 @@ def main():
     clean_acc3 = None
     results = []
 
-    for name, fp, bp, mp in test_protocols:
+    for name, fp, bp, mp, b_min, b_max, m_min, m_max in test_protocols:
         has_missing = name != "clean"
         ds = MultimodalDataset(
             mode="test",
@@ -140,7 +176,11 @@ def main():
             return_missing_masks=has_missing,
             missing_frame_prob=fp,
             missing_burst_prob=bp,
+            missing_burst_min=b_min if b_min is not None else 2,
+            missing_burst_max=b_max if b_max is not None else 3,
             missing_modality_prob=mp,
+            missing_modality_min=m_min if m_min is not None else 1,
+            missing_modality_max=m_max if m_max is not None else 2,
             missing_seed=test_seed,
         )
         loader = build_dataloader(ds, train_config, shuffle=False)
