@@ -90,6 +90,9 @@ class MultimodalDataset(Dataset):
             "gps": 2,
         }
         self.missing_modalities = self._normalize_missing_modalities(missing_modalities)
+        self.missing_frame_modalities = tuple(
+            m for m in self.missing_modalities if m != "gps"
+        )
 
         if csv_path is None:
             csv_path = os.path.join(split_root, f"{scenario_name}_{mode}.csv")
@@ -112,6 +115,8 @@ class MultimodalDataset(Dataset):
         return float(np.clip(float(value), 0.0, 1.0))
 
     def set_missing_epoch(self, epoch):
+        if self.mode in ("val", "test"):
+            return
         self.missing_epoch = int(epoch)
 
     def _normalize_missing_modalities(self, missing_modalities):
@@ -161,7 +166,7 @@ class MultimodalDataset(Dataset):
             return masks
 
         rng = self._missing_rng(idx)
-        for name in self.missing_modalities:
+        for name in self.missing_frame_modalities:
             length = self.missing_lengths[name]
             if self.missing_frame_prob > 0:
                 frame_missing = rng.random(length) < self.missing_frame_prob

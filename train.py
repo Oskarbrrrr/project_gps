@@ -56,6 +56,8 @@ class TrainConfig:
     save_every_epoch: bool = False
     device: str = "cuda"
     missing_enabled: bool = False
+    missing_aug_enabled: bool = False
+    dmaf_enabled: bool = False
     missing_frame_prob: float = 0.0
     missing_burst_prob: float = 0.0
     missing_burst_min: int = 2
@@ -371,7 +373,7 @@ def run_missing_robustness_tests(
             gps_stats=gps_stats,
             lidar_representation=train_config.lidar_representation,
             missing_enabled=has_missing,
-            return_missing_masks=has_missing,
+            return_missing_masks=(has_missing and train_config.dmaf_enabled),
             missing_frame_prob=fp,
             missing_burst_prob=bp,
             missing_burst_min=b_min if b_min is not None else 2,
@@ -461,8 +463,8 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
         csv_path=train_csv_path,
         image_subdir=train_config.image_subdir,
         lidar_representation=train_config.lidar_representation,
-        missing_enabled=train_config.missing_enabled,
-        return_missing_masks=train_config.missing_enabled,
+        missing_enabled=train_config.missing_aug_enabled,
+        return_missing_masks=(train_config.missing_aug_enabled and train_config.dmaf_enabled),
         missing_frame_prob=train_config.missing_frame_prob,
         missing_burst_prob=train_config.missing_burst_prob,
         missing_burst_min=train_config.missing_burst_min,
@@ -538,7 +540,7 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
     best_ckpt_path = os.path.join(checkpoints_dir, "best_model.pth")
 
     for epoch in range(1, train_config.epochs + 1):
-        if train_config.missing_enabled:
+        if train_config.missing_aug_enabled:
             train_ds.set_missing_epoch(epoch)
         train_metrics = run_epoch(
             model=model,
@@ -674,7 +676,7 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
     with open(result_path, "w", encoding="utf-8") as handle:
         handle.write(result_text)
 
-    if train_config.missing_enabled:
+    if train_config.missing_aug_enabled or train_config.dmaf_enabled:
         run_missing_robustness_tests(
             model=model,
             train_config=train_config,
@@ -748,7 +750,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gps-hidden-dim", type=int, default=96)
     parser.add_argument("--no-pretrained-backbones", action="store_true")
     parser.add_argument("--freeze-image-stem", action="store_true")
-    parser.add_argument("--missing-enabled", action="store_true")
+    parser.add_argument("--missing-enabled", action="store_true",
+                        help="Legacy convenience flag: enable both missing augmentation and DMAF")
+    parser.add_argument("--missing-aug-enabled", action="store_true",
+                        help="Enable dataset-side missing augmentation without requiring DMAF")
+    parser.add_argument("--dmaf-enabled", action="store_true",
+                        help="Enable DMAF mask-aware model modules")
+    parser.add_argument("--no-dmaf", action="store_true",
+                        help="Disable DMAF even when --missing-enabled is used; useful for Missing-Aug BeMamba")
     parser.add_argument("--missing-frame-prob", type=float, default=0.0)
     parser.add_argument("--missing-burst-prob", type=float, default=0.0)
     parser.add_argument("--missing-burst-min", type=int, default=2)
@@ -768,6 +777,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]:
+    if args.dmaf_enabled and args.no_dmaf:
+        raise ValueError("--dmaf-enabled and --no-dmaf cannot be used together")
+
+    missing_aug_enabled = args.missing_enabled or args.missing_aug_enabled
+    dmaf_enabled = (args.missing_enabled or args.dmaf_enabled) and (not args.no_dmaf)
+
     train_config = TrainConfig(
         data_root=args.data_root,
         split_root=args.split_root,
@@ -802,6 +817,8 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         save_every_epoch=args.save_every_epoch,
         device=args.device,
         missing_enabled=args.missing_enabled,
+        missing_aug_enabled=missing_aug_enabled,
+        dmaf_enabled=dmaf_enabled,
         missing_frame_prob=args.missing_frame_prob,
         missing_burst_prob=args.missing_burst_prob,
         missing_burst_min=args.missing_burst_min,
@@ -829,7 +846,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         gps_hidden_dim=args.gps_hidden_dim,
         pretrained_backbones=(not args.no_pretrained_backbones),
         freeze_image_stem=args.freeze_image_stem,
-        missing_enabled=args.missing_enabled,
+        missing_enabled=dmaf_enabled,
         use_mask_embed=not args.no_mask_embed,
         use_cross_attn=not args.no_cross_attn,
         use_reliability=not args.no_reliability,

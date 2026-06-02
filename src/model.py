@@ -326,7 +326,9 @@ class TemporalProcessor(nn.Module):
         if mask is not None:
             agg_mask = torch.flip(mask, dims=[1]) if self.temporal_order == "reverse" else mask
             weights = agg_mask.unsqueeze(-1).unsqueeze(-1)  # [B, seq_len, 1, 1]
-            aggregated = (per_time * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1)
+            valid_count = weights.sum(dim=1).clamp(min=1)
+            # Preserve the original BeMamba sum scale when all frames are present.
+            aggregated = (per_time * weights).sum(dim=1) * (seq_len / valid_count)
         else:
             aggregated = per_time.sum(dim=1)
 

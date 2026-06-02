@@ -32,6 +32,7 @@ def parse_args():
     parser.add_argument("--missing-frame-prob", type=float, default=0.2)
     parser.add_argument("--missing-burst-prob", type=float, default=0.1)
     parser.add_argument("--missing-modality-prob", type=float, default=0.1)
+    parser.add_argument("--missing-modalities", default="img,radar,lidar,gps")
     parser.add_argument("--missing-seed", type=int, default=42)
     parser.add_argument("--no-dmaf", action="store_true",
                         help="Evaluate as baseline model (no mask injection, no cross-attention)")
@@ -95,10 +96,13 @@ def main():
         loss_name=args.loss,
         soft_power_temperature=args.soft_power_temperature,
         hard_loss_weight=args.hard_loss_weight,
-        missing_enabled=not args.no_dmaf,
+        missing_enabled=False,
+        missing_aug_enabled=True,
+        dmaf_enabled=not args.no_dmaf,
         missing_frame_prob=args.missing_frame_prob,
         missing_burst_prob=args.missing_burst_prob,
         missing_modality_prob=args.missing_modality_prob,
+        missing_modalities=args.missing_modalities,
         missing_seed=args.missing_seed,
         seed=args.seed,
     )
@@ -172,7 +176,7 @@ def main():
             gps_stats=gps_stats,
             lidar_representation=args.lidar_representation,
             missing_enabled=has_missing,
-            return_missing_masks=has_missing,
+            return_missing_masks=(has_missing and not args.no_dmaf),
             missing_frame_prob=fp,
             missing_burst_prob=bp,
             missing_burst_min=b_min if b_min is not None else 2,
@@ -180,6 +184,7 @@ def main():
             missing_modality_prob=mp,
             missing_modality_min=m_min if m_min is not None else 1,
             missing_modality_max=m_max if m_max is not None else 2,
+            missing_modalities=args.missing_modalities,
             missing_seed=test_seed,
         )
         loader = build_dataloader(ds, train_config, shuffle=False)
