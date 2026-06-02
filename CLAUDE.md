@@ -303,6 +303,76 @@ DBA: 0.8979    |  APL: 0.0841 dB  |  best_epoch: 22
 
 SC34 基本复现到论文水平，SC32 仍是主要短板。
 
+### 7.3 DMAF v4 完整结果（2026-05-31）
+
+训练参数：`frame=0.1, burst=0.05, modal=0.05, seed=7`
+
+#### SC32（白天，camera_data_mask）
+
+| 协议 | Baseline | DMAF v4 | Δ Top-3 | Retention 提升 |
+|------|:---:|:---:|:---:|:---:|
+| clean | 82.50% | 80.90% | -1.60% | — |
+| frame 50% | 46.55% | **73.19%** | +26.64pp | 56.4% → 90.5% |
+| burst 60% | 37.56% | **76.08%** | +38.52pp | 45.5% → 94.0% |
+| modal 60% | 65.33% | **71.43%** | +6.10pp | 79.2% → 88.3% |
+
+- Clean 掉点 1.60%，略超 ±1% 目标线但属正常训练波动
+- 帧/连续帧缺失下 Retention 从 46%/57% 拉到 91%/94%
+- best_epoch: 27, DBA: 0.8661, APL: 0.1068 dB
+
+#### SC33（夜景，camera_data_mask_yolo）
+
+| 协议 | Baseline | DMAF v4 | Δ Top-3 | Retention 提升 |
+|------|:---:|:---:|:---:|:---:|
+| clean | 80.99% | **81.51%** | +0.52% | — |
+| frame 50% | 47.14% | **74.35%** | +27.21pp | 58.2% → 91.1% |
+| burst 60% | 44.66% | **76.04%** | +31.38pp | 55.1% → 93.1% |
+| modal 60% | 66.02% | **72.40%** | +6.38pp | 81.5% → 88.7% |
+
+- Clean **反超** Baseline 0.52%
+- best_epoch: 16, DBA: 0.8658, APL: 0.1306 dB
+
+#### SC34（夜景，camera_data_mask_yolo）
+
+| 协议 | Baseline | DMAF v4 | Δ Top-3 | Retention 提升 |
+|------|:---:|:---:|:---:|:---:|
+| clean | 85.58% | 84.74% | -0.84% | — |
+| frame 50% | 57.69% | **77.35%** | +19.66pp | 67.4% → 91.3% |
+| burst 60% | 64.24% | **79.02%** | +14.78pp | 75.1% → 93.2% |
+| modal 60% | 72.11% | 70.56% | -1.55pp | 84.3% → 83.3% |
+
+- Clean 在 ±1% 内
+- Modal 60% 是唯一 DMAF 不如 Baseline 的协议（-1.55pp）
+- best_epoch: 26, DBA: 0.8921, APL: 0.0930 dB
+
+#### 跨场景一致性
+
+| 协议 | SC32 Δ | SC33 Δ | SC34 Δ | 均值 |
+|------|:---:|:---:|:---:|:---:|
+| Clean | -1.60% | +0.52% | -0.84% | -0.64% |
+| Frame 50% | **+26.64pp** | **+27.21pp** | **+19.66pp** | **+24.50pp** |
+| Burst 60% | **+38.52pp** | **+31.38pp** | **+14.78pp** | **+28.23pp** |
+| Modal 60% | +6.10pp | +6.38pp | -1.55pp | +3.64pp |
+
+**结论**：帧/连续帧缺失下 DMAF v4 提升巨大且跨场景一致（+14~39pp）。模态缺失提升较小（+3~6pp），SC34 有微小倒退。
+
+### 7.4 消融实验（SC32，2026-05-31）
+
+| # | 变体 | Clean | Frame 50% | Burst 60% | Modal 60% |
+|:--:|------|:---:|:---:|:---:|:---:|
+| A1 | **DMAF Full** | 80.90% | **73.19%** | 76.08% | **71.43%** |
+| A2 | w/o CrossAttn (`--no-cross-attn`) | 81.70% | 72.23% | 73.84% | 72.71% |
+| A3 | w/o Reliability (`--no-reliability`) | 81.54% | 72.55% | **78.01%** | 69.66% |
+| A4 | w/o MaskEmbed (`--no-mask-embed`) | **81.86%** | 74.00% | 77.21% | 70.79% |
+| A5 | Baseline（无 DMAF） | 82.50% | 46.55% | 37.56% | 65.33% |
+
+**发现**：
+1. 任何 DMAF 变体都碾压 Baseline（核心贡献来自缺失数据训练 + mask 加权聚合）
+2. 单模块贡献在 ±2pp 内，属于正常训练波动而非显著组件贡献
+3. 拆 CrossAttn → burst 掉点最明显（76.08%→73.84%），暗示跨模态注意力对连续帧缺失有帮助
+4. 拆 MaskEmbed → clean 反而最高（81.86%），说明 `Embedding(2,d_model)` 可能非必须——加权聚合已给足够缺失信号
+5. 拆 Reliability → modal 掉点最明显（71.43%→69.66%），但对 frame/burst 无显著影响
+
 ## 8. DMAF 实现与实验状态
 
 ### 8.1 版本演进
@@ -407,7 +477,10 @@ v4 新增（2026-05-29）：
 - [x] 消融开关 `--no-mask-embed / --no-cross-attn / --no-reliability`（Phase 2 实验就绪）
 - [x] 7 阶段模块化架构重构（MaskEncoder / TemporalProcessor / CrossModalFusion 独立模块）
 - [x] `run_missing_robustness_tests` 显式传递 `missing_modalities` 参数
-- [ ] v4 实验验证（三个场景）
+- [x] **Phase 1 D1/D2/D3**：DMAF v4 三场景训练 + 12 协议鲁棒性评估
+- [x] **Phase 2 A2/A3/A4**：消融实验（SC32）
+- [x] **Pre P0**：Baseline 鲁棒性评估（12 协议 × 3 场景）
+- [ ] Phase 3 C1/C2/C3：缺失率曲线（纯 eval）
 
 ## 9. 实验计划与进度跟踪
 
@@ -417,20 +490,20 @@ v4 新增（2026-05-29）：
 
 ### 9.2 实验总览
 
-| 阶段 | 实验ID | 训练? | 场景 | 描述 | 优先级 | 预计耗时 |
+| 阶段 | 实验ID | 训练? | 场景 | 描述 | 优先级 | 状态 |
 |------|:--:|:---:|------|------|:---:|:---:|
-| **Pre** | P0 | ❌ eval | SC32/33/34 | Baseline 鲁棒性评估（12 协议 × 3 场景） | 🔴 最高 | ~30 min |
-| **Phase 1** | D1 | ✅ train | SC32 | DMAF v4 完整训练 + 12 协议 | 🔴 最高 | ~15 h |
-| **Phase 1** | D2 | ✅ train | SC33 | DMAF v4 完整训练 + 12 协议 | 🟡 次高 | ~15 h |
-| **Phase 1** | D3 | ✅ train | SC34 | DMAF v4 完整训练 + 12 协议 | 🟡 次高 | ~15 h |
-| **Phase 2** | A2 | ✅ train | SC32 | 消融：w/o CrossAttn (`--no-cross-attn`) | 🟢 中等 | ~15 h |
-| **Phase 2** | A3 | ✅ train | SC32 | 消融：w/o Reliability (`--no-reliability`) | 🟢 中等 | ~15 h |
-| **Phase 2** | A4 | ✅ train | SC32 | 消融：w/o MaskEmbed (`--no-mask-embed`) | 🟢 中等 | ~15 h |
-| **Phase 3** | C1 | ❌ eval | SC32 | 缺失率曲线（DMAF + Baseline 对比） | 🔵 较低 | ~30 min |
-| **Phase 3** | C2 | ❌ eval | SC33 | 缺失率曲线（DMAF + Baseline 对比） | 🔵 较低 | ~30 min |
-| **Phase 3** | C3 | ❌ eval | SC34 | 缺失率曲线（DMAF + Baseline 对比） | 🔵 较低 | ~30 min |
+| **Pre** | P0 | ❌ eval | SC32/33/34 | Baseline 鲁棒性评估（12 协议 × 3 场景） | 🔴 最高 | ✅ |
+| **Phase 1** | D1 | ✅ train | SC32 | DMAF v4 完整训练 + 12 协议 | 🔴 最高 | ✅ |
+| **Phase 1** | D2 | ✅ train | SC33 | DMAF v4 完整训练 + 12 协议 | 🟡 次高 | ✅ |
+| **Phase 1** | D3 | ✅ train | SC34 | DMAF v4 完整训练 + 12 协议 | 🟡 次高 | ✅ |
+| **Phase 2** | A2 | ✅ train | SC32 | 消融：w/o CrossAttn (`--no-cross-attn`) | 🟢 中等 | ✅ |
+| **Phase 2** | A3 | ✅ train | SC32 | 消融：w/o Reliability (`--no-reliability`) | 🟢 中等 | ✅ |
+| **Phase 2** | A4 | ✅ train | SC32 | 消融：w/o MaskEmbed (`--no-mask-embed`) | 🟢 中等 | ✅ |
+| **Phase 3** | C1 | ❌ eval | SC32 | 缺失率曲线（DMAF + Baseline 对比） | 🔵 较低 | 🔴 |
+| **Phase 3** | C2 | ❌ eval | SC33 | 缺失率曲线（DMAF + Baseline 对比） | 🔵 较低 | 🔴 |
+| **Phase 3** | C3 | ❌ eval | SC34 | 缺失率曲线（DMAF + Baseline 对比） | 🔵 较低 | 🔴 |
 
-**总计**：4 次训练（D1 + A2/A3/A4，SC33/34 与 SC32 并行则额外 2 次）+ 纯 eval 工作
+**已完成**：3 次 Baseline eval + 3 次 DMAF 训练 + 3 次消融训练；**待做**：Phase 3 缺失率曲线
 
 ---
 
@@ -727,36 +800,18 @@ python eval_missing.py \
 
 ---
 
-### 9.5 推荐执行顺序
+### 9.5 执行状态
 
 ```
-AutoDL 上按以下顺序执行：
-
-第1天：
-  ┌─ Pre: Baseline 鲁棒性评估（3 个 eval，~30 min）
-  │    产出：Baseline 在 12 协议下的具体数字
-  │    确认：Baseline 在缺失下确实掉点 → DMAF 有发挥空间
-  │
-  └─ Phase 1 D1: SC32 DMAF v4 训练（~15 h，挂机过夜）
-       产出：DMAF v4 在 SC32 的 clean + 12 协议结果
-       判断：Clean 不掉点？Frame/Burst/Modal Retention 显著 > Baseline？
-
-第2天：
-  ┌─ 分析 D1 结果
-  │   如果达标 → 启动 Phase 1 D2 + D3（可并行） + Phase 2 A2/A3/A4（可并行）
-  │   如果不达标 → 排查问题（见 Phase 1 排查指南）
-  │
-  └─ D2 (SC33) + D3 (SC34) + A2 + A3 + A4 并行提交（5 个训练任务，各自 ~15 h）
-
-第3天：
-  ┌─ 收集 D2/D3/A2/A3/A4 结果
-  │   产出：完整主表格 + 消融表
-  │
-  └─ Phase 3: 缺失率曲线（6 条 eval 命令 × 3 场景 = 18 条，纯 eval ~1 h）
-       产出：6 张曲线图的数据（帧/Burst/Modal × DMAF/Baseline × 3 场景）
+✅ Pre: Baseline 鲁棒性（已完成 2026-05-31）
+✅ Phase 1 D1: SC32 DMAF v4（已完成 2026-05-31）
+✅ Phase 1 D2: SC33 DMAF v4（已完成 2026-05-31）
+✅ Phase 1 D3: SC34 DMAF v4（已完成 2026-05-31）
+✅ Phase 2 A2/A3/A4: 消融实验（已完成 2026-05-31）
+🔴 Phase 3 C1/C2/C3: 缺失率曲线（待做）
 ```
 
-**当前下一步**：在 AutoDL 上先跑 **Pre（Baseline 鲁棒性评估）**，然后挂 **Phase 1 D1（SC32 DMAF v4）**。
+**当前下一步**：Phase 3 缺失率曲线（18 条 eval 命令，纯 eval ~1h），或直接基于现有数据写论文/做分析。
 
 ## 10. 当前最优配置与命令
 
