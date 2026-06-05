@@ -40,6 +40,7 @@ class TrainConfig:
     min_lr: float = 1e-6
     warmup_epochs: int = 0
     grad_clip_norm: float = 1.0
+    ema_decay: float = 0.0
     patience: int = 0
     early_stop_metric: str = "acc3"
     early_stop_mode: str = "max"
@@ -220,6 +221,43 @@ def build_scheduler(optimizer: torch.optim.Optimizer, config: TrainConfig):
     return SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[config.warmup_epochs])
 
 
+class ModelEMA:
+    def __init__(self, model: nn.Module, decay: float):
+        if not (0.0 < decay < 1.0):
+            raise ValueError("ema_decay must be in (0, 1)")
+        self.decay = float(decay)
+        self.shadow = {
+            key: value.detach().clone()
+            for key, value in model.state_dict().items()
+        }
+        self.backup = None
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        current_state = model.state_dict()
+        for key, value in current_state.items():
+            shadow_value = self.shadow[key]
+            if torch.is_floating_point(shadow_value):
+                shadow_value.mul_(self.decay).add_(value.detach(), alpha=1.0 - self.decay)
+            else:
+                shadow_value.copy_(value.detach())
+
+    def store(self, model: nn.Module) -> None:
+        self.backup = {
+            key: value.detach().clone()
+            for key, value in model.state_dict().items()
+        }
+
+    def copy_to(self, model: nn.Module) -> None:
+        model.load_state_dict(self.shadow, strict=True)
+
+    def restore(self, model: nn.Module) -> None:
+        if self.backup is None:
+            return
+        model.load_state_dict(self.backup, strict=True)
+        self.backup = None
+
+
 def is_better_metric(current: float, best: float | None, mode: str, min_delta: float) -> bool:
     if best is None:
         return True
@@ -269,6 +307,7 @@ def run_epoch(
     device: torch.device,
     amp_enabled: bool,
     grad_clip_norm: float,
+    ema: ModelEMA | None = None,
 ) -> Dict[str, float]:
     training = optimizer is not None
     model.train(training)
@@ -321,6 +360,8 @@ def run_epoch(
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                     optimizer.step()
+                if ema is not None:
+                    ema.update(model)
 
             loss_total += loss.item() * batch_size
             sample_total += batch_size
@@ -560,6 +601,7 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
     test_loader = build_dataloader(test_ds, train_config, shuffle=False)
 
     model = BeMambaModel(model_config).to(device)
+    ema = ModelEMA(model, train_config.ema_decay) if train_config.ema_decay > 0 else None
     criterion = build_criterion(train_config, alpha_weights)
     optimizer = build_optimizer(model, train_config)
     scheduler = build_scheduler(optimizer, train_config)
@@ -607,7 +649,11 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
             device=device,
             amp_enabled=(train_config.amp and device.type == "cuda"),
             grad_clip_norm=train_config.grad_clip_norm,
+            ema=ema,
         )
+        if ema is not None:
+            ema.store(model)
+            ema.copy_to(model)
         test_metrics = run_epoch(
             model=model,
             loader=test_loader,
@@ -618,6 +664,8 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
             amp_enabled=(train_config.amp and device.type == "cuda"),
             grad_clip_norm=train_config.grad_clip_norm,
         )
+        if ema is not None:
+            ema.restore(model)
         final_test_metrics = test_metrics
         monitored_value = test_metrics[train_config.early_stop_metric]
 
@@ -631,7 +679,12 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
             best_epoch = epoch
             best_test_metrics = dict(test_metrics)
             epochs_without_improvement = 0
+            if ema is not None:
+                ema.store(model)
+                ema.copy_to(model)
             torch.save(model.state_dict(), best_ckpt_path)
+            if ema is not None:
+                ema.restore(model)
         else:
             epochs_without_improvement += 1
 
@@ -780,6 +833,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-lr", type=float, default=1e-6)
     parser.add_argument("--warmup-epochs", type=int, default=0)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument("--ema-decay", type=float, default=0.0,
+                        help="Use exponential moving average weights for validation/checkpointing")
     parser.add_argument("--patience", type=int, default=0)
     parser.add_argument("--early-stop-metric", choices=["loss", "acc1", "acc2", "acc3", "dba", "apl"], default="acc3")
     parser.add_argument("--early-stop-mode", choices=["max", "min"], default="max")
@@ -853,6 +908,8 @@ def parse_args() -> argparse.Namespace:
 def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]:
     if args.dmaf_enabled and args.no_dmaf:
         raise ValueError("--dmaf-enabled and --no-dmaf cannot be used together")
+    if args.ema_decay != 0.0 and not (0.0 < args.ema_decay < 1.0):
+        raise ValueError("--ema-decay must be 0 or in (0, 1)")
 
     missing_aug_enabled = args.missing_enabled or args.missing_aug_enabled
     dmaf_enabled = (args.missing_enabled or args.dmaf_enabled) and (not args.no_dmaf)
@@ -897,6 +954,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         min_lr=args.min_lr,
         warmup_epochs=args.warmup_epochs,
         grad_clip_norm=args.grad_clip_norm,
+        ema_decay=args.ema_decay,
         patience=args.patience,
         early_stop_metric=args.early_stop_metric,
         early_stop_mode=args.early_stop_mode,
