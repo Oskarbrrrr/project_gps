@@ -39,6 +39,7 @@ class BeMambaConfig:
     spatial_mixer_layers: int = 0
     use_order_gate: bool = False
     use_attn_head: bool = False
+    use_branch_ensemble: bool = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -583,6 +584,86 @@ class AttentivePredictionHead(nn.Module):
         return self.net(features)
 
 
+class TokenClassifierHead(nn.Module):
+    """Compact classifier for one modality/token stream."""
+
+    def __init__(self, d_model: int, num_classes: int, dropout: float):
+        super().__init__()
+        self.pool_norm = nn.LayerNorm(d_model)
+        self.pool_score = nn.Linear(d_model, 1)
+        self.net = nn.Sequential(
+            nn.LayerNorm(d_model * 3),
+            nn.Linear(d_model * 3, d_model * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, num_classes),
+        )
+
+    def summarize(self, tokens: torch.Tensor) -> torch.Tensor:
+        weights = torch.softmax(self.pool_score(self.pool_norm(tokens)), dim=1)
+        attn_pool = (tokens * weights).sum(dim=1)
+        mean_pool = tokens.mean(dim=1)
+        max_pool = tokens.amax(dim=1)
+        return torch.cat([attn_pool, mean_pool, max_pool], dim=1)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        return self.net(self.summarize(tokens))
+
+
+class CleanBranchEnsembleHead(nn.Module):
+    """Blend fused logits with auxiliary modality logits for clean-data training."""
+
+    def __init__(self, d_model: int, num_classes: int, dropout: float):
+        super().__init__()
+        self.img_head = TokenClassifierHead(d_model, num_classes, dropout)
+        self.radar_head = TokenClassifierHead(d_model, num_classes, dropout)
+        self.lidar_head = TokenClassifierHead(d_model, num_classes, dropout)
+        self.gps_head = TokenClassifierHead(d_model, num_classes, dropout)
+        self.gate_norm = nn.LayerNorm(d_model * 5)
+        self.gate_hidden = nn.Sequential(
+            nn.Linear(d_model * 5, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.gate_out = nn.Linear(d_model, 5)
+        nn.init.zeros_(self.gate_out.weight)
+        with torch.no_grad():
+            self.gate_out.bias.copy_(torch.tensor([3.0, 0.0, 0.0, 0.0, -0.5]))
+
+    def forward(
+        self,
+        fused_logits: torch.Tensor,
+        fused_tokens: torch.Tensor,
+        img_tokens: torch.Tensor,
+        radar_tokens: torch.Tensor,
+        lidar_tokens: torch.Tensor,
+        gps_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        branch_logits = torch.stack(
+            [
+                fused_logits,
+                self.img_head(img_tokens),
+                self.radar_head(radar_tokens),
+                self.lidar_head(lidar_tokens),
+                self.gps_head(gps_tokens),
+            ],
+            dim=1,
+        )  # [B, 5, num_classes]
+        gate_context = torch.cat(
+            [
+                fused_tokens.mean(dim=1),
+                img_tokens.mean(dim=1),
+                radar_tokens.mean(dim=1),
+                lidar_tokens.mean(dim=1),
+                gps_tokens.mean(dim=1),
+            ],
+            dim=1,
+        )
+        gate_logits = self.gate_out(self.gate_hidden(self.gate_norm(gate_context)))
+        weights = torch.softmax(gate_logits, dim=1)
+        return (branch_logits * weights.unsqueeze(-1)).sum(dim=1)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Main Model
 # ═══════════════════════════════════════════════════════════════════════════
@@ -608,9 +689,10 @@ class BeMambaModel(nn.Module):
         cfg = self.config
         self.spatial_len = cfg.patch_grid * cfg.patch_grid
         self.missing_enabled = cfg.missing_enabled
-        if cfg.model_variant not in {"bemamba", "clean_plus"}:
+        if cfg.model_variant not in {"bemamba", "clean_plus", "clean_plus_v2"}:
             raise ValueError(f"Unsupported model_variant: {cfg.model_variant}")
         clean_plus = cfg.model_variant == "clean_plus"
+        clean_plus_v2 = cfg.model_variant == "clean_plus_v2"
         spatial_mixer_layers = cfg.spatial_mixer_layers
         if clean_plus and spatial_mixer_layers <= 0:
             spatial_mixer_layers = 1
@@ -624,6 +706,7 @@ class BeMambaModel(nn.Module):
         self.use_spatial_mixer = spatial_mixer_layers > 0
         self.use_order_gate = cfg.use_order_gate or clean_plus
         self.use_attn_head = cfg.use_attn_head or clean_plus
+        self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2
 
         # ── Phase 1: Spatial encoders ──
         self.img_backbone = ModalityBackbone("resnet34", 3, cfg.d_model, cfg.patch_grid, cfg.pretrained_backbones)
@@ -710,6 +793,11 @@ class BeMambaModel(nn.Module):
                 nn.Dropout(cfg.dropout),
                 nn.Linear(2048, cfg.num_classes),
             )
+        self.branch_ensemble_head = (
+            CleanBranchEnsembleHead(cfg.d_model, cfg.num_classes, cfg.dropout)
+            if self.use_branch_ensemble
+            else None
+        )
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -884,9 +972,17 @@ class BeMambaModel(nn.Module):
         # ═══════════════════════════════════════════════════════════
         # Phase 7: Classification head
         # ═══════════════════════════════════════════════════════════
-        if self.use_attn_head:
-            return self.head(fused)
-        return self.head(fused.reshape(B, -1))
+        fused_logits = self.head(fused) if self.use_attn_head else self.head(fused.reshape(B, -1))
+        if self.branch_ensemble_head is not None:
+            return self.branch_ensemble_head(
+                fused_logits,
+                fused,
+                img_tokens,
+                radar_tokens,
+                lidar_tokens,
+                gps_tokens,
+            )
+        return fused_logits
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -65,11 +65,12 @@ def parse_args():
     parser.add_argument("--temporal-order", default="reverse")
     parser.add_argument("--spatial-scan", default="row")
     parser.add_argument("--dropout", type=float, default=0.25)
-    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus"], default="bemamba")
+    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus", "clean_plus_v2"], default="bemamba")
     parser.add_argument("--clean-cross-attn", action="store_true")
     parser.add_argument("--spatial-mixer-layers", type=int, default=None)
     parser.add_argument("--order-gate", action="store_true")
     parser.add_argument("--attn-head", action="store_true")
+    parser.add_argument("--branch-ensemble", action="store_true")
     parser.add_argument("--device", default="cuda")
     return parser.parse_args()
 
@@ -78,6 +79,7 @@ def main():
     args = parse_args()
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     clean_plus = args.model_variant == "clean_plus"
+    clean_plus_v2 = args.model_variant == "clean_plus_v2"
     spatial_mixer_layers = args.spatial_mixer_layers
     if spatial_mixer_layers is None:
         spatial_mixer_layers = 1 if clean_plus else 0
@@ -86,6 +88,7 @@ def main():
     clean_cross_attn = args.clean_cross_attn or clean_plus
     use_order_gate = args.order_gate or clean_plus
     use_attn_head = args.attn_head or clean_plus
+    use_branch_ensemble = args.branch_ensemble or clean_plus_v2
 
     model_config = BeMambaConfig(
         d_model=args.d_model,
@@ -103,6 +106,7 @@ def main():
         spatial_mixer_layers=spatial_mixer_layers,
         use_order_gate=use_order_gate,
         use_attn_head=use_attn_head,
+        use_branch_ensemble=use_branch_ensemble,
     )
 
     train_config = TrainConfig(
@@ -129,6 +133,7 @@ def main():
         spatial_mixer_layers=spatial_mixer_layers,
         use_order_gate=use_order_gate,
         use_attn_head=use_attn_head,
+        use_branch_ensemble=use_branch_ensemble,
     )
 
     print(f"Loading checkpoint: {args.ckpt}")

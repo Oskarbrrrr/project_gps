@@ -75,6 +75,7 @@ class TrainConfig:
     spatial_mixer_layers: int = 0
     use_order_gate: bool = False
     use_attn_head: bool = False
+    use_branch_ensemble: bool = False
 
 
 class AlphaFocalLoss(nn.Module):
@@ -755,7 +756,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gps-hidden-dim", type=int, default=96)
     parser.add_argument("--no-pretrained-backbones", action="store_true")
     parser.add_argument("--freeze-image-stem", action="store_true")
-    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus"], default="bemamba",
+    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus", "clean_plus_v2"], default="bemamba",
                         help="Use the original BeMamba path or the enhanced clean-data variant")
     parser.add_argument("--clean-cross-attn", action="store_true",
                         help="Enable CrossModalFusion even when DMAF/missing masks are disabled")
@@ -765,6 +766,8 @@ def parse_args() -> argparse.Namespace:
                         help="Use sample-adaptive weights for the three modal ordering sequences")
     parser.add_argument("--attn-head", action="store_true",
                         help="Use attention/mean/max pooling features in the prediction head")
+    parser.add_argument("--branch-ensemble", action="store_true",
+                        help="Blend fused logits with auxiliary image/radar/lidar/GPS logits")
     parser.add_argument("--missing-enabled", action="store_true",
                         help="Legacy convenience flag: enable both missing augmentation and DMAF")
     parser.add_argument("--missing-aug-enabled", action="store_true",
@@ -798,6 +801,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
     missing_aug_enabled = args.missing_enabled or args.missing_aug_enabled
     dmaf_enabled = (args.missing_enabled or args.dmaf_enabled) and (not args.no_dmaf)
     clean_plus = args.model_variant == "clean_plus"
+    clean_plus_v2 = args.model_variant == "clean_plus_v2"
     spatial_mixer_layers = args.spatial_mixer_layers
     if spatial_mixer_layers is None:
         spatial_mixer_layers = 1 if clean_plus else 0
@@ -806,6 +810,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
     clean_cross_attn = args.clean_cross_attn or clean_plus
     use_order_gate = args.order_gate or clean_plus
     use_attn_head = args.attn_head or clean_plus
+    use_branch_ensemble = args.branch_ensemble or clean_plus_v2
 
     train_config = TrainConfig(
         data_root=args.data_root,
@@ -860,6 +865,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         spatial_mixer_layers=spatial_mixer_layers,
         use_order_gate=use_order_gate,
         use_attn_head=use_attn_head,
+        use_branch_ensemble=use_branch_ensemble,
     )
     model_config = BeMambaConfig(
         d_model=args.d_model,
@@ -884,6 +890,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         spatial_mixer_layers=spatial_mixer_layers,
         use_order_gate=use_order_gate,
         use_attn_head=use_attn_head,
+        use_branch_ensemble=use_branch_ensemble,
     )
     return train_config, model_config
 
