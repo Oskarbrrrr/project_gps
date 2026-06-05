@@ -76,6 +76,7 @@ class TrainConfig:
     use_order_gate: bool = False
     use_attn_head: bool = False
     use_branch_ensemble: bool = False
+    aux_loss_weight: float = 0.0
 
 
 class AlphaFocalLoss(nn.Module):
@@ -251,11 +252,24 @@ def run_epoch(
 
             with torch.set_grad_enabled(training):
                 with autocast(enabled=amp_enabled):
-                    outputs = model(imgs, radars, lidars, gps, img_mask, radar_mask, lidar_mask, gps_mask)
-                    if isinstance(criterion, PowerSoftCrossEntropyLoss):
-                        loss = criterion(outputs, targets, power_vec)
+                    model_outputs = model(imgs, radars, lidars, gps, img_mask, radar_mask, lidar_mask, gps_mask)
+                    aux_logits = None
+                    if isinstance(model_outputs, tuple):
+                        outputs, aux_logits = model_outputs
                     else:
-                        loss = criterion(outputs, targets)
+                        outputs = model_outputs
+                    loss = compute_loss(criterion, outputs, targets, power_vec)
+                    aux_weight = getattr(model.config, "aux_loss_weight", 0.0)
+                    if aux_logits is not None and aux_weight > 0:
+                        aux_loss = 0.0
+                        for branch_idx in range(aux_logits.size(1)):
+                            aux_loss = aux_loss + compute_loss(
+                                criterion,
+                                aux_logits[:, branch_idx, :],
+                                targets,
+                                power_vec,
+                            )
+                        loss = loss + aux_weight * aux_loss / aux_logits.size(1)
 
             if training:
                 assert optimizer is not None
@@ -314,6 +328,17 @@ def build_criterion(train_config: TrainConfig, alpha_weights: torch.Tensor | Non
     if train_config.loss_name == "ce":
         return nn.CrossEntropyLoss(label_smoothing=train_config.label_smoothing)
     raise ValueError(f"Unsupported loss: {train_config.loss_name}")
+
+
+def compute_loss(
+    criterion: nn.Module,
+    outputs: torch.Tensor,
+    targets: torch.Tensor,
+    power_vec: torch.Tensor,
+) -> torch.Tensor:
+    if isinstance(criterion, PowerSoftCrossEntropyLoss):
+        return criterion(outputs, targets, power_vec)
+    return criterion(outputs, targets)
 
 
 def run_missing_robustness_tests(
@@ -756,7 +781,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gps-hidden-dim", type=int, default=96)
     parser.add_argument("--no-pretrained-backbones", action="store_true")
     parser.add_argument("--freeze-image-stem", action="store_true")
-    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus", "clean_plus_v2"], default="bemamba",
+    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3"], default="bemamba",
                         help="Use the original BeMamba path or the enhanced clean-data variant")
     parser.add_argument("--clean-cross-attn", action="store_true",
                         help="Enable CrossModalFusion even when DMAF/missing masks are disabled")
@@ -768,6 +793,8 @@ def parse_args() -> argparse.Namespace:
                         help="Use attention/mean/max pooling features in the prediction head")
     parser.add_argument("--branch-ensemble", action="store_true",
                         help="Blend fused logits with auxiliary image/radar/lidar/GPS logits")
+    parser.add_argument("--aux-loss-weight", type=float, default=None,
+                        help="Auxiliary branch loss weight; clean_plus_v3 defaults to 0.25")
     parser.add_argument("--missing-enabled", action="store_true",
                         help="Legacy convenience flag: enable both missing augmentation and DMAF")
     parser.add_argument("--missing-aug-enabled", action="store_true",
@@ -802,6 +829,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
     dmaf_enabled = (args.missing_enabled or args.dmaf_enabled) and (not args.no_dmaf)
     clean_plus = args.model_variant == "clean_plus"
     clean_plus_v2 = args.model_variant == "clean_plus_v2"
+    clean_plus_v3 = args.model_variant == "clean_plus_v3"
     spatial_mixer_layers = args.spatial_mixer_layers
     if spatial_mixer_layers is None:
         spatial_mixer_layers = 1 if clean_plus else 0
@@ -810,7 +838,12 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
     clean_cross_attn = args.clean_cross_attn or clean_plus
     use_order_gate = args.order_gate or clean_plus
     use_attn_head = args.attn_head or clean_plus
-    use_branch_ensemble = args.branch_ensemble or clean_plus_v2
+    use_branch_ensemble = args.branch_ensemble or clean_plus_v2 or clean_plus_v3
+    aux_loss_weight = args.aux_loss_weight
+    if aux_loss_weight is None:
+        aux_loss_weight = 0.25 if clean_plus_v3 else 0.0
+    if aux_loss_weight < 0:
+        raise ValueError("--aux-loss-weight must be >= 0")
 
     train_config = TrainConfig(
         data_root=args.data_root,
@@ -866,6 +899,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         use_order_gate=use_order_gate,
         use_attn_head=use_attn_head,
         use_branch_ensemble=use_branch_ensemble,
+        aux_loss_weight=aux_loss_weight,
     )
     model_config = BeMambaConfig(
         d_model=args.d_model,
@@ -891,6 +925,8 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         use_order_gate=use_order_gate,
         use_attn_head=use_attn_head,
         use_branch_ensemble=use_branch_ensemble,
+        return_aux_logits=(aux_loss_weight > 0),
+        aux_loss_weight=aux_loss_weight,
     )
     return train_config, model_config
 

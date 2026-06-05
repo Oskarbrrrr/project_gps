@@ -40,6 +40,8 @@ class BeMambaConfig:
     use_order_gate: bool = False
     use_attn_head: bool = False
     use_branch_ensemble: bool = False
+    return_aux_logits: bool = False
+    aux_loss_weight: float = 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -638,6 +640,7 @@ class CleanBranchEnsembleHead(nn.Module):
         radar_tokens: torch.Tensor,
         lidar_tokens: torch.Tensor,
         gps_tokens: torch.Tensor,
+        return_aux: bool = False,
     ) -> torch.Tensor:
         branch_logits = torch.stack(
             [
@@ -661,7 +664,10 @@ class CleanBranchEnsembleHead(nn.Module):
         )
         gate_logits = self.gate_out(self.gate_hidden(self.gate_norm(gate_context)))
         weights = torch.softmax(gate_logits, dim=1)
-        return (branch_logits * weights.unsqueeze(-1)).sum(dim=1)
+        ensembled = (branch_logits * weights.unsqueeze(-1)).sum(dim=1)
+        if return_aux:
+            return ensembled, branch_logits
+        return ensembled
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -689,10 +695,11 @@ class BeMambaModel(nn.Module):
         cfg = self.config
         self.spatial_len = cfg.patch_grid * cfg.patch_grid
         self.missing_enabled = cfg.missing_enabled
-        if cfg.model_variant not in {"bemamba", "clean_plus", "clean_plus_v2"}:
+        if cfg.model_variant not in {"bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3"}:
             raise ValueError(f"Unsupported model_variant: {cfg.model_variant}")
         clean_plus = cfg.model_variant == "clean_plus"
         clean_plus_v2 = cfg.model_variant == "clean_plus_v2"
+        clean_plus_v3 = cfg.model_variant == "clean_plus_v3"
         spatial_mixer_layers = cfg.spatial_mixer_layers
         if clean_plus and spatial_mixer_layers <= 0:
             spatial_mixer_layers = 1
@@ -706,7 +713,8 @@ class BeMambaModel(nn.Module):
         self.use_spatial_mixer = spatial_mixer_layers > 0
         self.use_order_gate = cfg.use_order_gate or clean_plus
         self.use_attn_head = cfg.use_attn_head or clean_plus
-        self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2
+        self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2 or clean_plus_v3
+        self.return_aux_logits = cfg.return_aux_logits or clean_plus_v3
 
         # ── Phase 1: Spatial encoders ──
         self.img_backbone = ModalityBackbone("resnet34", 3, cfg.d_model, cfg.patch_grid, cfg.pretrained_backbones)
@@ -981,6 +989,7 @@ class BeMambaModel(nn.Module):
                 radar_tokens,
                 lidar_tokens,
                 gps_tokens,
+                return_aux=(self.return_aux_logits and self.training),
             )
         return fused_logits
 
