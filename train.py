@@ -33,6 +33,7 @@ class TrainConfig:
     batch_size: int = 16
     num_workers: int = 8
     lr: float = 1e-4
+    backbone_lr_scale: float = 1.0
     optimizer_name: str = "adamw"
     scheduler_name: str = "cosine"
     weight_decay: float = 0.0
@@ -166,6 +167,42 @@ def build_dataloader(dataset: MultimodalDataset, config: TrainConfig, shuffle: b
         persistent_workers=(config.persistent_workers and config.num_workers > 0),
         drop_last=False,
     )
+
+
+def build_optimizer(model: nn.Module, config: TrainConfig) -> torch.optim.Optimizer:
+    if config.backbone_lr_scale <= 0:
+        raise ValueError("backbone_lr_scale must be > 0")
+
+    if config.backbone_lr_scale == 1.0:
+        param_groups = model.parameters()
+    else:
+        backbone_params = []
+        other_params = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if name.startswith(("img_backbone.", "radar_backbone.", "lidar_backbone.")):
+                backbone_params.append(param)
+            else:
+                other_params.append(param)
+        param_groups = [
+            {"params": other_params, "lr": config.lr},
+            {"params": backbone_params, "lr": config.lr * config.backbone_lr_scale},
+        ]
+
+    if config.optimizer_name == "adam":
+        return torch.optim.Adam(
+            param_groups,
+            lr=config.lr,
+            weight_decay=config.weight_decay,
+        )
+    if config.optimizer_name == "adamw":
+        return torch.optim.AdamW(
+            param_groups,
+            lr=config.lr,
+            weight_decay=config.weight_decay,
+        )
+    raise ValueError(f"Unsupported optimizer: {config.optimizer_name}")
 
 
 def build_scheduler(optimizer: torch.optim.Optimizer, config: TrainConfig):
@@ -524,20 +561,7 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
 
     model = BeMambaModel(model_config).to(device)
     criterion = build_criterion(train_config, alpha_weights)
-    if train_config.optimizer_name == "adam":
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=train_config.lr,
-            weight_decay=train_config.weight_decay,
-        )
-    elif train_config.optimizer_name == "adamw":
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=train_config.lr,
-            weight_decay=train_config.weight_decay,
-        )
-    else:
-        raise ValueError(f"Unsupported optimizer: {train_config.optimizer_name}")
+    optimizer = build_optimizer(model, train_config)
     scheduler = build_scheduler(optimizer, train_config)
     scaler = GradScaler(enabled=(train_config.amp and device.type == "cuda"))
     save_config(run_dir, train_config, model_config)
@@ -748,6 +772,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--backbone-lr-scale", type=float, default=1.0,
+                        help="Scale the learning rate for img/radar/lidar ResNet backbones")
     parser.add_argument("--optimizer", choices=["adam", "adamw"], default="adamw")
     parser.add_argument("--scheduler", choices=["none", "cosine"], default="cosine")
     parser.add_argument("--weight-decay", type=float, default=0.0)
@@ -864,6 +890,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         lr=args.lr,
+        backbone_lr_scale=args.backbone_lr_scale,
         optimizer_name=args.optimizer,
         scheduler_name=args.scheduler,
         weight_decay=args.weight_decay,
