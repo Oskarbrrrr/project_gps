@@ -22,6 +22,7 @@ class BeMambaConfig:
     dropout: float = 0.2
     gps_hidden_dim: int = 96
     pretrained_backbones: bool = True
+    backbone_stage: int = 2
     temporal_layers: int = 1
     fusion_layers: int = 1
     freeze_image_stem: bool = False
@@ -118,18 +119,27 @@ class ModalityBackbone(nn.Module):
     Output: [B, d_model, patch_grid, patch_grid]
     """
 
-    def __init__(self, backbone_name: str, in_channels: int, d_model: int, patch_grid: int, pretrained: bool):
+    def __init__(
+        self,
+        backbone_name: str,
+        in_channels: int,
+        d_model: int,
+        patch_grid: int,
+        pretrained: bool,
+        backbone_stage: int = 2,
+    ):
         super().__init__()
+        if backbone_stage not in {2, 3, 4}:
+            raise ValueError(f"Unsupported backbone_stage: {backbone_stage}")
         if backbone_name == "resnet34":
             weights = models.ResNet34_Weights.IMAGENET1K_V1 if pretrained else None
             backbone = models.resnet34(weights=weights)
-            out_channels = 128
         elif backbone_name == "resnet18":
             weights = models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
             backbone = models.resnet18(weights=weights)
-            out_channels = 128
         else:
             raise ValueError(f"Unsupported backbone: {backbone_name}")
+        out_channels = {2: 128, 3: 256, 4: 512}[backbone_stage]
 
         if in_channels != 3:
             old_conv = backbone.conv1
@@ -149,14 +159,19 @@ class ModalityBackbone(nn.Module):
                     nn.init.kaiming_normal_(new_conv.weight, mode="fan_out", nonlinearity="relu")
             backbone.conv1 = new_conv
 
-        self.features = nn.Sequential(
+        feature_layers = [
             backbone.conv1,
             backbone.bn1,
             backbone.relu,
             backbone.maxpool,
             backbone.layer1,
             backbone.layer2,
-        )
+        ]
+        if backbone_stage >= 3:
+            feature_layers.append(backbone.layer3)
+        if backbone_stage >= 4:
+            feature_layers.append(backbone.layer4)
+        self.features = nn.Sequential(*feature_layers)
         self.pool = nn.AdaptiveAvgPool2d((patch_grid, patch_grid))
         self.project = nn.Identity() if out_channels == d_model else nn.Conv2d(out_channels, d_model, kernel_size=1, bias=False)
 
@@ -695,11 +710,12 @@ class BeMambaModel(nn.Module):
         cfg = self.config
         self.spatial_len = cfg.patch_grid * cfg.patch_grid
         self.missing_enabled = cfg.missing_enabled
-        if cfg.model_variant not in {"bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3"}:
+        if cfg.model_variant not in {"bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4"}:
             raise ValueError(f"Unsupported model_variant: {cfg.model_variant}")
         clean_plus = cfg.model_variant == "clean_plus"
         clean_plus_v2 = cfg.model_variant == "clean_plus_v2"
         clean_plus_v3 = cfg.model_variant == "clean_plus_v3"
+        clean_plus_v4 = cfg.model_variant == "clean_plus_v4"
         spatial_mixer_layers = cfg.spatial_mixer_layers
         if clean_plus and spatial_mixer_layers <= 0:
             spatial_mixer_layers = 1
@@ -713,13 +729,13 @@ class BeMambaModel(nn.Module):
         self.use_spatial_mixer = spatial_mixer_layers > 0
         self.use_order_gate = cfg.use_order_gate or clean_plus
         self.use_attn_head = cfg.use_attn_head or clean_plus
-        self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2 or clean_plus_v3
+        self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4
         self.return_aux_logits = cfg.return_aux_logits or clean_plus_v3
 
         # ── Phase 1: Spatial encoders ──
-        self.img_backbone = ModalityBackbone("resnet34", 3, cfg.d_model, cfg.patch_grid, cfg.pretrained_backbones)
-        self.radar_backbone = ModalityBackbone("resnet18", 2, cfg.d_model, cfg.patch_grid, cfg.pretrained_backbones)
-        self.lidar_backbone = ModalityBackbone("resnet18", 1, cfg.d_model, cfg.patch_grid, cfg.pretrained_backbones)
+        self.img_backbone = ModalityBackbone("resnet34", 3, cfg.d_model, cfg.patch_grid, cfg.pretrained_backbones, cfg.backbone_stage)
+        self.radar_backbone = ModalityBackbone("resnet18", 2, cfg.d_model, cfg.patch_grid, cfg.pretrained_backbones, cfg.backbone_stage)
+        self.lidar_backbone = ModalityBackbone("resnet18", 1, cfg.d_model, cfg.patch_grid, cfg.pretrained_backbones, cfg.backbone_stage)
         if cfg.freeze_image_stem:
             self.img_backbone.freeze_stem()
 

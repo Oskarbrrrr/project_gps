@@ -77,6 +77,7 @@ class TrainConfig:
     use_attn_head: bool = False
     use_branch_ensemble: bool = False
     aux_loss_weight: float = 0.0
+    backbone_stage: int = 2
 
 
 class AlphaFocalLoss(nn.Module):
@@ -781,8 +782,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gps-hidden-dim", type=int, default=96)
     parser.add_argument("--no-pretrained-backbones", action="store_true")
     parser.add_argument("--freeze-image-stem", action="store_true")
-    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3"], default="bemamba",
+    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4"], default="bemamba",
                         help="Use the original BeMamba path or the enhanced clean-data variant")
+    parser.add_argument("--backbone-stage", type=int, choices=[2, 3, 4], default=None,
+                        help="Last ResNet stage used by modality backbones; clean_plus_v4 defaults to 3")
     parser.add_argument("--clean-cross-attn", action="store_true",
                         help="Enable CrossModalFusion even when DMAF/missing masks are disabled")
     parser.add_argument("--spatial-mixer-layers", type=int, default=None,
@@ -830,6 +833,10 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
     clean_plus = args.model_variant == "clean_plus"
     clean_plus_v2 = args.model_variant == "clean_plus_v2"
     clean_plus_v3 = args.model_variant == "clean_plus_v3"
+    clean_plus_v4 = args.model_variant == "clean_plus_v4"
+    backbone_stage = args.backbone_stage
+    if backbone_stage is None:
+        backbone_stage = 3 if clean_plus_v4 else 2
     spatial_mixer_layers = args.spatial_mixer_layers
     if spatial_mixer_layers is None:
         spatial_mixer_layers = 1 if clean_plus else 0
@@ -838,7 +845,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
     clean_cross_attn = args.clean_cross_attn or clean_plus
     use_order_gate = args.order_gate or clean_plus
     use_attn_head = args.attn_head or clean_plus
-    use_branch_ensemble = args.branch_ensemble or clean_plus_v2 or clean_plus_v3
+    use_branch_ensemble = args.branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4
     aux_loss_weight = args.aux_loss_weight
     if aux_loss_weight is None:
         aux_loss_weight = 0.25 if clean_plus_v3 else 0.0
@@ -900,6 +907,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         use_attn_head=use_attn_head,
         use_branch_ensemble=use_branch_ensemble,
         aux_loss_weight=aux_loss_weight,
+        backbone_stage=backbone_stage,
     )
     model_config = BeMambaConfig(
         d_model=args.d_model,
@@ -913,6 +921,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         spatial_scan=args.spatial_scan,
         dropout=args.dropout,
         gps_hidden_dim=args.gps_hidden_dim,
+        backbone_stage=backbone_stage,
         pretrained_backbones=(not args.no_pretrained_backbones),
         freeze_image_stem=args.freeze_image_stem,
         missing_enabled=dmaf_enabled,
