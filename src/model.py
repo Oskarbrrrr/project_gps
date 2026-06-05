@@ -34,6 +34,11 @@ class BeMambaConfig:
     use_mask_embed: bool = True
     use_cross_attn: bool = True
     use_reliability: bool = True
+    model_variant: str = "bemamba"
+    clean_cross_attn: bool = False
+    spatial_mixer_layers: int = 0
+    use_order_gate: bool = False
+    use_attn_head: bool = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -474,6 +479,110 @@ class CrossModalFusion(nn.Module):
         return img_enh, radar_enh, lidar_enh
 
 
+class SpatialTokenMixerBlock(nn.Module):
+    """Lightweight self-attention over spatial tokens inside one modality."""
+
+    def __init__(self, d_model: int, nhead: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.norm_attn = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.dropout = nn.Dropout(dropout)
+        self.norm_ffn = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, d_model),
+        )
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        attn_in = self.norm_attn(tokens)
+        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+        tokens = tokens + self.dropout(attn_out)
+        tokens = tokens + self.dropout(self.ffn(self.norm_ffn(tokens)))
+        return tokens
+
+
+class SpatialTokenMixer(nn.Module):
+    """Stacked spatial token mixing used by the clean_plus variant."""
+
+    def __init__(self, d_model: int, num_layers: int, dropout: float = 0.1, nhead: int = 4):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [
+                SpatialTokenMixerBlock(d_model=d_model, nhead=nhead, dropout=dropout)
+                for _ in range(num_layers)
+            ]
+        )
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            tokens = layer(tokens)
+        return tokens
+
+
+class OrderFusionGate(nn.Module):
+    """Sample-adaptive fusion for the three BeMamba modal orderings."""
+
+    def __init__(self, d_model: int, dropout: float = 0.1):
+        super().__init__()
+        self.gate = nn.Sequential(
+            nn.LayerNorm(d_model * 2),
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 1),
+        )
+
+    def forward(self, encoded_stack: torch.Tensor) -> torch.Tensor:
+        summary = torch.cat(
+            [
+                encoded_stack.mean(dim=2),
+                encoded_stack.std(dim=2, unbiased=False),
+            ],
+            dim=-1,
+        )  # [B, 3, 2d]
+        weights = torch.softmax(self.gate(summary).squeeze(-1), dim=1)  # [B, 3]
+        fused = (encoded_stack * weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)
+        return fused * encoded_stack.size(1)
+
+
+class AttentivePredictionHead(nn.Module):
+    """Flattened-token head augmented with attention/mean/max pooling."""
+
+    def __init__(self, d_model: int, spatial_len: int, num_classes: int, dropout: float):
+        super().__init__()
+        self.pool_norm = nn.LayerNorm(d_model)
+        self.pool_score = nn.Linear(d_model, 1)
+        input_dim = d_model * spatial_len + d_model * 3
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, 2048),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(2048, 2048),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(2048, num_classes),
+        )
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        weights = torch.softmax(self.pool_score(self.pool_norm(tokens)), dim=1)
+        attn_pool = (tokens * weights).sum(dim=1)
+        mean_pool = tokens.mean(dim=1)
+        max_pool = tokens.amax(dim=1)
+        features = torch.cat(
+            [
+                tokens.reshape(tokens.size(0), -1),
+                attn_pool,
+                mean_pool,
+                max_pool,
+            ],
+            dim=1,
+        )
+        return self.net(features)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Main Model
 # ═══════════════════════════════════════════════════════════════════════════
@@ -499,11 +608,22 @@ class BeMambaModel(nn.Module):
         cfg = self.config
         self.spatial_len = cfg.patch_grid * cfg.patch_grid
         self.missing_enabled = cfg.missing_enabled
+        if cfg.model_variant not in {"bemamba", "clean_plus"}:
+            raise ValueError(f"Unsupported model_variant: {cfg.model_variant}")
+        clean_plus = cfg.model_variant == "clean_plus"
+        spatial_mixer_layers = cfg.spatial_mixer_layers
+        if clean_plus and spatial_mixer_layers <= 0:
+            spatial_mixer_layers = 1
+        if spatial_mixer_layers < 0:
+            raise ValueError("spatial_mixer_layers must be >= 0")
 
-        # Resolve ablation flags — all False when missing is disabled
+        # Resolve optional modules. Mask/reliability stay DMAF-only; clean_plus can use cross-attn.
         self.use_mask_embed = cfg.missing_enabled and cfg.use_mask_embed
-        self.use_cross_attn = cfg.missing_enabled and cfg.use_cross_attn
+        self.use_cross_attn = cfg.use_cross_attn and (cfg.missing_enabled or cfg.clean_cross_attn or clean_plus)
         self.use_reliability = cfg.missing_enabled and cfg.use_reliability
+        self.use_spatial_mixer = spatial_mixer_layers > 0
+        self.use_order_gate = cfg.use_order_gate or clean_plus
+        self.use_attn_head = cfg.use_attn_head or clean_plus
 
         # ── Phase 1: Spatial encoders ──
         self.img_backbone = ModalityBackbone("resnet34", 3, cfg.d_model, cfg.patch_grid, cfg.pretrained_backbones)
@@ -534,6 +654,14 @@ class BeMambaModel(nn.Module):
         self.img_temporal = TemporalProcessor(**temporal_kwargs)
         self.radar_temporal = TemporalProcessor(**temporal_kwargs)
         self.lidar_temporal = TemporalProcessor(**temporal_kwargs)
+        if self.use_spatial_mixer:
+            self.img_token_mixer = SpatialTokenMixer(cfg.d_model, spatial_mixer_layers, cfg.dropout)
+            self.radar_token_mixer = SpatialTokenMixer(cfg.d_model, spatial_mixer_layers, cfg.dropout)
+            self.lidar_token_mixer = SpatialTokenMixer(cfg.d_model, spatial_mixer_layers, cfg.dropout)
+        else:
+            self.img_token_mixer = nn.Identity()
+            self.radar_token_mixer = nn.Identity()
+            self.lidar_token_mixer = nn.Identity()
 
         # ── Phase 4: Reliability estimators ──
         self.img_reliability = ReliabilityEstimator(cfg.d_model, cfg.dropout)
@@ -566,18 +694,22 @@ class BeMambaModel(nn.Module):
                 for _ in range(cfg.fusion_layers)
             ]
         )
+        self.order_gate = OrderFusionGate(cfg.d_model, cfg.dropout) if self.use_order_gate else None
 
         # ── Phase 7: Classification head ──
         flattened_dim = cfg.d_model * self.spatial_len
-        self.head = nn.Sequential(
-            nn.Linear(flattened_dim, 2048),
-            nn.ReLU(),
-            nn.Dropout(cfg.dropout),
-            nn.Linear(2048, 2048),
-            nn.ReLU(),
-            nn.Dropout(cfg.dropout),
-            nn.Linear(2048, cfg.num_classes),
-        )
+        if self.use_attn_head:
+            self.head = AttentivePredictionHead(cfg.d_model, self.spatial_len, cfg.num_classes, cfg.dropout)
+        else:
+            self.head = nn.Sequential(
+                nn.Linear(flattened_dim, 2048),
+                nn.ReLU(),
+                nn.Dropout(cfg.dropout),
+                nn.Linear(2048, 2048),
+                nn.ReLU(),
+                nn.Dropout(cfg.dropout),
+                nn.Linear(2048, cfg.num_classes),
+            )
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -657,6 +789,8 @@ class BeMambaModel(nn.Module):
             seq = sequence.reshape(sequence.size(0), self.spatial_len, 5, self.config.d_model)
             encoded_sequences.append(seq.mean(dim=2))  # [B, N, d]
 
+        if self.order_gate is not None:
+            return self.order_gate(torch.stack(encoded_sequences, dim=1))
         return encoded_sequences[0] + encoded_sequences[1] + encoded_sequences[2]
 
     # ── Main forward ─────────────────────────────────────────────────
@@ -718,6 +852,9 @@ class BeMambaModel(nn.Module):
         img_tokens = self.img_temporal(img_spatial, mask=img_mask if self.missing_enabled else None)
         radar_tokens = self.radar_temporal(radar_spatial, mask=radar_mask if self.missing_enabled else None)
         lidar_tokens = self.lidar_temporal(lidar_spatial, mask=lidar_mask if self.missing_enabled else None)
+        img_tokens = self.img_token_mixer(img_tokens)
+        radar_tokens = self.radar_token_mixer(radar_tokens)
+        lidar_tokens = self.lidar_token_mixer(lidar_tokens)
         gps_tokens = gps_feat  # [B, 2, d] — no temporal processing for 2 GPS points
 
         # ═══════════════════════════════════════════════════════════
@@ -747,6 +884,8 @@ class BeMambaModel(nn.Module):
         # ═══════════════════════════════════════════════════════════
         # Phase 7: Classification head
         # ═══════════════════════════════════════════════════════════
+        if self.use_attn_head:
+            return self.head(fused)
         return self.head(fused.reshape(B, -1))
 
 
