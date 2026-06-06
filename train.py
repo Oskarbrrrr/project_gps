@@ -41,6 +41,7 @@ class TrainConfig:
     warmup_epochs: int = 0
     grad_clip_norm: float = 1.0
     ema_decay: float = 0.0
+    ema_start_epoch: int = 8
     patience: int = 0
     early_stop_metric: str = "acc3"
     early_stop_mode: str = "max"
@@ -601,7 +602,7 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
     test_loader = build_dataloader(test_ds, train_config, shuffle=False)
 
     model = BeMambaModel(model_config).to(device)
-    ema = ModelEMA(model, train_config.ema_decay) if train_config.ema_decay > 0 else None
+    ema = None
     criterion = build_criterion(train_config, alpha_weights)
     optimizer = build_optimizer(model, train_config)
     scheduler = build_scheduler(optimizer, train_config)
@@ -638,6 +639,8 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
     best_ckpt_path = os.path.join(checkpoints_dir, "best_model.pth")
 
     for epoch in range(1, train_config.epochs + 1):
+        if train_config.ema_decay > 0 and ema is None and epoch >= train_config.ema_start_epoch:
+            ema = ModelEMA(model, train_config.ema_decay)
         if train_config.missing_aug_enabled:
             train_ds.set_missing_epoch(epoch)
         train_metrics = run_epoch(
@@ -835,6 +838,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--ema-decay", type=float, default=0.0,
                         help="Use exponential moving average weights for validation/checkpointing")
+    parser.add_argument("--ema-start-epoch", type=int, default=8,
+                        help="Start EMA after this epoch; avoids averaging random early weights")
     parser.add_argument("--patience", type=int, default=0)
     parser.add_argument("--early-stop-metric", choices=["loss", "acc1", "acc2", "acc3", "dba", "apl"], default="acc3")
     parser.add_argument("--early-stop-mode", choices=["max", "min"], default="max")
@@ -910,6 +915,8 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         raise ValueError("--dmaf-enabled and --no-dmaf cannot be used together")
     if args.ema_decay != 0.0 and not (0.0 < args.ema_decay < 1.0):
         raise ValueError("--ema-decay must be 0 or in (0, 1)")
+    if args.ema_start_epoch < 1:
+        raise ValueError("--ema-start-epoch must be >= 1")
 
     missing_aug_enabled = args.missing_enabled or args.missing_aug_enabled
     dmaf_enabled = (args.missing_enabled or args.dmaf_enabled) and (not args.no_dmaf)
@@ -955,6 +962,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         warmup_epochs=args.warmup_epochs,
         grad_clip_norm=args.grad_clip_norm,
         ema_decay=args.ema_decay,
+        ema_start_epoch=args.ema_start_epoch,
         patience=args.patience,
         early_stop_metric=args.early_stop_metric,
         early_stop_mode=args.early_stop_mode,
