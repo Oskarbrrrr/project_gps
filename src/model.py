@@ -42,6 +42,7 @@ class BeMambaConfig:
     use_attn_head: bool = False
     use_branch_ensemble: bool = False
     use_beam_query_head: bool = False
+    use_multiscale_backbone: bool = False
     return_aux_logits: bool = False
     aux_loss_weight: float = 0.0
 
@@ -187,6 +188,75 @@ class ModalityBackbone(nn.Module):
         feat = self.pool(feat)
         feat = self.project(feat)
         return feat  # [B, d_model, patch_grid, patch_grid]
+
+
+class MultiScaleModalityBackbone(nn.Module):
+    """ResNet layer2+layer3 feature fusion for clean-data variants.
+
+    Layer2 keeps finer spatial cues, while layer3 contributes stronger semantic
+    context. Both are pooled to the same token grid before a 1x1 projection.
+    """
+
+    def __init__(
+        self,
+        backbone_name: str,
+        in_channels: int,
+        d_model: int,
+        patch_grid: int,
+        pretrained: bool,
+    ):
+        super().__init__()
+        if backbone_name == "resnet34":
+            weights = models.ResNet34_Weights.IMAGENET1K_V1 if pretrained else None
+            backbone = models.resnet34(weights=weights)
+        elif backbone_name == "resnet18":
+            weights = models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+            backbone = models.resnet18(weights=weights)
+        else:
+            raise ValueError(f"Unsupported backbone: {backbone_name}")
+
+        if in_channels != 3:
+            old_conv = backbone.conv1
+            new_conv = nn.Conv2d(
+                in_channels,
+                old_conv.out_channels,
+                kernel_size=old_conv.kernel_size,
+                stride=old_conv.stride,
+                padding=old_conv.padding,
+                bias=False,
+            )
+            with torch.no_grad():
+                if pretrained:
+                    mean_weight = old_conv.weight.mean(dim=1, keepdim=True)
+                    new_conv.weight.copy_(mean_weight.repeat(1, in_channels, 1, 1))
+                else:
+                    nn.init.kaiming_normal_(new_conv.weight, mode="fan_out", nonlinearity="relu")
+            backbone.conv1 = new_conv
+
+        self.stem = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu, backbone.maxpool)
+        self.layer1 = backbone.layer1
+        self.layer2 = backbone.layer2
+        self.layer3 = backbone.layer3
+        self.pool = nn.AdaptiveAvgPool2d((patch_grid, patch_grid))
+        self.project = nn.Sequential(
+            nn.Conv2d(128 + 256, d_model, kernel_size=1, bias=False),
+            nn.BatchNorm2d(d_model),
+            nn.SiLU(),
+        )
+
+    def freeze_stem(self) -> None:
+        for module in (self.stem[0], self.stem[1]):
+            for parameter in module.parameters():
+                parameter.requires_grad = False
+        self.stem[1].eval()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        stem = self.stem(x)
+        layer1 = self.layer1(stem)
+        layer2 = self.layer2(layer1)
+        layer3 = self.layer3(layer2)
+        feat = torch.cat([self.pool(layer2), self.pool(layer3)], dim=1)
+        return self.project(feat)
 
 
 class GPSProjection(nn.Module):
@@ -750,13 +820,14 @@ class BeMambaModel(nn.Module):
         cfg = self.config
         self.spatial_len = cfg.patch_grid * cfg.patch_grid
         self.missing_enabled = cfg.missing_enabled
-        if cfg.model_variant not in {"bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5"}:
+        if cfg.model_variant not in {"bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6"}:
             raise ValueError(f"Unsupported model_variant: {cfg.model_variant}")
         clean_plus = cfg.model_variant == "clean_plus"
         clean_plus_v2 = cfg.model_variant == "clean_plus_v2"
         clean_plus_v3 = cfg.model_variant == "clean_plus_v3"
         clean_plus_v4 = cfg.model_variant == "clean_plus_v4"
         clean_plus_v5 = cfg.model_variant == "clean_plus_v5"
+        clean_plus_v6 = cfg.model_variant == "clean_plus_v6"
         spatial_mixer_layers = cfg.spatial_mixer_layers
         if clean_plus and spatial_mixer_layers <= 0:
             spatial_mixer_layers = 1
@@ -770,14 +841,21 @@ class BeMambaModel(nn.Module):
         self.use_spatial_mixer = spatial_mixer_layers > 0
         self.use_order_gate = cfg.use_order_gate or clean_plus
         self.use_attn_head = cfg.use_attn_head or clean_plus
-        self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5
-        self.use_beam_query_head = cfg.use_beam_query_head or clean_plus_v5
+        self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6
+        self.use_beam_query_head = cfg.use_beam_query_head or clean_plus_v5 or clean_plus_v6
+        self.use_multiscale_backbone = cfg.use_multiscale_backbone or clean_plus_v6
         self.return_aux_logits = cfg.return_aux_logits or clean_plus_v3
 
         # ── Phase 1: Spatial encoders ──
-        self.img_backbone = ModalityBackbone("resnet34", 3, cfg.d_model, cfg.patch_grid, cfg.pretrained_backbones, cfg.backbone_stage)
-        self.radar_backbone = ModalityBackbone("resnet18", 2, cfg.d_model, cfg.patch_grid, cfg.pretrained_backbones, cfg.backbone_stage)
-        self.lidar_backbone = ModalityBackbone("resnet18", 1, cfg.d_model, cfg.patch_grid, cfg.pretrained_backbones, cfg.backbone_stage)
+        backbone_cls = MultiScaleModalityBackbone if self.use_multiscale_backbone else ModalityBackbone
+        if self.use_multiscale_backbone:
+            self.img_backbone = backbone_cls("resnet34", 3, cfg.d_model, cfg.patch_grid, cfg.pretrained_backbones)
+            self.radar_backbone = backbone_cls("resnet18", 2, cfg.d_model, cfg.patch_grid, cfg.pretrained_backbones)
+            self.lidar_backbone = backbone_cls("resnet18", 1, cfg.d_model, cfg.patch_grid, cfg.pretrained_backbones)
+        else:
+            self.img_backbone = backbone_cls("resnet34", 3, cfg.d_model, cfg.patch_grid, cfg.pretrained_backbones, cfg.backbone_stage)
+            self.radar_backbone = backbone_cls("resnet18", 2, cfg.d_model, cfg.patch_grid, cfg.pretrained_backbones, cfg.backbone_stage)
+            self.lidar_backbone = backbone_cls("resnet18", 1, cfg.d_model, cfg.patch_grid, cfg.pretrained_backbones, cfg.backbone_stage)
         if cfg.freeze_image_stem:
             self.img_backbone.freeze_stem()
 
@@ -873,7 +951,10 @@ class BeMambaModel(nn.Module):
     def train(self, mode: bool = True):
         super().train(mode)
         if self.config.freeze_image_stem:
-            self.img_backbone.features[1].eval()
+            if hasattr(self.img_backbone, "features"):
+                self.img_backbone.features[1].eval()
+            elif hasattr(self.img_backbone, "stem"):
+                self.img_backbone.stem[1].eval()
         return self
 
     # ── Helper: apply 2D backbone to 5-frame sequence ────────────────
