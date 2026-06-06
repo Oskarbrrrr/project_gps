@@ -44,6 +44,7 @@ class BeMambaConfig:
     use_beam_query_head: bool = False
     use_multiscale_backbone: bool = False
     use_ordinal_head: bool = False
+    use_temporal_attn_pool: bool = False
     return_aux_logits: bool = False
     aux_loss_weight: float = 0.0
 
@@ -349,6 +350,7 @@ class TemporalProcessor(nn.Module):
         temporal_layers: int,
         temporal_order: str,
         spatial_scan: str,
+        use_attn_pool: bool = False,
     ):
         super().__init__()
         if temporal_order not in {"forward", "reverse"}:
@@ -358,6 +360,7 @@ class TemporalProcessor(nn.Module):
 
         self.temporal_order = temporal_order
         self.spatial_scan = spatial_scan
+        self.use_attn_pool = use_attn_pool
 
         self.temporal_blocks = nn.ModuleList(
             [
@@ -376,6 +379,12 @@ class TemporalProcessor(nn.Module):
                 for _ in range(temporal_layers)
             ]
         )
+        if self.use_attn_pool:
+            self.pool_norm = nn.LayerNorm(d_model)
+            self.pool_score = nn.Linear(d_model, 1)
+        else:
+            self.pool_norm = None
+            self.pool_score = None
 
     def _flatten_spatial(self, x: torch.Tensor) -> torch.Tensor:
         """Flatten spatial dims according to scan mode."""
@@ -417,8 +426,17 @@ class TemporalProcessor(nn.Module):
         # Reshape back to per-frame: [B, seq_len, spatial_len, d_model]
         per_time = fused.reshape(B, seq_len, spatial_len, d_model)
 
-        # Mask-weighted aggregation
-        if mask is not None:
+        # Temporal aggregation
+        if self.use_attn_pool:
+            assert self.pool_norm is not None and self.pool_score is not None
+            pool_scores = self.pool_score(self.pool_norm(per_time)).squeeze(-1)  # [B, seq_len, spatial_len]
+            if mask is not None:
+                agg_mask = torch.flip(mask, dims=[1]) if self.temporal_order == "reverse" else mask
+                valid = agg_mask.unsqueeze(-1).bool()
+                pool_scores = pool_scores.masked_fill(~valid, -1e4)
+            pool_weights = torch.softmax(pool_scores, dim=1).unsqueeze(-1)
+            aggregated = (per_time * pool_weights).sum(dim=1) * seq_len
+        elif mask is not None:
             agg_mask = torch.flip(mask, dims=[1]) if self.temporal_order == "reverse" else mask
             weights = agg_mask.unsqueeze(-1).unsqueeze(-1)  # [B, seq_len, 1, 1]
             valid_count = weights.sum(dim=1).clamp(min=1)
@@ -858,7 +876,7 @@ class BeMambaModel(nn.Module):
         cfg = self.config
         self.spatial_len = cfg.patch_grid * cfg.patch_grid
         self.missing_enabled = cfg.missing_enabled
-        if cfg.model_variant not in {"bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7"}:
+        if cfg.model_variant not in {"bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7", "clean_plus_v8"}:
             raise ValueError(f"Unsupported model_variant: {cfg.model_variant}")
         clean_plus = cfg.model_variant == "clean_plus"
         clean_plus_v2 = cfg.model_variant == "clean_plus_v2"
@@ -867,6 +885,7 @@ class BeMambaModel(nn.Module):
         clean_plus_v5 = cfg.model_variant == "clean_plus_v5"
         clean_plus_v6 = cfg.model_variant == "clean_plus_v6"
         clean_plus_v7 = cfg.model_variant == "clean_plus_v7"
+        clean_plus_v8 = cfg.model_variant == "clean_plus_v8"
         spatial_mixer_layers = cfg.spatial_mixer_layers
         if clean_plus and spatial_mixer_layers <= 0:
             spatial_mixer_layers = 1
@@ -880,10 +899,11 @@ class BeMambaModel(nn.Module):
         self.use_spatial_mixer = spatial_mixer_layers > 0
         self.use_order_gate = cfg.use_order_gate or clean_plus
         self.use_attn_head = cfg.use_attn_head or clean_plus
-        self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7
-        self.use_beam_query_head = cfg.use_beam_query_head or clean_plus_v5 or clean_plus_v6 or clean_plus_v7
+        self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8
+        self.use_beam_query_head = cfg.use_beam_query_head or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8
         self.use_multiscale_backbone = cfg.use_multiscale_backbone or clean_plus_v6
         self.use_ordinal_head = cfg.use_ordinal_head or clean_plus_v7
+        self.use_temporal_attn_pool = cfg.use_temporal_attn_pool or clean_plus_v8
         self.return_aux_logits = cfg.return_aux_logits or clean_plus_v3
 
         # ── Phase 1: Spatial encoders ──
@@ -917,6 +937,7 @@ class BeMambaModel(nn.Module):
             temporal_layers=cfg.temporal_layers,
             temporal_order=cfg.temporal_order,
             spatial_scan=cfg.spatial_scan,
+            use_attn_pool=self.use_temporal_attn_pool,
         )
         self.img_temporal = TemporalProcessor(**temporal_kwargs)
         self.radar_temporal = TemporalProcessor(**temporal_kwargs)
