@@ -22,7 +22,7 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--device", default="cuda")
 
-    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4"], default="bemamba")
+    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5"], default="bemamba")
     parser.add_argument("--backbone-stage", type=int, choices=[2, 3, 4], default=None)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--d-state", type=int, default=16)
@@ -40,6 +40,8 @@ def parse_args():
     parser.add_argument("--order-gate", action="store_true")
     parser.add_argument("--attn-head", action="store_true")
     parser.add_argument("--branch-ensemble", action="store_true")
+    parser.add_argument("--method", choices=["logits", "prob", "rank_vote", "topk_vote"], default="logits")
+    parser.add_argument("--vote-topk", type=int, default=10)
     return parser.parse_args()
 
 
@@ -48,10 +50,11 @@ def build_model_config(args):
     clean_plus_v2 = args.model_variant == "clean_plus_v2"
     clean_plus_v3 = args.model_variant == "clean_plus_v3"
     clean_plus_v4 = args.model_variant == "clean_plus_v4"
+    clean_plus_v5 = args.model_variant == "clean_plus_v5"
 
     backbone_stage = args.backbone_stage
     if backbone_stage is None:
-        backbone_stage = 3 if clean_plus_v4 else 2
+        backbone_stage = 3 if (clean_plus_v4 or clean_plus_v5) else 2
 
     spatial_mixer_layers = args.spatial_mixer_layers
     if spatial_mixer_layers is None:
@@ -77,9 +80,35 @@ def build_model_config(args):
         spatial_mixer_layers=spatial_mixer_layers,
         use_order_gate=args.order_gate or clean_plus,
         use_attn_head=args.attn_head or clean_plus,
-        use_branch_ensemble=args.branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4,
+        use_branch_ensemble=args.branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5,
+        use_beam_query_head=clean_plus_v5,
         return_aux_logits=False,
     )
+
+
+def combine_ensemble_outputs(logits_list, method: str, vote_topk: int):
+    stacked = torch.stack(logits_list, dim=0)
+    if method == "logits":
+        return stacked.mean(dim=0)
+    if method == "prob":
+        return torch.softmax(stacked, dim=-1).mean(dim=0)
+
+    batch_size, num_classes = logits_list[0].shape
+    scores = logits_list[0].new_zeros(batch_size, num_classes)
+    if method == "rank_vote":
+        weights = torch.linspace(1.0, 0.0, steps=num_classes, device=scores.device)
+        for logits in logits_list:
+            order = logits.argsort(dim=1, descending=True)
+            scores.scatter_add_(1, order, weights.unsqueeze(0).expand(batch_size, -1))
+        return scores / len(logits_list)
+    if method == "topk_vote":
+        k = min(max(vote_topk, 1), num_classes)
+        weights = torch.linspace(1.0, 0.1, steps=k, device=scores.device)
+        for logits in logits_list:
+            indices = logits.topk(k, dim=1).indices
+            scores.scatter_add_(1, indices, weights.unsqueeze(0).expand(batch_size, -1))
+        return scores / len(logits_list)
+    raise ValueError(f"Unsupported ensemble method: {method}")
 
 
 def main():
@@ -134,11 +163,11 @@ def main():
     with torch.no_grad():
         for batch in loader:
             imgs, radars, lidars, gps, targets, power_vec, *_ = move_batch_to_device(batch, device)
-            logits_sum = None
+            logits_list = []
             for model in models:
                 logits = model(imgs, radars, lidars, gps)
-                logits_sum = logits if logits_sum is None else logits_sum + logits
-            outputs = logits_sum / len(models)
+                logits_list.append(logits)
+            outputs = combine_ensemble_outputs(logits_list, args.method, args.vote_topk)
             batch_size = targets.size(0)
             acc1, acc2, acc3 = calculate_topk_accuracy(outputs, targets, topk=(1, 2, 3))
             acc1_total += acc1 * batch_size
@@ -156,6 +185,7 @@ def main():
         "apl": apl_total / max(sample_total, 1),
     }
     print(f"Ensemble checkpoints: {len(models)}")
+    print(f"method: {args.method}")
     print(f"top1_acc: {metrics['acc1']:.2f}%")
     print(f"top2_acc: {metrics['acc2']:.2f}%")
     print(f"top3_acc: {metrics['acc3']:.2f}%")

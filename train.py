@@ -81,6 +81,9 @@ class TrainConfig:
     use_branch_ensemble: bool = False
     aux_loss_weight: float = 0.0
     backbone_stage: int = 2
+    rank_margin_weight: float = 0.0
+    rank_margin: float = 0.2
+    rank_topk: int = 3
 
 
 class AlphaFocalLoss(nn.Module):
@@ -309,6 +312,9 @@ def run_epoch(
     amp_enabled: bool,
     grad_clip_norm: float,
     ema: ModelEMA | None = None,
+    rank_margin_weight: float = 0.0,
+    rank_margin: float = 0.2,
+    rank_topk: int = 3,
 ) -> Dict[str, float]:
     training = optimizer is not None
     model.train(training)
@@ -337,6 +343,13 @@ def run_epoch(
                     else:
                         outputs = model_outputs
                     loss = compute_loss(criterion, outputs, targets, power_vec)
+                    if training and rank_margin_weight > 0:
+                        loss = loss + rank_margin_weight * topk_margin_loss(
+                            outputs,
+                            targets,
+                            topk=rank_topk,
+                            margin=rank_margin,
+                        )
                     aux_weight = getattr(model.config, "aux_loss_weight", 0.0)
                     if aux_logits is not None and aux_weight > 0:
                         aux_loss = 0.0
@@ -419,6 +432,21 @@ def compute_loss(
     if isinstance(criterion, PowerSoftCrossEntropyLoss):
         return criterion(outputs, targets, power_vec)
     return criterion(outputs, targets)
+
+
+def topk_margin_loss(
+    outputs: torch.Tensor,
+    targets: torch.Tensor,
+    topk: int = 3,
+    margin: float = 0.2,
+) -> torch.Tensor:
+    target_logits = outputs.gather(1, targets.unsqueeze(1))
+    negative_logits = outputs.masked_fill(
+        torch.zeros_like(outputs, dtype=torch.bool).scatter_(1, targets.unsqueeze(1), True),
+        float("-inf"),
+    )
+    kth_negative = negative_logits.topk(topk, dim=1).values[:, -1:].detach()
+    return nn.functional.relu(kth_negative + margin - target_logits).mean()
 
 
 def run_missing_robustness_tests(
@@ -653,6 +681,9 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
             amp_enabled=(train_config.amp and device.type == "cuda"),
             grad_clip_norm=train_config.grad_clip_norm,
             ema=ema,
+            rank_margin_weight=train_config.rank_margin_weight,
+            rank_margin=train_config.rank_margin,
+            rank_topk=train_config.rank_topk,
         )
         if ema is not None:
             ema.store(model)
@@ -868,7 +899,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gps-hidden-dim", type=int, default=96)
     parser.add_argument("--no-pretrained-backbones", action="store_true")
     parser.add_argument("--freeze-image-stem", action="store_true")
-    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4"], default="bemamba",
+    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5"], default="bemamba",
                         help="Use the original BeMamba path or the enhanced clean-data variant")
     parser.add_argument("--backbone-stage", type=int, choices=[2, 3, 4], default=None,
                         help="Last ResNet stage used by modality backbones; clean_plus_v4 defaults to 3")
@@ -884,6 +915,12 @@ def parse_args() -> argparse.Namespace:
                         help="Blend fused logits with auxiliary image/radar/lidar/GPS logits")
     parser.add_argument("--aux-loss-weight", type=float, default=None,
                         help="Auxiliary branch loss weight; clean_plus_v3 defaults to 0.25")
+    parser.add_argument("--rank-margin-weight", type=float, default=None,
+                        help="Top-k ranking margin loss weight; clean_plus_v5 defaults to 0.05")
+    parser.add_argument("--rank-margin", type=float, default=0.2,
+                        help="Margin used by the Top-k ranking loss")
+    parser.add_argument("--rank-topk", type=int, default=3,
+                        help="Top-k target for the ranking margin loss")
     parser.add_argument("--missing-enabled", action="store_true",
                         help="Legacy convenience flag: enable both missing augmentation and DMAF")
     parser.add_argument("--missing-aug-enabled", action="store_true",
@@ -924,9 +961,10 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
     clean_plus_v2 = args.model_variant == "clean_plus_v2"
     clean_plus_v3 = args.model_variant == "clean_plus_v3"
     clean_plus_v4 = args.model_variant == "clean_plus_v4"
+    clean_plus_v5 = args.model_variant == "clean_plus_v5"
     backbone_stage = args.backbone_stage
     if backbone_stage is None:
-        backbone_stage = 3 if clean_plus_v4 else 2
+        backbone_stage = 3 if (clean_plus_v4 or clean_plus_v5) else 2
     spatial_mixer_layers = args.spatial_mixer_layers
     if spatial_mixer_layers is None:
         spatial_mixer_layers = 1 if clean_plus else 0
@@ -935,12 +973,21 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
     clean_cross_attn = args.clean_cross_attn or clean_plus
     use_order_gate = args.order_gate or clean_plus
     use_attn_head = args.attn_head or clean_plus
-    use_branch_ensemble = args.branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4
+    use_branch_ensemble = args.branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5
     aux_loss_weight = args.aux_loss_weight
     if aux_loss_weight is None:
         aux_loss_weight = 0.25 if clean_plus_v3 else 0.0
     if aux_loss_weight < 0:
         raise ValueError("--aux-loss-weight must be >= 0")
+    rank_margin_weight = args.rank_margin_weight
+    if rank_margin_weight is None:
+        rank_margin_weight = 0.05 if clean_plus_v5 else 0.0
+    if rank_margin_weight < 0:
+        raise ValueError("--rank-margin-weight must be >= 0")
+    if args.rank_margin < 0:
+        raise ValueError("--rank-margin must be >= 0")
+    if args.rank_topk < 1:
+        raise ValueError("--rank-topk must be >= 1")
 
     train_config = TrainConfig(
         data_root=args.data_root,
@@ -1001,6 +1048,9 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         use_branch_ensemble=use_branch_ensemble,
         aux_loss_weight=aux_loss_weight,
         backbone_stage=backbone_stage,
+        rank_margin_weight=rank_margin_weight,
+        rank_margin=args.rank_margin,
+        rank_topk=args.rank_topk,
     )
     model_config = BeMambaConfig(
         d_model=args.d_model,
@@ -1027,6 +1077,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         use_order_gate=use_order_gate,
         use_attn_head=use_attn_head,
         use_branch_ensemble=use_branch_ensemble,
+        use_beam_query_head=clean_plus_v5,
         return_aux_logits=(aux_loss_weight > 0),
         aux_loss_weight=aux_loss_weight,
     )

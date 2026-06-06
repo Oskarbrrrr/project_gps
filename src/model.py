@@ -41,6 +41,7 @@ class BeMambaConfig:
     use_order_gate: bool = False
     use_attn_head: bool = False
     use_branch_ensemble: bool = False
+    use_beam_query_head: bool = False
     return_aux_logits: bool = False
     aux_loss_weight: float = 0.0
 
@@ -689,6 +690,45 @@ class CleanBranchEnsembleHead(nn.Module):
 # Main Model
 # ═══════════════════════════════════════════════════════════════════════════
 
+class BeamQueryRefinementHead(nn.Module):
+    """Class-query refinement for beam-specific evidence gathering."""
+
+    def __init__(self, d_model: int, num_classes: int, dropout: float, nhead: int = 4):
+        super().__init__()
+        self.beam_queries = nn.Parameter(torch.empty(num_classes, d_model))
+        nn.init.normal_(self.beam_queries, std=0.02)
+
+        self.query_norm = nn.LayerNorm(d_model)
+        self.token_norm = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.dropout = nn.Dropout(dropout)
+        self.ffn_norm = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, d_model),
+        )
+        self.score = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 1),
+        )
+        self.refine_scale = nn.Parameter(torch.tensor(0.25))
+
+    def forward(self, base_logits: torch.Tensor, fused_tokens: torch.Tensor) -> torch.Tensor:
+        batch_size = fused_tokens.size(0)
+        queries = self.query_norm(self.beam_queries).unsqueeze(0).expand(batch_size, -1, -1)
+        tokens = self.token_norm(fused_tokens)
+        attn_out, _ = self.attn(queries, tokens, tokens, need_weights=False)
+        queries = queries + self.dropout(attn_out)
+        queries = queries + self.dropout(self.ffn(self.ffn_norm(queries)))
+        refine_logits = self.score(queries).squeeze(-1)
+        return base_logits + self.refine_scale * refine_logits
+
+
 class BeMambaModel(nn.Module):
     """BeMamba with DMAF (Dynamic Mask Adaptive Fusion).
 
@@ -710,12 +750,13 @@ class BeMambaModel(nn.Module):
         cfg = self.config
         self.spatial_len = cfg.patch_grid * cfg.patch_grid
         self.missing_enabled = cfg.missing_enabled
-        if cfg.model_variant not in {"bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4"}:
+        if cfg.model_variant not in {"bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5"}:
             raise ValueError(f"Unsupported model_variant: {cfg.model_variant}")
         clean_plus = cfg.model_variant == "clean_plus"
         clean_plus_v2 = cfg.model_variant == "clean_plus_v2"
         clean_plus_v3 = cfg.model_variant == "clean_plus_v3"
         clean_plus_v4 = cfg.model_variant == "clean_plus_v4"
+        clean_plus_v5 = cfg.model_variant == "clean_plus_v5"
         spatial_mixer_layers = cfg.spatial_mixer_layers
         if clean_plus and spatial_mixer_layers <= 0:
             spatial_mixer_layers = 1
@@ -729,7 +770,8 @@ class BeMambaModel(nn.Module):
         self.use_spatial_mixer = spatial_mixer_layers > 0
         self.use_order_gate = cfg.use_order_gate or clean_plus
         self.use_attn_head = cfg.use_attn_head or clean_plus
-        self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4
+        self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5
+        self.use_beam_query_head = cfg.use_beam_query_head or clean_plus_v5
         self.return_aux_logits = cfg.return_aux_logits or clean_plus_v3
 
         # ── Phase 1: Spatial encoders ──
@@ -820,6 +862,11 @@ class BeMambaModel(nn.Module):
         self.branch_ensemble_head = (
             CleanBranchEnsembleHead(cfg.d_model, cfg.num_classes, cfg.dropout)
             if self.use_branch_ensemble
+            else None
+        )
+        self.beam_query_head = (
+            BeamQueryRefinementHead(cfg.d_model, cfg.num_classes, cfg.dropout)
+            if self.use_beam_query_head
             else None
         )
 
@@ -997,8 +1044,9 @@ class BeMambaModel(nn.Module):
         # Phase 7: Classification head
         # ═══════════════════════════════════════════════════════════
         fused_logits = self.head(fused) if self.use_attn_head else self.head(fused.reshape(B, -1))
+        logits = fused_logits
         if self.branch_ensemble_head is not None:
-            return self.branch_ensemble_head(
+            logits = self.branch_ensemble_head(
                 fused_logits,
                 fused,
                 img_tokens,
@@ -1007,7 +1055,14 @@ class BeMambaModel(nn.Module):
                 gps_tokens,
                 return_aux=(self.return_aux_logits and self.training),
             )
-        return fused_logits
+            if isinstance(logits, tuple):
+                main_logits, aux_logits = logits
+                if self.beam_query_head is not None:
+                    main_logits = self.beam_query_head(main_logits, fused)
+                return main_logits, aux_logits
+        if self.beam_query_head is not None:
+            logits = self.beam_query_head(logits, fused)
+        return logits
 
 
 # ═══════════════════════════════════════════════════════════════════════════
