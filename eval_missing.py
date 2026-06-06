@@ -65,7 +65,7 @@ def parse_args():
     parser.add_argument("--temporal-order", default="reverse")
     parser.add_argument("--spatial-scan", default="row")
     parser.add_argument("--dropout", type=float, default=0.25)
-    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6"], default="bemamba")
+    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7"], default="bemamba")
     parser.add_argument("--backbone-stage", type=int, choices=[2, 3, 4], default=None)
     parser.add_argument("--clean-cross-attn", action="store_true")
     parser.add_argument("--spatial-mixer-layers", type=int, default=None)
@@ -85,9 +85,10 @@ def main():
     clean_plus_v4 = args.model_variant == "clean_plus_v4"
     clean_plus_v5 = args.model_variant == "clean_plus_v5"
     clean_plus_v6 = args.model_variant == "clean_plus_v6"
+    clean_plus_v7 = args.model_variant == "clean_plus_v7"
     backbone_stage = args.backbone_stage
     if backbone_stage is None:
-        backbone_stage = 3 if (clean_plus_v4 or clean_plus_v5 or clean_plus_v6) else 2
+        backbone_stage = 3 if (clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7) else 2
     spatial_mixer_layers = args.spatial_mixer_layers
     if spatial_mixer_layers is None:
         spatial_mixer_layers = 1 if clean_plus else 0
@@ -96,7 +97,7 @@ def main():
     clean_cross_attn = args.clean_cross_attn or clean_plus
     use_order_gate = args.order_gate or clean_plus
     use_attn_head = args.attn_head or clean_plus
-    use_branch_ensemble = args.branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6
+    use_branch_ensemble = args.branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7
 
     model_config = BeMambaConfig(
         d_model=args.d_model,
@@ -116,8 +117,9 @@ def main():
         use_order_gate=use_order_gate,
         use_attn_head=use_attn_head,
         use_branch_ensemble=use_branch_ensemble,
-        use_beam_query_head=clean_plus_v5 or clean_plus_v6,
+        use_beam_query_head=clean_plus_v5 or clean_plus_v6 or clean_plus_v7,
         use_multiscale_backbone=clean_plus_v6,
+        use_ordinal_head=clean_plus_v7,
         return_aux_logits=False,
     )
 

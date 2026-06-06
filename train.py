@@ -899,7 +899,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gps-hidden-dim", type=int, default=96)
     parser.add_argument("--no-pretrained-backbones", action="store_true")
     parser.add_argument("--freeze-image-stem", action="store_true")
-    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6"], default="bemamba",
+    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7"], default="bemamba",
                         help="Use the original BeMamba path or the enhanced clean-data variant")
     parser.add_argument("--backbone-stage", type=int, choices=[2, 3, 4], default=None,
                         help="Last ResNet stage used by modality backbones; clean_plus_v4 defaults to 3")
@@ -916,7 +916,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--aux-loss-weight", type=float, default=None,
                         help="Auxiliary branch loss weight; clean_plus_v3 defaults to 0.25")
     parser.add_argument("--rank-margin-weight", type=float, default=None,
-                        help="Top-k ranking margin loss weight; clean_plus_v5/v6 defaults to 0.05")
+                        help="Top-k ranking margin loss weight; clean_plus_v5/v6/v7 defaults to 0.05")
     parser.add_argument("--rank-margin", type=float, default=0.2,
                         help="Margin used by the Top-k ranking loss")
     parser.add_argument("--rank-topk", type=int, default=3,
@@ -963,9 +963,10 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
     clean_plus_v4 = args.model_variant == "clean_plus_v4"
     clean_plus_v5 = args.model_variant == "clean_plus_v5"
     clean_plus_v6 = args.model_variant == "clean_plus_v6"
+    clean_plus_v7 = args.model_variant == "clean_plus_v7"
     backbone_stage = args.backbone_stage
     if backbone_stage is None:
-        backbone_stage = 3 if (clean_plus_v4 or clean_plus_v5 or clean_plus_v6) else 2
+        backbone_stage = 3 if (clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7) else 2
     spatial_mixer_layers = args.spatial_mixer_layers
     if spatial_mixer_layers is None:
         spatial_mixer_layers = 1 if clean_plus else 0
@@ -974,7 +975,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
     clean_cross_attn = args.clean_cross_attn or clean_plus
     use_order_gate = args.order_gate or clean_plus
     use_attn_head = args.attn_head or clean_plus
-    use_branch_ensemble = args.branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6
+    use_branch_ensemble = args.branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7
     aux_loss_weight = args.aux_loss_weight
     if aux_loss_weight is None:
         aux_loss_weight = 0.25 if clean_plus_v3 else 0.0
@@ -982,7 +983,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         raise ValueError("--aux-loss-weight must be >= 0")
     rank_margin_weight = args.rank_margin_weight
     if rank_margin_weight is None:
-        rank_margin_weight = 0.05 if (clean_plus_v5 or clean_plus_v6) else 0.0
+        rank_margin_weight = 0.05 if (clean_plus_v5 or clean_plus_v6 or clean_plus_v7) else 0.0
     if rank_margin_weight < 0:
         raise ValueError("--rank-margin-weight must be >= 0")
     if args.rank_margin < 0:
@@ -1078,8 +1079,9 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         use_order_gate=use_order_gate,
         use_attn_head=use_attn_head,
         use_branch_ensemble=use_branch_ensemble,
-        use_beam_query_head=clean_plus_v5 or clean_plus_v6,
+        use_beam_query_head=clean_plus_v5 or clean_plus_v6 or clean_plus_v7,
         use_multiscale_backbone=clean_plus_v6,
+        use_ordinal_head=clean_plus_v7,
         return_aux_logits=(aux_loss_weight > 0),
         aux_loss_weight=aux_loss_weight,
     )

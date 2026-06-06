@@ -43,6 +43,7 @@ class BeMambaConfig:
     use_branch_ensemble: bool = False
     use_beam_query_head: bool = False
     use_multiscale_backbone: bool = False
+    use_ordinal_head: bool = False
     return_aux_logits: bool = False
     aux_loss_weight: float = 0.0
 
@@ -799,6 +800,43 @@ class BeamQueryRefinementHead(nn.Module):
         return base_logits + self.refine_scale * refine_logits
 
 
+class BeamOrdinalPriorHead(nn.Module):
+    """Continuous beam-index prior added to classification logits."""
+
+    def __init__(self, d_model: int, num_classes: int, dropout: float):
+        super().__init__()
+        self.num_classes = num_classes
+        self.pool_norm = nn.LayerNorm(d_model)
+        self.pool_score = nn.Linear(d_model, 1)
+        self.regressor = nn.Sequential(
+            nn.LayerNorm(d_model * 3),
+            nn.Linear(d_model * 3, d_model * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, 2),
+        )
+        self.prior_scale = nn.Parameter(torch.tensor(0.15))
+        self.register_buffer(
+            "beam_positions",
+            torch.arange(num_classes, dtype=torch.float32).view(1, num_classes),
+            persistent=False,
+        )
+
+    def forward(self, logits: torch.Tensor, fused_tokens: torch.Tensor) -> torch.Tensor:
+        weights = torch.softmax(self.pool_score(self.pool_norm(fused_tokens)), dim=1)
+        attn_pool = (fused_tokens * weights).sum(dim=1)
+        mean_pool = fused_tokens.mean(dim=1)
+        max_pool = fused_tokens.amax(dim=1)
+        raw_center, raw_width = self.regressor(
+            torch.cat([attn_pool, mean_pool, max_pool], dim=1)
+        ).chunk(2, dim=1)
+        center = torch.sigmoid(raw_center) * (self.num_classes - 1)
+        width = nn.functional.softplus(raw_width) + 1.5
+        prior = -((self.beam_positions - center) ** 2) / (2.0 * width.square())
+        prior = prior - prior.mean(dim=1, keepdim=True)
+        return logits + self.prior_scale * prior
+
+
 class BeMambaModel(nn.Module):
     """BeMamba with DMAF (Dynamic Mask Adaptive Fusion).
 
@@ -820,7 +858,7 @@ class BeMambaModel(nn.Module):
         cfg = self.config
         self.spatial_len = cfg.patch_grid * cfg.patch_grid
         self.missing_enabled = cfg.missing_enabled
-        if cfg.model_variant not in {"bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6"}:
+        if cfg.model_variant not in {"bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7"}:
             raise ValueError(f"Unsupported model_variant: {cfg.model_variant}")
         clean_plus = cfg.model_variant == "clean_plus"
         clean_plus_v2 = cfg.model_variant == "clean_plus_v2"
@@ -828,6 +866,7 @@ class BeMambaModel(nn.Module):
         clean_plus_v4 = cfg.model_variant == "clean_plus_v4"
         clean_plus_v5 = cfg.model_variant == "clean_plus_v5"
         clean_plus_v6 = cfg.model_variant == "clean_plus_v6"
+        clean_plus_v7 = cfg.model_variant == "clean_plus_v7"
         spatial_mixer_layers = cfg.spatial_mixer_layers
         if clean_plus and spatial_mixer_layers <= 0:
             spatial_mixer_layers = 1
@@ -841,9 +880,10 @@ class BeMambaModel(nn.Module):
         self.use_spatial_mixer = spatial_mixer_layers > 0
         self.use_order_gate = cfg.use_order_gate or clean_plus
         self.use_attn_head = cfg.use_attn_head or clean_plus
-        self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6
-        self.use_beam_query_head = cfg.use_beam_query_head or clean_plus_v5 or clean_plus_v6
+        self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7
+        self.use_beam_query_head = cfg.use_beam_query_head or clean_plus_v5 or clean_plus_v6 or clean_plus_v7
         self.use_multiscale_backbone = cfg.use_multiscale_backbone or clean_plus_v6
+        self.use_ordinal_head = cfg.use_ordinal_head or clean_plus_v7
         self.return_aux_logits = cfg.return_aux_logits or clean_plus_v3
 
         # ── Phase 1: Spatial encoders ──
@@ -945,6 +985,11 @@ class BeMambaModel(nn.Module):
         self.beam_query_head = (
             BeamQueryRefinementHead(cfg.d_model, cfg.num_classes, cfg.dropout)
             if self.use_beam_query_head
+            else None
+        )
+        self.ordinal_head = (
+            BeamOrdinalPriorHead(cfg.d_model, cfg.num_classes, cfg.dropout)
+            if self.use_ordinal_head
             else None
         )
 
@@ -1140,9 +1185,13 @@ class BeMambaModel(nn.Module):
                 main_logits, aux_logits = logits
                 if self.beam_query_head is not None:
                     main_logits = self.beam_query_head(main_logits, fused)
+                if self.ordinal_head is not None:
+                    main_logits = self.ordinal_head(main_logits, fused)
                 return main_logits, aux_logits
         if self.beam_query_head is not None:
             logits = self.beam_query_head(logits, fused)
+        if self.ordinal_head is not None:
+            logits = self.ordinal_head(logits, fused)
         return logits
 
 
