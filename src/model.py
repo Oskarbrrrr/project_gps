@@ -3,6 +3,7 @@ from typing import Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from mamba_ssm import Mamba
 from torchvision import models
 
@@ -45,6 +46,7 @@ class BeMambaConfig:
     use_multiscale_backbone: bool = False
     use_ordinal_head: bool = False
     use_temporal_attn_pool: bool = False
+    use_beam_neighbor_head: bool = False
     return_aux_logits: bool = False
     aux_loss_weight: float = 0.0
 
@@ -855,6 +857,58 @@ class BeamOrdinalPriorHead(nn.Module):
         return logits + self.prior_scale * prior
 
 
+class BeamNeighborhoodRefinementHead(nn.Module):
+    """Local logit refinement over adjacent beam indices."""
+
+    def __init__(
+        self,
+        d_model: int,
+        num_classes: int,
+        dropout: float,
+        kernel_size: int = 5,
+    ):
+        super().__init__()
+        if kernel_size < 3 or kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be an odd integer >= 3")
+        self.num_classes = num_classes
+        self.kernel_size = kernel_size
+        self.radius = kernel_size // 2
+
+        self.pool_norm = nn.LayerNorm(d_model)
+        self.pool_score = nn.Linear(d_model, 1)
+        self.context_proj = nn.Sequential(
+            nn.LayerNorm(d_model * 3),
+            nn.Linear(d_model * 3, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.kernel_proj = nn.Linear(d_model, kernel_size)
+        self.gate = nn.Linear(d_model, 1)
+        self.logit_norm = nn.LayerNorm(num_classes)
+        self.refine_scale = nn.Parameter(torch.tensor(0.10))
+
+        nn.init.zeros_(self.kernel_proj.weight)
+        nn.init.zeros_(self.kernel_proj.bias)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, -1.5)
+
+    def forward(self, logits: torch.Tensor, fused_tokens: torch.Tensor) -> torch.Tensor:
+        weights = torch.softmax(self.pool_score(self.pool_norm(fused_tokens)), dim=1)
+        attn_pool = (fused_tokens * weights).sum(dim=1)
+        mean_pool = fused_tokens.mean(dim=1)
+        max_pool = fused_tokens.amax(dim=1)
+        context = self.context_proj(torch.cat([attn_pool, mean_pool, max_pool], dim=1))
+
+        kernel = torch.softmax(self.kernel_proj(context), dim=-1)
+        gate = torch.sigmoid(self.gate(context))
+
+        normalized_logits = self.logit_norm(logits).unsqueeze(1)
+        padded = F.pad(normalized_logits, (self.radius, self.radius), mode="replicate")
+        windows = padded.unfold(dimension=2, size=self.kernel_size, step=1)
+        local_logits = (windows * kernel.view(logits.size(0), 1, 1, -1)).sum(dim=-1).squeeze(1)
+        return logits + self.refine_scale * gate * local_logits
+
+
 class BeMambaModel(nn.Module):
     """BeMamba with DMAF (Dynamic Mask Adaptive Fusion).
 
@@ -876,7 +930,7 @@ class BeMambaModel(nn.Module):
         cfg = self.config
         self.spatial_len = cfg.patch_grid * cfg.patch_grid
         self.missing_enabled = cfg.missing_enabled
-        if cfg.model_variant not in {"bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7", "clean_plus_v8"}:
+        if cfg.model_variant not in {"bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7", "clean_plus_v8", "clean_plus_v9"}:
             raise ValueError(f"Unsupported model_variant: {cfg.model_variant}")
         clean_plus = cfg.model_variant == "clean_plus"
         clean_plus_v2 = cfg.model_variant == "clean_plus_v2"
@@ -886,6 +940,7 @@ class BeMambaModel(nn.Module):
         clean_plus_v6 = cfg.model_variant == "clean_plus_v6"
         clean_plus_v7 = cfg.model_variant == "clean_plus_v7"
         clean_plus_v8 = cfg.model_variant == "clean_plus_v8"
+        clean_plus_v9 = cfg.model_variant == "clean_plus_v9"
         spatial_mixer_layers = cfg.spatial_mixer_layers
         if clean_plus and spatial_mixer_layers <= 0:
             spatial_mixer_layers = 1
@@ -899,11 +954,12 @@ class BeMambaModel(nn.Module):
         self.use_spatial_mixer = spatial_mixer_layers > 0
         self.use_order_gate = cfg.use_order_gate or clean_plus
         self.use_attn_head = cfg.use_attn_head or clean_plus
-        self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8
-        self.use_beam_query_head = cfg.use_beam_query_head or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8
+        self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9
+        self.use_beam_query_head = cfg.use_beam_query_head or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9
         self.use_multiscale_backbone = cfg.use_multiscale_backbone or clean_plus_v6
         self.use_ordinal_head = cfg.use_ordinal_head or clean_plus_v7
         self.use_temporal_attn_pool = cfg.use_temporal_attn_pool or clean_plus_v8
+        self.use_beam_neighbor_head = cfg.use_beam_neighbor_head or clean_plus_v9
         self.return_aux_logits = cfg.return_aux_logits or clean_plus_v3
 
         # ── Phase 1: Spatial encoders ──
@@ -1011,6 +1067,11 @@ class BeMambaModel(nn.Module):
         self.ordinal_head = (
             BeamOrdinalPriorHead(cfg.d_model, cfg.num_classes, cfg.dropout)
             if self.use_ordinal_head
+            else None
+        )
+        self.beam_neighbor_head = (
+            BeamNeighborhoodRefinementHead(cfg.d_model, cfg.num_classes, cfg.dropout)
+            if self.use_beam_neighbor_head
             else None
         )
 
@@ -1208,11 +1269,15 @@ class BeMambaModel(nn.Module):
                     main_logits = self.beam_query_head(main_logits, fused)
                 if self.ordinal_head is not None:
                     main_logits = self.ordinal_head(main_logits, fused)
+                if self.beam_neighbor_head is not None:
+                    main_logits = self.beam_neighbor_head(main_logits, fused)
                 return main_logits, aux_logits
         if self.beam_query_head is not None:
             logits = self.beam_query_head(logits, fused)
         if self.ordinal_head is not None:
             logits = self.ordinal_head(logits, fused)
+        if self.beam_neighbor_head is not None:
+            logits = self.beam_neighbor_head(logits, fused)
         return logits
 
 
