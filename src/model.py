@@ -1014,7 +1014,7 @@ class BeMambaModel(nn.Module):
         cfg = self.config
         self.spatial_len = cfg.patch_grid * cfg.patch_grid
         self.missing_enabled = cfg.missing_enabled
-        if cfg.model_variant not in {"bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7", "clean_plus_v8", "clean_plus_v9", "clean_plus_v10"}:
+        if cfg.model_variant not in {"bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7", "clean_plus_v8", "clean_plus_v9", "clean_plus_v10", "clean_plus_v11"}:
             raise ValueError(f"Unsupported model_variant: {cfg.model_variant}")
         clean_plus = cfg.model_variant == "clean_plus"
         clean_plus_v2 = cfg.model_variant == "clean_plus_v2"
@@ -1026,6 +1026,7 @@ class BeMambaModel(nn.Module):
         clean_plus_v8 = cfg.model_variant == "clean_plus_v8"
         clean_plus_v9 = cfg.model_variant == "clean_plus_v9"
         clean_plus_v10 = cfg.model_variant == "clean_plus_v10"
+        clean_plus_v11 = cfg.model_variant == "clean_plus_v11"
         spatial_mixer_layers = cfg.spatial_mixer_layers
         if clean_plus and spatial_mixer_layers <= 0:
             spatial_mixer_layers = 1
@@ -1039,13 +1040,13 @@ class BeMambaModel(nn.Module):
         self.use_spatial_mixer = spatial_mixer_layers > 0
         self.use_order_gate = cfg.use_order_gate or clean_plus
         self.use_attn_head = cfg.use_attn_head or clean_plus
-        self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10
-        self.use_beam_query_head = cfg.use_beam_query_head or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10
+        self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11
+        self.use_beam_query_head = cfg.use_beam_query_head or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11
         self.use_multiscale_backbone = cfg.use_multiscale_backbone or clean_plus_v6
         self.use_ordinal_head = cfg.use_ordinal_head or clean_plus_v7
         self.use_temporal_attn_pool = cfg.use_temporal_attn_pool or clean_plus_v8
-        self.use_beam_neighbor_head = cfg.use_beam_neighbor_head or clean_plus_v9 or clean_plus_v10
-        self.use_candidate_reranker = cfg.use_candidate_reranker or clean_plus_v10
+        self.use_beam_neighbor_head = cfg.use_beam_neighbor_head or clean_plus_v9 or clean_plus_v10 or clean_plus_v11
+        self.use_candidate_reranker = cfg.use_candidate_reranker or clean_plus_v10 or clean_plus_v11
         self.return_aux_logits = cfg.return_aux_logits or clean_plus_v3
 
         # ── Phase 1: Spatial encoders ──
