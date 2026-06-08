@@ -64,6 +64,14 @@ _Avoid_: backbone scaling, seed sweep, multi-change experiment
 The first Loss-First Clean Probe: reuse the clean_plus_v10 structure and add the Hard Top-3 Candidate Margin as the new default Top-3-aligned training objective.
 _Avoid_: new backbone, new fusion module, candidate-width sweep
 
+**clean_plus_v12**:
+The bounded soft reranker Clean Backbone probe: reuse the clean_plus_v10 structure but constrain candidate rerank logit deltas with a tanh-bounded residual.
+_Avoid_: Hard Top-3 Candidate Margin, unbounded reranking, backbone scaling
+
+**Bounded Soft Candidate Reranking**:
+A candidate reranking strategy that keeps Top-7 reranking but limits each candidate logit correction to a small fixed range, reducing train-split ranking overfit.
+_Avoid_: hard margin, unconstrained logit rewriting, representation expansion
+
 **Clean Rerank Loss Pairing**:
 The clean_plus_v11 training setup that keeps candidate power-soft reranking for physical power-distribution consistency and adds Hard Top-3 Candidate Margin for direct Top-3 metric alignment.
 _Avoid_: replacing all losses, single-purpose CE, unweighted loss stacking

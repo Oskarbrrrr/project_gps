@@ -30,6 +30,7 @@ MODEL_VARIANTS = [
     "clean_plus_v9",
     "clean_plus_v10",
     "clean_plus_v11",
+    "clean_plus_v12",
 ]
 
 
@@ -67,6 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--order-gate", action="store_true")
     parser.add_argument("--attn-head", action="store_true")
     parser.add_argument("--branch-ensemble", action="store_true")
+    parser.add_argument("--candidate-rerank-delta-bound", type=float, default=0.20)
     parser.add_argument("--topk", type=int, default=7, help="Largest Top-K list to store/analyze")
     parser.add_argument("--dba-delta", type=float, default=5.0)
     return parser.parse_args()

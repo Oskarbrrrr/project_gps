@@ -48,7 +48,9 @@ class BeMambaConfig:
     use_temporal_attn_pool: bool = False
     use_beam_neighbor_head: bool = False
     use_candidate_reranker: bool = False
+    use_bounded_candidate_reranker: bool = False
     candidate_topk: int = 7
+    candidate_delta_bound: float = 0.20
     return_aux_logits: bool = False
     aux_loss_weight: float = 0.0
 
@@ -920,12 +922,18 @@ class CandidateRerankerHead(nn.Module):
         num_classes: int,
         dropout: float,
         topk: int = 7,
+        bounded_delta: bool = False,
+        delta_bound: float = 0.20,
     ):
         super().__init__()
         if topk < 3:
             raise ValueError("candidate topk must be >= 3")
+        if delta_bound <= 0:
+            raise ValueError("candidate delta bound must be > 0")
         self.num_classes = num_classes
         self.topk = min(topk, num_classes)
+        self.bounded_delta = bool(bounded_delta)
+        self.delta_bound = float(delta_bound)
 
         self.pool_norm = nn.LayerNorm(d_model)
         self.pool_score = nn.Linear(d_model, 1)
@@ -990,6 +998,8 @@ class CandidateRerankerHead(nn.Module):
         )
         rerank_delta = self.score(candidate_features).squeeze(-1)
         rerank_delta = rerank_delta - rerank_delta.mean(dim=1, keepdim=True)
+        if self.bounded_delta:
+            return logits.scatter_add(1, candidate_idx, self.delta_bound * torch.tanh(rerank_delta))
         return logits.scatter_add(1, candidate_idx, self.rerank_scale * rerank_delta)
 
 
@@ -1014,7 +1024,7 @@ class BeMambaModel(nn.Module):
         cfg = self.config
         self.spatial_len = cfg.patch_grid * cfg.patch_grid
         self.missing_enabled = cfg.missing_enabled
-        if cfg.model_variant not in {"bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7", "clean_plus_v8", "clean_plus_v9", "clean_plus_v10", "clean_plus_v11"}:
+        if cfg.model_variant not in {"bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7", "clean_plus_v8", "clean_plus_v9", "clean_plus_v10", "clean_plus_v11", "clean_plus_v12"}:
             raise ValueError(f"Unsupported model_variant: {cfg.model_variant}")
         clean_plus = cfg.model_variant == "clean_plus"
         clean_plus_v2 = cfg.model_variant == "clean_plus_v2"
@@ -1027,6 +1037,7 @@ class BeMambaModel(nn.Module):
         clean_plus_v9 = cfg.model_variant == "clean_plus_v9"
         clean_plus_v10 = cfg.model_variant == "clean_plus_v10"
         clean_plus_v11 = cfg.model_variant == "clean_plus_v11"
+        clean_plus_v12 = cfg.model_variant == "clean_plus_v12"
         spatial_mixer_layers = cfg.spatial_mixer_layers
         if clean_plus and spatial_mixer_layers <= 0:
             spatial_mixer_layers = 1
@@ -1040,13 +1051,14 @@ class BeMambaModel(nn.Module):
         self.use_spatial_mixer = spatial_mixer_layers > 0
         self.use_order_gate = cfg.use_order_gate or clean_plus
         self.use_attn_head = cfg.use_attn_head or clean_plus
-        self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11
-        self.use_beam_query_head = cfg.use_beam_query_head or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11
+        self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12
+        self.use_beam_query_head = cfg.use_beam_query_head or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12
         self.use_multiscale_backbone = cfg.use_multiscale_backbone or clean_plus_v6
         self.use_ordinal_head = cfg.use_ordinal_head or clean_plus_v7
         self.use_temporal_attn_pool = cfg.use_temporal_attn_pool or clean_plus_v8
-        self.use_beam_neighbor_head = cfg.use_beam_neighbor_head or clean_plus_v9 or clean_plus_v10 or clean_plus_v11
-        self.use_candidate_reranker = cfg.use_candidate_reranker or clean_plus_v10 or clean_plus_v11
+        self.use_beam_neighbor_head = cfg.use_beam_neighbor_head or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12
+        self.use_candidate_reranker = cfg.use_candidate_reranker or clean_plus_v10 or clean_plus_v11 or clean_plus_v12
+        self.use_bounded_candidate_reranker = cfg.use_bounded_candidate_reranker or clean_plus_v12
         self.return_aux_logits = cfg.return_aux_logits or clean_plus_v3
 
         # ── Phase 1: Spatial encoders ──
@@ -1167,6 +1179,8 @@ class BeMambaModel(nn.Module):
                 cfg.num_classes,
                 cfg.dropout,
                 topk=cfg.candidate_topk,
+                bounded_delta=self.use_bounded_candidate_reranker,
+                delta_bound=cfg.candidate_delta_bound,
             )
             if self.use_candidate_reranker
             else None
