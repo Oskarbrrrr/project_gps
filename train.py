@@ -27,6 +27,7 @@ class TrainConfig:
     output_root: str = "./outputs"
     merge_train_val: bool = True
     image_subdir: str = "camera_data"
+    image_aug: bool = False
     lidar_representation: str = "count"
     scenarios: Tuple[str, ...] = ("scenario32", "scenario33", "scenario34")
     epochs: int = 30
@@ -673,6 +674,7 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
         scenario_name=scenario_name,
         csv_path=train_csv_path,
         image_subdir=train_config.image_subdir,
+        image_aug=train_config.image_aug,
         lidar_representation=train_config.lidar_representation,
         missing_enabled=train_config.missing_aug_enabled,
         return_missing_masks=(train_config.missing_aug_enabled and train_config.dmaf_enabled),
@@ -931,6 +933,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", default="./outputs")
     parser.add_argument("--no-merge-trainval", action="store_true")
     parser.add_argument("--image-subdir", default="camera_data")
+    parser.add_argument("--image-aug", action="store_true",
+                        help="Use light train-only image augmentation for clean-data regularization")
     parser.add_argument("--lidar-representation", choices=["binary", "count"], default="count")
     parser.add_argument("--scenarios", nargs="+", default=["scenario32", "scenario33", "scenario34"])
     parser.add_argument("--epochs", type=int, default=30)
@@ -1109,6 +1113,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         output_root=args.output_root,
         merge_train_val=(not args.no_merge_trainval),
         image_subdir=args.image_subdir,
+        image_aug=args.image_aug,
         lidar_representation=args.lidar_representation,
         scenarios=tuple(args.scenarios),
         epochs=args.epochs,

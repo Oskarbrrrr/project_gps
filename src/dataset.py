@@ -48,10 +48,12 @@ class MultimodalDataset(Dataset):
         missing_modality_max=2,
         missing_modalities=None,
         missing_seed=42,
+        image_aug=False,
     ):
         self.data_dir = data_root
         self.mode = mode
         self.image_subdir = image_subdir
+        self.image_aug = bool(image_aug)
         self.gps_stats = gps_stats
         self.lidar_representation = lidar_representation
         self.lidar_grid_size = int(lidar_grid_size)
@@ -98,9 +100,29 @@ class MultimodalDataset(Dataset):
             csv_path = os.path.join(split_root, f"{scenario_name}_{mode}.csv")
         self.df = pd.read_csv(csv_path)
 
-        self.img_transform = transforms.Compose(
+        if self.mode == "train" and self.image_aug:
+            image_transforms = [
+                transforms.RandomResizedCrop(
+                    (256, 256),
+                    scale=(0.90, 1.00),
+                    ratio=(0.95, 1.05),
+                ),
+                transforms.ColorJitter(
+                    brightness=0.08,
+                    contrast=0.08,
+                    saturation=0.05,
+                    hue=0.01,
+                ),
+                transforms.RandomApply(
+                    [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.6))],
+                    p=0.10,
+                ),
+            ]
+        else:
+            image_transforms = [transforms.Resize((256, 256))]
+
+        image_transforms.extend(
             [
-                transforms.Resize((256, 256)),
                 transforms.ToTensor(),
                 transforms.Normalize(
                     mean=[0.485, 0.456, 0.406],
@@ -108,6 +130,7 @@ class MultimodalDataset(Dataset):
                 ),
             ]
         )
+        self.img_transform = transforms.Compose(image_transforms)
 
         self._init_gps_normalization()
 

@@ -80,6 +80,18 @@ _Avoid_: multi-scenario sweep, seed validation, simultaneous structure changes
 Top-3 Accuracy is the single primary metric for clean-data model-structure optimization and paper-facing comparison.
 _Avoid_: composite score, Top-1-first tuning, DBA-first tuning
 
+**SC32 Clean Overfitting**:
+The repeated SC32 clean-data pattern where train Top-3 continues rising after the best epoch while test Top-3 and test loss worsen, indicating capacity and regularization are now the main bottleneck.
+_Avoid_: undertraining, seed search, bigger backbone
+
+**SC32 Clean Two-Bottleneck Pattern**:
+The current SC32 clean-data state where the model often recovers the correct beam in a wider candidate set but fails to place it in Top-3, while stronger ranking supervision quickly overfits the train split.
+_Avoid_: single-cause diagnosis, seed search, backbone scaling
+
+**Train-Only Image Augmentation**:
+Light camera-image augmentation used only during clean-data training to reduce SC32 overfitting; test images keep the original deterministic resize and normalization pipeline.
+_Avoid_: Missing-Aug, test-time augmentation, sensor missing simulation
+
 **Seed Validation**:
 The stability check for a promising Clean Backbone candidate after it has already shown a meaningful Top-3 gain; it is not the primary path for discovering a large improvement.
 _Avoid_: breakthrough search, exhaustive seed sweep, paper method
