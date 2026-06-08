@@ -102,20 +102,12 @@ class MultimodalDataset(Dataset):
 
         if self.mode == "train" and self.image_aug:
             image_transforms = [
-                transforms.RandomResizedCrop(
-                    (256, 256),
-                    scale=(0.90, 1.00),
-                    ratio=(0.95, 1.05),
-                ),
+                transforms.Resize((256, 256)),
                 transforms.ColorJitter(
-                    brightness=0.08,
-                    contrast=0.08,
+                    brightness=0.06,
+                    contrast=0.06,
                     saturation=0.05,
                     hue=0.01,
-                ),
-                transforms.RandomApply(
-                    [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.6))],
-                    p=0.10,
                 ),
             ]
         else:

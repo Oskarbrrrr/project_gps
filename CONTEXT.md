@@ -89,8 +89,8 @@ The current SC32 clean-data state where the model often recovers the correct bea
 _Avoid_: single-cause diagnosis, seed search, backbone scaling
 
 **Train-Only Image Augmentation**:
-Light camera-image augmentation used only during clean-data training to reduce SC32 overfitting; test images keep the original deterministic resize and normalization pipeline.
-_Avoid_: Missing-Aug, test-time augmentation, sensor missing simulation
+Light camera-image augmentation used only during clean-data training to reduce SC32 overfitting; it is photometric-only and keeps deterministic resizing without random crop, blur, or geometry changes.
+_Avoid_: Missing-Aug, test-time augmentation, sensor missing simulation, random crop
 
 **Seed Validation**:
 The stability check for a promising Clean Backbone candidate after it has already shown a meaningful Top-3 gain; it is not the primary path for discovering a large improvement.
