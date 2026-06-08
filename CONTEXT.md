@@ -68,9 +68,21 @@ _Avoid_: new backbone, new fusion module, candidate-width sweep
 The bounded soft reranker Clean Backbone probe: reuse the clean_plus_v10 structure but constrain candidate rerank logit deltas with a tanh-bounded residual.
 _Avoid_: Hard Top-3 Candidate Margin, unbounded reranking, backbone scaling
 
+**clean_plus_v13**:
+The regularized candidate-ranking Clean Backbone probe: reuse the clean_plus_v10 candidate-reranking structure while reducing candidate beam-id memorization and anchoring ranking supervision to the measured power distribution.
+_Avoid_: bounded reranking, hard margin, bigger backbone
+
 **Bounded Soft Candidate Reranking**:
 A candidate reranking strategy that keeps Top-7 reranking but limits each candidate logit correction to a small fixed range, reducing train-split ranking overfit.
 _Avoid_: hard margin, unconstrained logit rewriting, representation expansion
+
+**Power-Anchored Candidate Supervision**:
+A Top-3-oriented clean training signal that uses the measured power distribution's strongest beams as a stable candidate set, so ranking supervision is not only defined by the model's current Top-K predictions.
+_Avoid_: hard target only, model-selected candidate loss, seed tuning
+
+**Regularized Candidate Reranking**:
+The clean candidate-reranking direction that keeps the Top-7 reranker but discourages it from relying too heavily on beam identity memorization during training.
+_Avoid_: capacity expansion, random seed search, full backbone replacement
 
 **Clean Rerank Loss Pairing**:
 The clean_plus_v11 training setup that keeps candidate power-soft reranking for physical power-distribution consistency and adds Hard Top-3 Candidate Margin for direct Top-3 metric alignment.
