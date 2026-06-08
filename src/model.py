@@ -47,6 +47,8 @@ class BeMambaConfig:
     use_ordinal_head: bool = False
     use_temporal_attn_pool: bool = False
     use_beam_neighbor_head: bool = False
+    use_candidate_reranker: bool = False
+    candidate_topk: int = 7
     return_aux_logits: bool = False
     aux_loss_weight: float = 0.0
 
@@ -909,6 +911,88 @@ class BeamNeighborhoodRefinementHead(nn.Module):
         return logits + self.refine_scale * gate * local_logits
 
 
+class CandidateRerankerHead(nn.Module):
+    """Rerank the current Top-K beam candidates with token context and beam position."""
+
+    def __init__(
+        self,
+        d_model: int,
+        num_classes: int,
+        dropout: float,
+        topk: int = 7,
+    ):
+        super().__init__()
+        if topk < 3:
+            raise ValueError("candidate topk must be >= 3")
+        self.num_classes = num_classes
+        self.topk = min(topk, num_classes)
+
+        self.pool_norm = nn.LayerNorm(d_model)
+        self.pool_score = nn.Linear(d_model, 1)
+        self.context_proj = nn.Sequential(
+            nn.LayerNorm(d_model * 3),
+            nn.Linear(d_model * 3, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.beam_embed = nn.Embedding(num_classes, d_model)
+        self.logit_norm = nn.LayerNorm(self.topk)
+        self.score = nn.Sequential(
+            nn.LayerNorm(d_model * 2 + 4),
+            nn.Linear(d_model * 2 + 4, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 1),
+        )
+        self.rerank_scale = nn.Parameter(torch.tensor(0.10))
+        self.register_buffer(
+            "beam_positions",
+            torch.linspace(-1.0, 1.0, steps=num_classes).view(1, num_classes),
+            persistent=False,
+        )
+
+        final_linear = self.score[-1]
+        nn.init.zeros_(final_linear.weight)
+        nn.init.zeros_(final_linear.bias)
+
+    def forward(self, logits: torch.Tensor, fused_tokens: torch.Tensor) -> torch.Tensor:
+        weights = torch.softmax(self.pool_score(self.pool_norm(fused_tokens)), dim=1)
+        attn_pool = (fused_tokens * weights).sum(dim=1)
+        mean_pool = fused_tokens.mean(dim=1)
+        max_pool = fused_tokens.amax(dim=1)
+        context = self.context_proj(torch.cat([attn_pool, mean_pool, max_pool], dim=1))
+
+        candidate_logits, candidate_idx = logits.topk(self.topk, dim=1)
+        normalized_candidate_logits = self.logit_norm(candidate_logits).unsqueeze(-1)
+        candidate_probs = torch.softmax(candidate_logits, dim=1).unsqueeze(-1)
+        rank_pos = torch.linspace(
+            0.0,
+            1.0,
+            steps=self.topk,
+            device=logits.device,
+            dtype=logits.dtype,
+        ).view(1, self.topk, 1).expand(logits.size(0), -1, -1)
+        beam_pos = self.beam_positions.to(dtype=logits.dtype).expand(logits.size(0), -1)
+        candidate_pos = beam_pos.gather(1, candidate_idx).unsqueeze(-1)
+        top1_pos = candidate_pos[:, :1, :]
+        rel_pos = candidate_pos - top1_pos
+
+        candidate_features = torch.cat(
+            [
+                self.beam_embed(candidate_idx),
+                context.unsqueeze(1).expand(-1, self.topk, -1),
+                normalized_candidate_logits,
+                candidate_probs,
+                rank_pos,
+                rel_pos,
+            ],
+            dim=-1,
+        )
+        rerank_delta = self.score(candidate_features).squeeze(-1)
+        rerank_delta = rerank_delta - rerank_delta.mean(dim=1, keepdim=True)
+        return logits.scatter_add(1, candidate_idx, self.rerank_scale * rerank_delta)
+
+
 class BeMambaModel(nn.Module):
     """BeMamba with DMAF (Dynamic Mask Adaptive Fusion).
 
@@ -930,7 +1014,7 @@ class BeMambaModel(nn.Module):
         cfg = self.config
         self.spatial_len = cfg.patch_grid * cfg.patch_grid
         self.missing_enabled = cfg.missing_enabled
-        if cfg.model_variant not in {"bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7", "clean_plus_v8", "clean_plus_v9"}:
+        if cfg.model_variant not in {"bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7", "clean_plus_v8", "clean_plus_v9", "clean_plus_v10"}:
             raise ValueError(f"Unsupported model_variant: {cfg.model_variant}")
         clean_plus = cfg.model_variant == "clean_plus"
         clean_plus_v2 = cfg.model_variant == "clean_plus_v2"
@@ -941,6 +1025,7 @@ class BeMambaModel(nn.Module):
         clean_plus_v7 = cfg.model_variant == "clean_plus_v7"
         clean_plus_v8 = cfg.model_variant == "clean_plus_v8"
         clean_plus_v9 = cfg.model_variant == "clean_plus_v9"
+        clean_plus_v10 = cfg.model_variant == "clean_plus_v10"
         spatial_mixer_layers = cfg.spatial_mixer_layers
         if clean_plus and spatial_mixer_layers <= 0:
             spatial_mixer_layers = 1
@@ -954,12 +1039,13 @@ class BeMambaModel(nn.Module):
         self.use_spatial_mixer = spatial_mixer_layers > 0
         self.use_order_gate = cfg.use_order_gate or clean_plus
         self.use_attn_head = cfg.use_attn_head or clean_plus
-        self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9
-        self.use_beam_query_head = cfg.use_beam_query_head or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9
+        self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10
+        self.use_beam_query_head = cfg.use_beam_query_head or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10
         self.use_multiscale_backbone = cfg.use_multiscale_backbone or clean_plus_v6
         self.use_ordinal_head = cfg.use_ordinal_head or clean_plus_v7
         self.use_temporal_attn_pool = cfg.use_temporal_attn_pool or clean_plus_v8
-        self.use_beam_neighbor_head = cfg.use_beam_neighbor_head or clean_plus_v9
+        self.use_beam_neighbor_head = cfg.use_beam_neighbor_head or clean_plus_v9 or clean_plus_v10
+        self.use_candidate_reranker = cfg.use_candidate_reranker or clean_plus_v10
         self.return_aux_logits = cfg.return_aux_logits or clean_plus_v3
 
         # ── Phase 1: Spatial encoders ──
@@ -1072,6 +1158,16 @@ class BeMambaModel(nn.Module):
         self.beam_neighbor_head = (
             BeamNeighborhoodRefinementHead(cfg.d_model, cfg.num_classes, cfg.dropout)
             if self.use_beam_neighbor_head
+            else None
+        )
+        self.candidate_reranker = (
+            CandidateRerankerHead(
+                cfg.d_model,
+                cfg.num_classes,
+                cfg.dropout,
+                topk=cfg.candidate_topk,
+            )
+            if self.use_candidate_reranker
             else None
         )
 
@@ -1271,6 +1367,8 @@ class BeMambaModel(nn.Module):
                     main_logits = self.ordinal_head(main_logits, fused)
                 if self.beam_neighbor_head is not None:
                     main_logits = self.beam_neighbor_head(main_logits, fused)
+                if self.candidate_reranker is not None:
+                    main_logits = self.candidate_reranker(main_logits, fused)
                 return main_logits, aux_logits
         if self.beam_query_head is not None:
             logits = self.beam_query_head(logits, fused)
@@ -1278,6 +1376,8 @@ class BeMambaModel(nn.Module):
             logits = self.ordinal_head(logits, fused)
         if self.beam_neighbor_head is not None:
             logits = self.beam_neighbor_head(logits, fused)
+        if self.candidate_reranker is not None:
+            logits = self.candidate_reranker(logits, fused)
         return logits
 
 

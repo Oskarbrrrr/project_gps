@@ -84,6 +84,9 @@ class TrainConfig:
     rank_margin_weight: float = 0.0
     rank_margin: float = 0.2
     rank_topk: int = 3
+    candidate_rerank_weight: float = 0.0
+    candidate_rerank_topk: int = 7
+    candidate_rerank_temperature: float = 0.15
 
 
 class AlphaFocalLoss(nn.Module):
@@ -315,6 +318,9 @@ def run_epoch(
     rank_margin_weight: float = 0.0,
     rank_margin: float = 0.2,
     rank_topk: int = 3,
+    candidate_rerank_weight: float = 0.0,
+    candidate_rerank_topk: int = 7,
+    candidate_rerank_temperature: float = 0.15,
 ) -> Dict[str, float]:
     training = optimizer is not None
     model.train(training)
@@ -349,6 +355,13 @@ def run_epoch(
                             targets,
                             topk=rank_topk,
                             margin=rank_margin,
+                        )
+                    if training and candidate_rerank_weight > 0:
+                        loss = loss + candidate_rerank_weight * candidate_power_rerank_loss(
+                            outputs,
+                            power_vec,
+                            topk=candidate_rerank_topk,
+                            temperature=candidate_rerank_temperature,
                         )
                     aux_weight = getattr(model.config, "aux_loss_weight", 0.0)
                     if aux_logits is not None and aux_weight > 0:
@@ -447,6 +460,28 @@ def topk_margin_loss(
     )
     kth_negative = negative_logits.topk(topk, dim=1).values[:, -1:].detach()
     return nn.functional.relu(kth_negative + margin - target_logits).mean()
+
+
+def candidate_power_rerank_loss(
+    outputs: torch.Tensor,
+    power_vec: torch.Tensor,
+    topk: int = 7,
+    temperature: float = 0.15,
+) -> torch.Tensor:
+    topk = min(max(int(topk), 1), outputs.size(1))
+    candidate_idx = outputs.detach().topk(topk, dim=1).indices
+    candidate_logits = outputs.gather(1, candidate_idx)
+
+    candidate_power = power_vec.to(outputs.device).gather(1, candidate_idx)
+    candidate_power = torch.nan_to_num(candidate_power, nan=0.0, posinf=0.0, neginf=0.0)
+    candidate_power = torch.clamp(candidate_power, min=0.0)
+    if torch.all(candidate_power <= 0):
+        return outputs.new_zeros(())
+
+    soft_logits = torch.log(candidate_power + 1e-8) / max(temperature, 1e-8)
+    soft_targets = torch.softmax(soft_logits, dim=1)
+    log_probs = nn.functional.log_softmax(candidate_logits, dim=1)
+    return -(soft_targets * log_probs).sum(dim=1).mean()
 
 
 def run_missing_robustness_tests(
@@ -684,6 +719,9 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
             rank_margin_weight=train_config.rank_margin_weight,
             rank_margin=train_config.rank_margin,
             rank_topk=train_config.rank_topk,
+            candidate_rerank_weight=train_config.candidate_rerank_weight,
+            candidate_rerank_topk=train_config.candidate_rerank_topk,
+            candidate_rerank_temperature=train_config.candidate_rerank_temperature,
         )
         if ema is not None:
             ema.store(model)
@@ -899,7 +937,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gps-hidden-dim", type=int, default=96)
     parser.add_argument("--no-pretrained-backbones", action="store_true")
     parser.add_argument("--freeze-image-stem", action="store_true")
-    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7", "clean_plus_v8", "clean_plus_v9"], default="bemamba",
+    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7", "clean_plus_v8", "clean_plus_v9", "clean_plus_v10"], default="bemamba",
                         help="Use the original BeMamba path or the enhanced clean-data variant")
     parser.add_argument("--backbone-stage", type=int, choices=[2, 3, 4], default=None,
                         help="Last ResNet stage used by modality backbones; clean_plus_v4 defaults to 3")
@@ -916,11 +954,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--aux-loss-weight", type=float, default=None,
                         help="Auxiliary branch loss weight; clean_plus_v3 defaults to 0.25")
     parser.add_argument("--rank-margin-weight", type=float, default=None,
-                        help="Top-k ranking margin loss weight; clean_plus_v5-v9 defaults to 0.05")
+                        help="Top-k ranking margin loss weight; clean_plus_v5-v10 defaults to 0.05")
     parser.add_argument("--rank-margin", type=float, default=0.2,
                         help="Margin used by the Top-k ranking loss")
     parser.add_argument("--rank-topk", type=int, default=3,
                         help="Top-k target for the ranking margin loss")
+    parser.add_argument("--candidate-rerank-weight", type=float, default=None,
+                        help="Power-soft loss weight over current Top-K candidates; clean_plus_v10 defaults to 0.05")
+    parser.add_argument("--candidate-rerank-topk", type=int, default=7,
+                        help="Number of candidates used by the v10 rerank head/loss")
+    parser.add_argument("--candidate-rerank-temperature", type=float, default=0.15,
+                        help="Temperature for power-soft candidate rerank targets")
     parser.add_argument("--missing-enabled", action="store_true",
                         help="Legacy convenience flag: enable both missing augmentation and DMAF")
     parser.add_argument("--missing-aug-enabled", action="store_true",
@@ -966,9 +1010,10 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
     clean_plus_v7 = args.model_variant == "clean_plus_v7"
     clean_plus_v8 = args.model_variant == "clean_plus_v8"
     clean_plus_v9 = args.model_variant == "clean_plus_v9"
+    clean_plus_v10 = args.model_variant == "clean_plus_v10"
     backbone_stage = args.backbone_stage
     if backbone_stage is None:
-        backbone_stage = 3 if (clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9) else 2
+        backbone_stage = 3 if (clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10) else 2
     spatial_mixer_layers = args.spatial_mixer_layers
     if spatial_mixer_layers is None:
         spatial_mixer_layers = 1 if clean_plus else 0
@@ -977,7 +1022,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
     clean_cross_attn = args.clean_cross_attn or clean_plus
     use_order_gate = args.order_gate or clean_plus
     use_attn_head = args.attn_head or clean_plus
-    use_branch_ensemble = args.branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9
+    use_branch_ensemble = args.branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10
     aux_loss_weight = args.aux_loss_weight
     if aux_loss_weight is None:
         aux_loss_weight = 0.25 if clean_plus_v3 else 0.0
@@ -985,13 +1030,22 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         raise ValueError("--aux-loss-weight must be >= 0")
     rank_margin_weight = args.rank_margin_weight
     if rank_margin_weight is None:
-        rank_margin_weight = 0.05 if (clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9) else 0.0
+        rank_margin_weight = 0.05 if (clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10) else 0.0
     if rank_margin_weight < 0:
         raise ValueError("--rank-margin-weight must be >= 0")
     if args.rank_margin < 0:
         raise ValueError("--rank-margin must be >= 0")
     if args.rank_topk < 1:
         raise ValueError("--rank-topk must be >= 1")
+    candidate_rerank_weight = args.candidate_rerank_weight
+    if candidate_rerank_weight is None:
+        candidate_rerank_weight = 0.05 if clean_plus_v10 else 0.0
+    if candidate_rerank_weight < 0:
+        raise ValueError("--candidate-rerank-weight must be >= 0")
+    if args.candidate_rerank_topk < 3:
+        raise ValueError("--candidate-rerank-topk must be >= 3")
+    if args.candidate_rerank_temperature <= 0:
+        raise ValueError("--candidate-rerank-temperature must be > 0")
 
     train_config = TrainConfig(
         data_root=args.data_root,
@@ -1055,6 +1109,9 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         rank_margin_weight=rank_margin_weight,
         rank_margin=args.rank_margin,
         rank_topk=args.rank_topk,
+        candidate_rerank_weight=candidate_rerank_weight,
+        candidate_rerank_topk=args.candidate_rerank_topk,
+        candidate_rerank_temperature=args.candidate_rerank_temperature,
     )
     model_config = BeMambaConfig(
         d_model=args.d_model,
@@ -1081,11 +1138,13 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         use_order_gate=use_order_gate,
         use_attn_head=use_attn_head,
         use_branch_ensemble=use_branch_ensemble,
-        use_beam_query_head=clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9,
+        use_beam_query_head=clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10,
         use_multiscale_backbone=clean_plus_v6,
         use_ordinal_head=clean_plus_v7,
         use_temporal_attn_pool=clean_plus_v8,
-        use_beam_neighbor_head=clean_plus_v9,
+        use_beam_neighbor_head=clean_plus_v9 or clean_plus_v10,
+        use_candidate_reranker=clean_plus_v10,
+        candidate_topk=args.candidate_rerank_topk,
         return_aux_logits=(aux_loss_weight > 0),
         aux_loss_weight=aux_loss_weight,
     )

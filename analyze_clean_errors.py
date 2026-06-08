@@ -28,6 +28,7 @@ MODEL_VARIANTS = [
     "clean_plus_v7",
     "clean_plus_v8",
     "clean_plus_v9",
+    "clean_plus_v10",
 ]
 
 
