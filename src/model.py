@@ -49,6 +49,8 @@ class BeMambaConfig:
     use_beam_neighbor_head: bool = False
     use_candidate_reranker: bool = False
     use_bounded_candidate_reranker: bool = False
+    use_modality_feature_dropout: bool = False
+    modality_feature_dropout: float = 0.0
     candidate_topk: int = 7
     candidate_delta_bound: float = 0.20
     candidate_embed_dropout: float = 0.0
@@ -1033,7 +1035,7 @@ class BeMambaModel(nn.Module):
         cfg = self.config
         self.spatial_len = cfg.patch_grid * cfg.patch_grid
         self.missing_enabled = cfg.missing_enabled
-        if cfg.model_variant not in {"bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7", "clean_plus_v8", "clean_plus_v9", "clean_plus_v10", "clean_plus_v11", "clean_plus_v12", "clean_plus_v13"}:
+        if cfg.model_variant not in {"bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7", "clean_plus_v8", "clean_plus_v9", "clean_plus_v10", "clean_plus_v11", "clean_plus_v12", "clean_plus_v13", "clean_plus_v14"}:
             raise ValueError(f"Unsupported model_variant: {cfg.model_variant}")
         clean_plus = cfg.model_variant == "clean_plus"
         clean_plus_v2 = cfg.model_variant == "clean_plus_v2"
@@ -1048,6 +1050,7 @@ class BeMambaModel(nn.Module):
         clean_plus_v11 = cfg.model_variant == "clean_plus_v11"
         clean_plus_v12 = cfg.model_variant == "clean_plus_v12"
         clean_plus_v13 = cfg.model_variant == "clean_plus_v13"
+        clean_plus_v14 = cfg.model_variant == "clean_plus_v14"
         spatial_mixer_layers = cfg.spatial_mixer_layers
         if clean_plus and spatial_mixer_layers <= 0:
             spatial_mixer_layers = 1
@@ -1061,14 +1064,18 @@ class BeMambaModel(nn.Module):
         self.use_spatial_mixer = spatial_mixer_layers > 0
         self.use_order_gate = cfg.use_order_gate or clean_plus
         self.use_attn_head = cfg.use_attn_head or clean_plus
-        self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13
-        self.use_beam_query_head = cfg.use_beam_query_head or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13
+        self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14
+        self.use_beam_query_head = cfg.use_beam_query_head or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14
         self.use_multiscale_backbone = cfg.use_multiscale_backbone or clean_plus_v6
         self.use_ordinal_head = cfg.use_ordinal_head or clean_plus_v7
         self.use_temporal_attn_pool = cfg.use_temporal_attn_pool or clean_plus_v8
-        self.use_beam_neighbor_head = cfg.use_beam_neighbor_head or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13
-        self.use_candidate_reranker = cfg.use_candidate_reranker or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13
+        self.use_beam_neighbor_head = cfg.use_beam_neighbor_head or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14
+        self.use_candidate_reranker = cfg.use_candidate_reranker or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14
         self.use_bounded_candidate_reranker = cfg.use_bounded_candidate_reranker or clean_plus_v12
+        self.use_modality_feature_dropout = cfg.use_modality_feature_dropout or clean_plus_v14
+        self.modality_feature_dropout = float(cfg.modality_feature_dropout)
+        if self.modality_feature_dropout < 0 or self.modality_feature_dropout >= 1:
+            raise ValueError("modality_feature_dropout must be in [0, 1)")
         self.return_aux_logits = cfg.return_aux_logits or clean_plus_v3
 
         # ── Phase 1: Spatial encoders ──
@@ -1282,6 +1289,41 @@ class BeMambaModel(nn.Module):
             return self.order_gate(torch.stack(encoded_sequences, dim=1))
         return encoded_sequences[0] + encoded_sequences[1] + encoded_sequences[2]
 
+    def _apply_modality_feature_dropout(
+        self,
+        image_tokens: torch.Tensor,
+        radar_tokens: torch.Tensor,
+        lidar_tokens: torch.Tensor,
+        gps_tokens: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Training-only modality-stream dropout for clean-plus regularization."""
+        p = self.modality_feature_dropout
+        if (not self.training) or (not self.use_modality_feature_dropout) or p <= 0:
+            return image_tokens, radar_tokens, lidar_tokens, gps_tokens
+
+        batch_size = image_tokens.size(0)
+        keep = image_tokens.new_empty(batch_size, 4).bernoulli_(1.0 - p)
+
+        # Avoid the degenerate case where a sample loses every modality stream.
+        empty_rows = keep.sum(dim=1) == 0
+        if torch.any(empty_rows):
+            keep[empty_rows] = 0.0
+            row_idx = empty_rows.nonzero(as_tuple=True)[0]
+            restore_idx = torch.randint(
+                0,
+                4,
+                (int(empty_rows.sum().item()),),
+                device=keep.device,
+            )
+            keep[row_idx, restore_idx] = 1.0
+
+        keep = keep / (1.0 - p)
+        image_tokens = image_tokens * keep[:, 0].view(batch_size, 1, 1)
+        radar_tokens = radar_tokens * keep[:, 1].view(batch_size, 1, 1)
+        lidar_tokens = lidar_tokens * keep[:, 2].view(batch_size, 1, 1)
+        gps_tokens = gps_tokens * keep[:, 3].view(batch_size, 1, 1)
+        return image_tokens, radar_tokens, lidar_tokens, gps_tokens
+
     # ── Main forward ─────────────────────────────────────────────────
 
     def forward(
@@ -1369,6 +1411,13 @@ class BeMambaModel(nn.Module):
         # ═══════════════════════════════════════════════════════════
         # Phase 6: Build sequences + MBMamba fusion
         # ═══════════════════════════════════════════════════════════
+        img_tokens, radar_tokens, lidar_tokens, gps_tokens = self._apply_modality_feature_dropout(
+            img_tokens,
+            radar_tokens,
+            lidar_tokens,
+            gps_tokens,
+        )
+
         sequences = self._build_modal_sequences(img_tokens, lidar_tokens, radar_tokens, gps_tokens)
         fused = self._modal_fusion(sequences)  # [B, N, d]
 

@@ -92,6 +92,14 @@ _Avoid_: Hard Top-3 Candidate Margin, unbounded reranking, backbone scaling
 The regularized candidate-ranking Clean Backbone probe: reuse the clean_plus_v10 candidate-reranking structure while reducing candidate beam-id memorization and anchoring ranking supervision to the measured power distribution.
 _Avoid_: bounded reranking, hard margin, bigger backbone
 
+**clean_plus_v14**:
+The fusion-regularized Clean Backbone probe that keeps the clean_plus_v10 candidate-reranking structure and targets SC32 Clean Overfitting through Modality Feature Dropout.
+_Avoid_: two-stage reranker, missing-aware robustness, image augmentation
+
+**Modality Feature Dropout**:
+A Clean Backbone regularization concept that suppresses whole latent modality streams during clean-data training to reduce modality-specific overfitting while preserving complete-input evaluation.
+_Avoid_: Missing-Aug, DMAF mask, sensor dropout, test-time missing input
+
 **Bounded Soft Candidate Reranking**:
 A candidate reranking strategy that keeps Top-7 reranking but limits each candidate logit correction to a small fixed range, reducing train-split ranking overfit.
 _Avoid_: hard margin, unconstrained logit rewriting, representation expansion

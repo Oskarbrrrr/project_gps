@@ -93,6 +93,7 @@ class TrainConfig:
     power_anchor_weight: float = 0.0
     power_anchor_topk: int = 7
     power_anchor_temperature: float = 0.15
+    modality_feature_dropout: float = 0.0
     top3_candidate_margin_weight: float = 0.0
     top3_candidate_margin: float = 0.15
     top3_candidate_topk: int = 7
@@ -1031,7 +1032,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gps-hidden-dim", type=int, default=96)
     parser.add_argument("--no-pretrained-backbones", action="store_true")
     parser.add_argument("--freeze-image-stem", action="store_true")
-    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7", "clean_plus_v8", "clean_plus_v9", "clean_plus_v10", "clean_plus_v11", "clean_plus_v12", "clean_plus_v13"], default="bemamba",
+    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7", "clean_plus_v8", "clean_plus_v9", "clean_plus_v10", "clean_plus_v11", "clean_plus_v12", "clean_plus_v13", "clean_plus_v14"], default="bemamba",
                         help="Use the original BeMamba path or the enhanced clean-data variant")
     parser.add_argument("--backbone-stage", type=int, choices=[2, 3, 4], default=None,
                         help="Last ResNet stage used by modality backbones; clean_plus_v4 defaults to 3")
@@ -1069,6 +1070,8 @@ def parse_args() -> argparse.Namespace:
                         help="Power Top-K anchor set size for power-anchored candidate supervision")
     parser.add_argument("--power-anchor-temperature", type=float, default=0.15,
                         help="Temperature for power-anchored candidate soft targets")
+    parser.add_argument("--modality-feature-dropout", type=float, default=None,
+                        help="Training-only dropout on modality token streams; clean_plus_v14 defaults to 0.10")
     parser.add_argument("--top3-candidate-margin-weight", type=float, default=None,
                         help="Hard Top-3 candidate margin loss weight; clean_plus_v11 defaults to 0.03")
     parser.add_argument("--top3-candidate-margin", type=float, default=0.15,
@@ -1124,9 +1127,10 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
     clean_plus_v11 = args.model_variant == "clean_plus_v11"
     clean_plus_v12 = args.model_variant == "clean_plus_v12"
     clean_plus_v13 = args.model_variant == "clean_plus_v13"
+    clean_plus_v14 = args.model_variant == "clean_plus_v14"
     backbone_stage = args.backbone_stage
     if backbone_stage is None:
-        backbone_stage = 3 if (clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13) else 2
+        backbone_stage = 3 if (clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14) else 2
     spatial_mixer_layers = args.spatial_mixer_layers
     if spatial_mixer_layers is None:
         spatial_mixer_layers = 1 if clean_plus else 0
@@ -1135,7 +1139,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
     clean_cross_attn = args.clean_cross_attn or clean_plus
     use_order_gate = args.order_gate or clean_plus
     use_attn_head = args.attn_head or clean_plus
-    use_branch_ensemble = args.branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13
+    use_branch_ensemble = args.branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14
     aux_loss_weight = args.aux_loss_weight
     if aux_loss_weight is None:
         aux_loss_weight = 0.25 if clean_plus_v3 else 0.0
@@ -1143,7 +1147,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         raise ValueError("--aux-loss-weight must be >= 0")
     rank_margin_weight = args.rank_margin_weight
     if rank_margin_weight is None:
-        rank_margin_weight = 0.05 if (clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13) else 0.0
+        rank_margin_weight = 0.05 if (clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14) else 0.0
     if rank_margin_weight < 0:
         raise ValueError("--rank-margin-weight must be >= 0")
     if args.rank_margin < 0:
@@ -1152,7 +1156,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         raise ValueError("--rank-topk must be >= 1")
     candidate_rerank_weight = args.candidate_rerank_weight
     if candidate_rerank_weight is None:
-        candidate_rerank_weight = 0.03 if clean_plus_v13 else (0.05 if (clean_plus_v10 or clean_plus_v11 or clean_plus_v12) else 0.0)
+        candidate_rerank_weight = 0.03 if clean_plus_v13 else (0.05 if (clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v14) else 0.0)
     if candidate_rerank_weight < 0:
         raise ValueError("--candidate-rerank-weight must be >= 0")
     if args.candidate_rerank_topk < 3:
@@ -1175,6 +1179,11 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         raise ValueError("--power-anchor-topk must be >= 3")
     if args.power_anchor_temperature <= 0:
         raise ValueError("--power-anchor-temperature must be > 0")
+    modality_feature_dropout = args.modality_feature_dropout
+    if modality_feature_dropout is None:
+        modality_feature_dropout = 0.10 if clean_plus_v14 else 0.0
+    if modality_feature_dropout < 0 or modality_feature_dropout >= 1:
+        raise ValueError("--modality-feature-dropout must be in [0, 1)")
     top3_candidate_margin_weight = args.top3_candidate_margin_weight
     if top3_candidate_margin_weight is None:
         top3_candidate_margin_weight = 0.03 if clean_plus_v11 else 0.0
@@ -1256,6 +1265,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         power_anchor_weight=power_anchor_weight,
         power_anchor_topk=args.power_anchor_topk,
         power_anchor_temperature=args.power_anchor_temperature,
+        modality_feature_dropout=modality_feature_dropout,
         top3_candidate_margin_weight=top3_candidate_margin_weight,
         top3_candidate_margin=args.top3_candidate_margin,
         top3_candidate_topk=args.top3_candidate_topk,
@@ -1285,13 +1295,15 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         use_order_gate=use_order_gate,
         use_attn_head=use_attn_head,
         use_branch_ensemble=use_branch_ensemble,
-        use_beam_query_head=clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13,
+        use_beam_query_head=clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14,
         use_multiscale_backbone=clean_plus_v6,
         use_ordinal_head=clean_plus_v7,
         use_temporal_attn_pool=clean_plus_v8,
-        use_beam_neighbor_head=clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13,
-        use_candidate_reranker=clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13,
+        use_beam_neighbor_head=clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14,
+        use_candidate_reranker=clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14,
         use_bounded_candidate_reranker=clean_plus_v12,
+        use_modality_feature_dropout=clean_plus_v14 or modality_feature_dropout > 0,
+        modality_feature_dropout=modality_feature_dropout,
         candidate_topk=args.candidate_rerank_topk,
         candidate_delta_bound=args.candidate_rerank_delta_bound,
         candidate_embed_dropout=candidate_embed_dropout,

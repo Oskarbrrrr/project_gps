@@ -47,6 +47,7 @@ def build_stage1_config(args: argparse.Namespace) -> BeMambaConfig:
     clean_plus_v11 = variant == "clean_plus_v11"
     clean_plus_v12 = variant == "clean_plus_v12"
     clean_plus_v13 = variant == "clean_plus_v13"
+    clean_plus_v14 = variant == "clean_plus_v14"
 
     stage3_family = (
         clean_plus_v4
@@ -59,6 +60,7 @@ def build_stage1_config(args: argparse.Namespace) -> BeMambaConfig:
         or clean_plus_v11
         or clean_plus_v12
         or clean_plus_v13
+        or clean_plus_v14
     )
     backbone_stage = args.backbone_stage if args.backbone_stage is not None else (3 if stage3_family else 2)
     spatial_mixer_layers = args.spatial_mixer_layers
@@ -99,6 +101,7 @@ def build_stage1_config(args: argparse.Namespace) -> BeMambaConfig:
             or clean_plus_v11
             or clean_plus_v12
             or clean_plus_v13
+            or clean_plus_v14
         ),
         use_beam_query_head=(
             clean_plus_v5
@@ -110,12 +113,13 @@ def build_stage1_config(args: argparse.Namespace) -> BeMambaConfig:
             or clean_plus_v11
             or clean_plus_v12
             or clean_plus_v13
+            or clean_plus_v14
         ),
         use_multiscale_backbone=clean_plus_v6,
         use_ordinal_head=clean_plus_v7,
         use_temporal_attn_pool=clean_plus_v8,
-        use_beam_neighbor_head=clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13,
-        use_candidate_reranker=clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13,
+        use_beam_neighbor_head=clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14,
+        use_candidate_reranker=clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14,
         use_bounded_candidate_reranker=clean_plus_v12,
         candidate_topk=args.stage1_candidate_topk,
         candidate_delta_bound=args.stage1_candidate_delta_bound,
@@ -364,6 +368,7 @@ def parse_args() -> argparse.Namespace:
         "clean_plus_v11",
         "clean_plus_v12",
         "clean_plus_v13",
+        "clean_plus_v14",
     ]
     parser = argparse.ArgumentParser(description="Train a standalone two-stage beam candidate reranker.")
     parser.add_argument("--stage1-ckpt", required=True, help="Frozen Stage-1 best_model.pth path")
