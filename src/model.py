@@ -1294,6 +1294,7 @@ class BeMambaModel(nn.Module):
         radar_mask: torch.Tensor | None = None,
         lidar_mask: torch.Tensor | None = None,
         gps_mask: torch.Tensor | None = None,
+        return_features: bool = False,
     ) -> torch.Tensor:
         """Forward pass with modular 7-phase pipeline.
 
@@ -1303,9 +1304,10 @@ class BeMambaModel(nn.Module):
             lidars: [B, 5, 1, H, W]
             gps:    [B, 2, 2]
             *_mask: [B, seq_len] or None  (0=missing, 1=present)
+            return_features: when True, also return intermediate tokens for reranking
 
         Returns:
-            logits: [B, num_classes]
+            logits [B, num_classes], or (logits, features)
         """
         B = imgs.shape[0]
         device = imgs.device
@@ -1374,6 +1376,14 @@ class BeMambaModel(nn.Module):
         # Phase 7: Classification head
         # ═══════════════════════════════════════════════════════════
         fused_logits = self.head(fused) if self.use_attn_head else self.head(fused.reshape(B, -1))
+        features = {
+            "fused_tokens": fused,
+            "img_tokens": img_tokens,
+            "radar_tokens": radar_tokens,
+            "lidar_tokens": lidar_tokens,
+            "gps_tokens": gps_tokens,
+            "fused_logits": fused_logits,
+        }
         logits = fused_logits
         if self.branch_ensemble_head is not None:
             logits = self.branch_ensemble_head(
@@ -1395,6 +1405,8 @@ class BeMambaModel(nn.Module):
                     main_logits = self.beam_neighbor_head(main_logits, fused)
                 if self.candidate_reranker is not None:
                     main_logits = self.candidate_reranker(main_logits, fused)
+                if return_features:
+                    return (main_logits, aux_logits), features
                 return main_logits, aux_logits
         if self.beam_query_head is not None:
             logits = self.beam_query_head(logits, fused)
@@ -1404,6 +1416,8 @@ class BeMambaModel(nn.Module):
             logits = self.beam_neighbor_head(logits, fused)
         if self.candidate_reranker is not None:
             logits = self.candidate_reranker(logits, fused)
+        if return_features:
+            return logits, features
         return logits
 
 

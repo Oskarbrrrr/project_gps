@@ -36,6 +36,18 @@ _Avoid_: validation, robustness evaluation
 The clean-plus step that reorders a model's own high-confidence beam candidates instead of trying to discover new candidates from scratch.
 _Avoid_: image-source switching, backbone scaling
 
+**Reranker Head**:
+A lightweight reranking module attached to the Clean Backbone that adjusts candidate logits inside the same end-to-end model.
+_Avoid_: standalone second-stage model, offline post-processing, separate dataset
+
+**Standalone Reranker Model**:
+A separate second-stage model trained to reorder candidates produced by a frozen or pre-trained first-stage beam predictor.
+_Avoid_: reranker head, single-stage classifier, ordinary classification head
+
+**Two-Stage Clean Reranker**:
+The clean-data reranking experiment where a frozen Clean Backbone first produces a Top-K beam candidate set and a separately trained second-stage model learns to reorder only those candidates.
+_Avoid_: end-to-end reranker head, missing-aware robustness, seed-only validation
+
 **Beam-Aware Candidate Reranking**:
 The Clean Backbone innovation focus that uses beam neighborhood structure and power-distribution information to move plausible candidates into the Top-3.
 _Avoid_: generic classifier head, larger CNN, missing-aware robustness
