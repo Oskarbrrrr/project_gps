@@ -52,6 +52,10 @@ _Avoid_: end-to-end reranker head, missing-aware robustness, seed-only validatio
 A conservative two-stage reranking setup that applies direct target-ranking supervision only to Stage-1 recoverable misses and uses preservation penalties to avoid damaging already-correct Stage-1 Top-3 predictions.
 _Avoid_: stronger reranker everywhere, full-list reclassification, backbone retraining
 
+**Reranker Negative Result**:
+The SC32 clean finding that both ordinary and selective two-stage rerankers fail to improve over the frozen Stage-1 Top-3 result, with best performance occurring at the identity-like first epoch.
+_Avoid_: reranker strength issue, more reranker epochs, reranker-only breakthrough
+
 **Beam-Aware Candidate Reranking**:
 The Clean Backbone innovation focus that uses beam neighborhood structure and power-distribution information to move plausible candidates into the Top-3.
 _Avoid_: generic classifier head, larger CNN, missing-aware robustness
