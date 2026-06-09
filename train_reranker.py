@@ -154,6 +154,7 @@ def extract_stage1_outputs(
 def two_stage_rerank_loss(
     candidate_logits: torch.Tensor,
     candidate_idx: torch.Tensor,
+    stage1_candidate_logits: torch.Tensor,
     targets: torch.Tensor,
     power_vec: torch.Tensor,
     hard_weight: float,
@@ -161,6 +162,9 @@ def two_stage_rerank_loss(
     power_temperature: float,
     top3_margin_weight: float,
     top3_margin: float,
+    recoverable_only: bool,
+    preserve_weight: float,
+    delta_reg_weight: float,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     losses = {}
     total = candidate_logits.new_zeros(())
@@ -168,12 +172,15 @@ def two_stage_rerank_loss(
     target_match = candidate_idx == targets.unsqueeze(1)
     target_in_candidates = target_match.any(dim=1)
     target_pos = target_match.float().argmax(dim=1)
+    stage1_target_in_top3 = target_in_candidates & (target_pos < 3)
+    stage1_recoverable = target_in_candidates & (~stage1_target_in_top3)
+    supervised_mask = stage1_recoverable if recoverable_only else target_in_candidates
 
     hard_loss = candidate_logits.new_zeros(())
-    if hard_weight > 0 and torch.any(target_in_candidates):
+    if hard_weight > 0 and torch.any(supervised_mask):
         hard_loss = F.cross_entropy(
-            candidate_logits[target_in_candidates],
-            target_pos[target_in_candidates],
+            candidate_logits[supervised_mask],
+            target_pos[supervised_mask],
         )
         total = total + hard_weight * hard_loss
     losses["hard_loss"] = float(hard_loss.detach().item())
@@ -194,10 +201,10 @@ def two_stage_rerank_loss(
     losses["power_loss"] = float(power_loss.detach().item())
 
     top3_margin_loss = candidate_logits.new_zeros(())
-    if top3_margin_weight > 0 and torch.any(target_in_candidates):
+    if top3_margin_weight > 0 and torch.any(stage1_recoverable):
         current_top3 = candidate_logits.detach().topk(min(3, candidate_logits.size(1)), dim=1).indices
         target_in_top3 = (current_top3 == target_pos.unsqueeze(1)).any(dim=1)
-        recoverable = target_in_candidates & (~target_in_top3)
+        recoverable = stage1_recoverable & (~target_in_top3)
         if torch.any(recoverable):
             third_scores = candidate_logits.gather(1, current_top3[:, -1:].to(candidate_logits.device)).squeeze(1)
             target_scores = candidate_logits.gather(1, target_pos.unsqueeze(1)).squeeze(1)
@@ -205,7 +212,23 @@ def two_stage_rerank_loss(
             top3_margin_loss = top3_margin_loss[recoverable].mean()
             total = total + top3_margin_weight * top3_margin_loss
     losses["top3_margin_loss"] = float(top3_margin_loss.detach().item())
+
+    preserve_loss = candidate_logits.new_zeros(())
+    if preserve_weight > 0:
+        stage1_probs = F.softmax(stage1_candidate_logits.detach(), dim=1)
+        log_probs = F.log_softmax(candidate_logits, dim=1)
+        preserve_loss = F.kl_div(log_probs, stage1_probs, reduction="batchmean")
+        total = total + preserve_weight * preserve_loss
+    losses["preserve_loss"] = float(preserve_loss.detach().item())
+
+    delta_reg_loss = candidate_logits.new_zeros(())
+    if delta_reg_weight > 0:
+        delta_reg_loss = (candidate_logits - stage1_candidate_logits.detach()).square().mean()
+        total = total + delta_reg_weight * delta_reg_loss
+    losses["delta_reg_loss"] = float(delta_reg_loss.detach().item())
+
     losses["target_in_candidates"] = float(target_in_candidates.float().mean().detach().item() * 100.0)
+    losses["stage1_recoverable"] = float(stage1_recoverable.float().mean().detach().item() * 100.0)
     losses["loss"] = float(total.detach().item())
     return total, losses
 
@@ -229,6 +252,8 @@ def run_epoch(
         "hard_loss": 0.0,
         "power_loss": 0.0,
         "top3_margin_loss": 0.0,
+        "preserve_loss": 0.0,
+        "delta_reg_loss": 0.0,
         "stage1_acc1": 0.0,
         "stage1_acc2": 0.0,
         "stage1_acc3": 0.0,
@@ -238,6 +263,7 @@ def run_epoch(
         "rerank_dba": 0.0,
         "rerank_apl": 0.0,
         "candidate_coverage": 0.0,
+        "stage1_recoverable": 0.0,
     }
     sample_total = 0
 
@@ -266,6 +292,7 @@ def run_epoch(
                 loss, loss_items = two_stage_rerank_loss(
                     rerank_output.candidate_logits,
                     rerank_output.candidate_idx,
+                    rerank_output.stage1_candidate_logits,
                     targets,
                     power_vec,
                     hard_weight=args.hard_weight,
@@ -273,6 +300,9 @@ def run_epoch(
                     power_temperature=args.power_temperature,
                     top3_margin_weight=args.top3_margin_weight,
                     top3_margin=args.top3_margin,
+                    recoverable_only=args.recoverable_only,
+                    preserve_weight=args.preserve_weight,
+                    delta_reg_weight=args.delta_reg_weight,
                 )
 
         if training:
@@ -289,9 +319,10 @@ def run_epoch(
                 optimizer.step()
 
         sample_total += batch_size
-        for key in ("loss", "hard_loss", "power_loss", "top3_margin_loss"):
+        for key in ("loss", "hard_loss", "power_loss", "top3_margin_loss", "preserve_loss", "delta_reg_loss"):
             totals[key] += loss_items[key] * batch_size
         totals["candidate_coverage"] += loss_items["target_in_candidates"] * batch_size
+        totals["stage1_recoverable"] += loss_items["stage1_recoverable"] * batch_size
 
         stage1_acc1, stage1_acc2, stage1_acc3 = calculate_topk_accuracy(stage1_logits, targets, topk=(1, 2, 3))
         rerank_acc1, rerank_acc2, rerank_acc3 = calculate_topk_accuracy(rerank_output.full_logits, targets, topk=(1, 2, 3))
@@ -393,6 +424,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--power-temperature", type=float, default=0.15)
     parser.add_argument("--top3-margin-weight", type=float, default=0.03)
     parser.add_argument("--top3-margin", type=float, default=0.05)
+    parser.add_argument("--recoverable-only", action="store_true",
+                        help="Apply hard supervision only to Stage-1 Top-K misses that contain the target outside Top-3")
+    parser.add_argument("--preserve-weight", type=float, default=0.0,
+                        help="KL penalty that preserves Stage-1 candidate distribution")
+    parser.add_argument("--delta-reg-weight", type=float, default=0.0,
+                        help="L2 penalty on reranker candidate-logit deltas")
     return parser.parse_args()
 
 
@@ -400,7 +437,13 @@ def main() -> None:
     args = parse_args()
     if args.candidate_topk < 3:
         raise ValueError("--candidate-topk must be >= 3")
-    if args.hard_weight < 0 or args.power_weight < 0 or args.top3_margin_weight < 0:
+    if (
+        args.hard_weight < 0
+        or args.power_weight < 0
+        or args.top3_margin_weight < 0
+        or args.preserve_weight < 0
+        or args.delta_reg_weight < 0
+    ):
         raise ValueError("loss weights must be >= 0")
     if args.power_temperature <= 0:
         raise ValueError("--power-temperature must be > 0")
@@ -482,11 +525,14 @@ def main() -> None:
                 "train_loss",
                 "train_acc3",
                 "test_loss",
+                "preserve_loss",
+                "delta_reg_loss",
                 "stage1_acc3",
                 "rerank_acc1",
                 "rerank_acc2",
                 "rerank_acc3",
                 "candidate_coverage",
+                "stage1_recoverable",
                 "rerank_dba",
                 "rerank_apl",
                 "is_best",
@@ -550,6 +596,7 @@ def main() -> None:
             f"stage1_acc3={test_metrics['stage1_acc3']:.2f}% | "
             f"test_acc3={test_metrics['rerank_acc3']:.2f}% | "
             f"coverage={test_metrics['candidate_coverage']:.2f}% | "
+            f"recoverable={test_metrics['stage1_recoverable']:.2f}% | "
             f"test_dba={test_metrics['rerank_dba']:.4f} | "
             f"test_apl={test_metrics['rerank_apl']:.4f} dB | ETA {eta_string}"
         )
@@ -562,11 +609,14 @@ def main() -> None:
                     f"{train_metrics['loss']:.6f}",
                     f"{train_metrics['rerank_acc3']:.4f}",
                     f"{test_metrics['loss']:.6f}",
+                    f"{test_metrics['preserve_loss']:.6f}",
+                    f"{test_metrics['delta_reg_loss']:.6f}",
                     f"{test_metrics['stage1_acc3']:.4f}",
                     f"{test_metrics['rerank_acc1']:.4f}",
                     f"{test_metrics['rerank_acc2']:.4f}",
                     f"{test_metrics['rerank_acc3']:.4f}",
                     f"{test_metrics['candidate_coverage']:.4f}",
+                    f"{test_metrics['stage1_recoverable']:.4f}",
                     f"{test_metrics['rerank_dba']:.6f}",
                     f"{test_metrics['rerank_apl']:.6f}",
                     int(is_best),
@@ -600,6 +650,7 @@ def main() -> None:
         f"rerank_top2_acc: {final_metrics['rerank_acc2']:.2f}%\n"
         f"rerank_top3_acc: {final_metrics['rerank_acc3']:.2f}%\n"
         f"candidate_coverage: {final_metrics['candidate_coverage']:.2f}%\n"
+        f"stage1_recoverable: {final_metrics['stage1_recoverable']:.2f}%\n"
         f"rerank_dba: {final_metrics['rerank_dba']:.4f}\n"
         f"rerank_apl: {final_metrics['rerank_apl']:.4f} dB\n"
     )

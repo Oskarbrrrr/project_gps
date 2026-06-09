@@ -48,6 +48,10 @@ _Avoid_: reranker head, single-stage classifier, ordinary classification head
 The clean-data reranking experiment where a frozen Clean Backbone first produces a Top-K beam candidate set and a separately trained second-stage model learns to reorder only those candidates.
 _Avoid_: end-to-end reranker head, missing-aware robustness, seed-only validation
 
+**Selective Two-Stage Reranking**:
+A conservative two-stage reranking setup that applies direct target-ranking supervision only to Stage-1 recoverable misses and uses preservation penalties to avoid damaging already-correct Stage-1 Top-3 predictions.
+_Avoid_: stronger reranker everywhere, full-list reclassification, backbone retraining
+
 **Beam-Aware Candidate Reranking**:
 The Clean Backbone innovation focus that uses beam neighborhood structure and power-distribution information to move plausible candidates into the Top-3.
 _Avoid_: generic classifier head, larger CNN, missing-aware robustness
