@@ -26,6 +26,7 @@ class TrainConfig:
     split_root: str = "./Data/splits"
     output_root: str = "./outputs"
     merge_train_val: bool = True
+    selection_split: str = "test"
     image_subdir: str = "camera_data"
     image_aug: bool = False
     lidar_representation: str = "count"
@@ -711,6 +712,7 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
         merge_train_val=train_config.merge_train_val,
     )
     test_csv_path = os.path.join(train_config.split_root, f"{scenario_name}_test.csv")
+    val_csv_path = os.path.join(train_config.split_root, f"{scenario_name}_val.csv")
     alpha_weights = None
     if train_config.loss_name == "focal":
         alpha_weights = calculate_alpha_weights(train_csv_path, num_classes=model_config.num_classes).to(device)
@@ -750,6 +752,27 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
 
     train_loader = build_dataloader(train_ds, train_config, shuffle=True)
     test_loader = build_dataloader(test_ds, train_config, shuffle=False)
+    selection_name = train_config.selection_split
+    if selection_name == "val":
+        if not os.path.exists(val_csv_path):
+            raise FileNotFoundError(
+                f"--selection-split val requires a validation split: {val_csv_path}"
+            )
+        val_ds = MultimodalDataset(
+            mode="test",
+            data_root=train_config.data_root,
+            split_root=train_config.split_root,
+            scenario_name=scenario_name,
+            csv_path=val_csv_path,
+            image_subdir=train_config.image_subdir,
+            gps_stats=gps_stats,
+            lidar_representation=train_config.lidar_representation,
+        )
+        selection_loader = build_dataloader(val_ds, train_config, shuffle=False)
+    elif selection_name == "test":
+        selection_loader = test_loader
+    else:
+        raise ValueError(f"Unsupported selection_split: {selection_name}")
 
     model = BeMambaModel(model_config).to(device)
     ema = None
@@ -770,21 +793,21 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
                 "train_acc1",
                 "train_acc2",
                 "train_acc3",
-                "test_loss",
-                "test_acc1",
-                "test_acc2",
-                "test_acc3",
-                "test_dba",
-                "test_apl",
+                f"{selection_name}_loss",
+                f"{selection_name}_acc1",
+                f"{selection_name}_acc2",
+                f"{selection_name}_acc3",
+                f"{selection_name}_dba",
+                f"{selection_name}_apl",
                 "is_best",
             ]
         )
 
     start_time = time.time()
-    final_test_metrics = None
+    final_selection_metrics = None
     best_epoch = 0
     best_metric_value = None
-    best_test_metrics = None
+    best_selection_metrics = None
     epochs_without_improvement = 0
     best_ckpt_path = os.path.join(checkpoints_dir, "best_model.pth")
 
@@ -819,9 +842,9 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
         if ema is not None:
             ema.store(model)
             ema.copy_to(model)
-        test_metrics = run_epoch(
+        selection_metrics = run_epoch(
             model=model,
-            loader=test_loader,
+            loader=selection_loader,
             criterion=criterion,
             optimizer=None,
             scaler=None,
@@ -831,8 +854,8 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
         )
         if ema is not None:
             ema.restore(model)
-        final_test_metrics = test_metrics
-        monitored_value = test_metrics[train_config.early_stop_metric]
+        final_selection_metrics = selection_metrics
+        monitored_value = selection_metrics[train_config.early_stop_metric]
 
         if is_better_metric(
             monitored_value,
@@ -842,7 +865,7 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
         ):
             best_metric_value = monitored_value
             best_epoch = epoch
-            best_test_metrics = dict(test_metrics)
+            best_selection_metrics = dict(selection_metrics)
             epochs_without_improvement = 0
             if ema is not None:
                 ema.store(model)
@@ -865,10 +888,10 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
                 f"| lr={current_lr:.2e} "
                 f"| train_loss={train_metrics['loss']:.4f} "
                 f"| train_acc3={train_metrics['acc3']:.2f}% "
-                f"| test_loss={test_metrics['loss']:.4f} "
-                f"| test_acc3={test_metrics['acc3']:.2f}% "
-                f"| test_dba={test_metrics['dba']:.4f} "
-                f"| test_apl={test_metrics['apl']:.4f} dB "
+                f"| {selection_name}_loss={selection_metrics['loss']:.4f} "
+                f"| {selection_name}_acc3={selection_metrics['acc3']:.2f}% "
+                f"| {selection_name}_dba={selection_metrics['dba']:.4f} "
+                f"| {selection_name}_apl={selection_metrics['apl']:.4f} dB "
                 f"| ETA {eta_string}"
             )
 
@@ -882,12 +905,12 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
                     f"{train_metrics['acc1']:.4f}",
                     f"{train_metrics['acc2']:.4f}",
                     f"{train_metrics['acc3']:.4f}",
-                    f"{test_metrics['loss']:.6f}",
-                    f"{test_metrics['acc1']:.4f}",
-                    f"{test_metrics['acc2']:.4f}",
-                    f"{test_metrics['acc3']:.4f}",
-                    f"{test_metrics['dba']:.6f}",
-                    f"{test_metrics['apl']:.6f}",
+                    f"{selection_metrics['loss']:.6f}",
+                    f"{selection_metrics['acc1']:.4f}",
+                    f"{selection_metrics['acc2']:.4f}",
+                    f"{selection_metrics['acc3']:.4f}",
+                    f"{selection_metrics['dba']:.6f}",
+                    f"{selection_metrics['apl']:.6f}",
                     epoch == best_epoch,
                 ]
             )
@@ -901,16 +924,17 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
         if train_config.patience > 0 and epochs_without_improvement >= train_config.patience:
             print(
                 f"Early stopping triggered at epoch {epoch:03d} "
-                f"(best_epoch={best_epoch:03d}, best_{train_config.early_stop_metric}={best_metric_value:.4f})"
+                f"(monitor_split={selection_name}, best_epoch={best_epoch:03d}, "
+                f"best_{train_config.early_stop_metric}={best_metric_value:.4f})"
             )
             break
 
     final_ckpt = os.path.join(checkpoints_dir, "final_model.pth")
     torch.save(model.state_dict(), final_ckpt)
-    if best_test_metrics is None:
-        best_test_metrics = final_test_metrics if final_test_metrics is not None else run_epoch(
+    if best_selection_metrics is None:
+        best_selection_metrics = final_selection_metrics if final_selection_metrics is not None else run_epoch(
             model=model,
-            loader=test_loader,
+            loader=selection_loader,
             criterion=criterion,
             optimizer=None,
             scaler=None,
@@ -919,7 +943,7 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
             grad_clip_norm=train_config.grad_clip_norm,
         )
         best_epoch = epoch
-        best_metric_value = best_test_metrics[train_config.early_stop_metric]
+        best_metric_value = best_selection_metrics[train_config.early_stop_metric]
         torch.save(model.state_dict(), best_ckpt_path)
 
     load_checkpoint(model, best_ckpt_path, device)
@@ -938,6 +962,7 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
     result_text = (
         f"[Best Results for {scenario_name}]\n"
         f"best_epoch: {best_epoch}\n"
+        f"monitor_split: {selection_name}\n"
         f"monitor_metric: {train_config.early_stop_metric}\n"
         f"monitor_value: {best_metric_value:.4f}\n"
         f"top1_acc: {test_metrics['acc1']:.2f}%\n"
@@ -962,16 +987,16 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
             run_dir=run_dir,
         )
 
-    if final_test_metrics is not None:
+    if final_selection_metrics is not None:
         last_result_path = os.path.join(run_dir, "last_epoch_result.txt")
         last_result_text = (
-            f"[Last Epoch Results for {scenario_name}]\n"
+            f"[Last Epoch {selection_name} Results for {scenario_name}]\n"
             f"epoch: {epoch}\n"
-            f"top1_acc: {final_test_metrics['acc1']:.2f}%\n"
-            f"top2_acc: {final_test_metrics['acc2']:.2f}%\n"
-            f"top3_acc: {final_test_metrics['acc3']:.2f}%\n"
-            f"dba: {final_test_metrics['dba']:.4f}\n"
-            f"apl: {final_test_metrics['apl']:.4f} dB\n"
+            f"top1_acc: {final_selection_metrics['acc1']:.2f}%\n"
+            f"top2_acc: {final_selection_metrics['acc2']:.2f}%\n"
+            f"top3_acc: {final_selection_metrics['acc3']:.2f}%\n"
+            f"dba: {final_selection_metrics['dba']:.4f}\n"
+            f"apl: {final_selection_metrics['apl']:.4f} dB\n"
         )
         with open(last_result_path, "w", encoding="utf-8") as handle:
             handle.write(last_result_text)
@@ -983,6 +1008,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split-root", default="./Data/splits")
     parser.add_argument("--output-root", default="./outputs")
     parser.add_argument("--no-merge-trainval", action="store_true")
+    parser.add_argument("--selection-split", choices=["test", "val"], default="test",
+                        help="Split used for checkpoint selection/early stopping; use val for paper-facing runs")
     parser.add_argument("--image-subdir", default="camera_data")
     parser.add_argument("--image-aug", action="store_true",
                         help="Use light train-only image augmentation for clean-data regularization")
@@ -1107,6 +1134,8 @@ def parse_args() -> argparse.Namespace:
 def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]:
     if args.dmaf_enabled and args.no_dmaf:
         raise ValueError("--dmaf-enabled and --no-dmaf cannot be used together")
+    if args.selection_split == "val" and not args.no_merge_trainval:
+        raise ValueError("--selection-split val requires --no-merge-trainval so validation samples are not trained on")
     if args.ema_decay != 0.0 and not (0.0 < args.ema_decay < 1.0):
         raise ValueError("--ema-decay must be 0 or in (0, 1)")
     if args.ema_start_epoch < 1:
@@ -1199,6 +1228,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         split_root=args.split_root,
         output_root=args.output_root,
         merge_train_val=(not args.no_merge_trainval),
+        selection_split=args.selection_split,
         image_subdir=args.image_subdir,
         image_aug=args.image_aug,
         lidar_representation=args.lidar_representation,

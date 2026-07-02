@@ -128,6 +128,14 @@ _Avoid_: multi-scenario sweep, seed validation, simultaneous structure changes
 Top-3 Accuracy is the single primary metric for clean-data model-structure optimization and paper-facing comparison.
 _Avoid_: composite score, Top-1-first tuning, DBA-first tuning
 
+**Paper-Facing Checkpoint Selection**:
+The reporting protocol where a validation split selects the checkpoint and the test split is used only for final measurement.
+_Avoid_: test-set early stopping, leaderboard-style checkpoint picking, seed validation
+
+**Paper-Aligned Sequence Order**:
+The reproduction-audit sequence convention that follows the original BeMamba order assumptions before adding Clean-Plus changes.
+_Avoid_: row-reverse shortcut, post-hoc evaluation mismatch, hidden implementation drift
+
 **SC32 Clean Overfitting**:
 The repeated SC32 clean-data pattern where train Top-3 continues rising after the best epoch while test Top-3 and test loss worsen, indicating capacity and regularization are now the main bottleneck.
 _Avoid_: undertraining, seed search, bigger backbone

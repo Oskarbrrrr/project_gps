@@ -11,12 +11,21 @@ def parse_args():
     parser.add_argument("--output-dir", default=None, help="Defaults to <repo>/Data/splits")
     parser.add_argument("--scenarios", nargs="+", default=["scenario32", "scenario33", "scenario34"])
     parser.add_argument("--test-size", type=float, default=0.2)
+    parser.add_argument(
+        "--val-size",
+        type=float,
+        default=0.25,
+        help="Validation fraction carved from the paper80 train split for paper80_train_val_test.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--split-mode",
-        choices=["paper80_20", "train_val_test"],
+        choices=["paper80_20", "paper80_train_val_test", "train_val_test"],
         default="paper80_20",
-        help="paper80_20 writes only train/test. train_val_test writes 60/20/20 for legacy compatibility.",
+        help=(
+            "paper80_20 writes only train/test. paper80_train_val_test preserves the paper80 test split "
+            "and carves validation from train. train_val_test writes 60/20/20 for legacy compatibility."
+        ),
     )
     parser.add_argument("--no-stratify-beam", action="store_true")
     return parser.parse_args()
@@ -72,6 +81,22 @@ def split_train_val_test(df: pd.DataFrame, seed: int, stratify_labels):
     )
 
 
+def split_paper80_train_val_test(df: pd.DataFrame, test_size: float, val_size: float, seed: int, stratify_labels):
+    train_full_df, test_df = split_paper_80_20(df, test_size, seed, stratify_labels)
+    train_stratify = build_stratify_labels(train_full_df, enable=(stratify_labels is not None))
+    train_df, val_df = train_test_split(
+        train_full_df,
+        test_size=val_size,
+        random_state=seed,
+        stratify=train_stratify,
+    )
+    return (
+        train_df.reset_index(drop=True),
+        val_df.reset_index(drop=True),
+        test_df.reset_index(drop=True),
+    )
+
+
 def split_csv(scenario_name: str, csv_path: str, output_dir: str, args) -> None:
     print(f"[info] processing {scenario_name}")
     if not os.path.exists(csv_path):
@@ -89,6 +114,20 @@ def split_csv(scenario_name: str, csv_path: str, output_dir: str, args) -> None:
         train_df.to_csv(train_path, index=False)
         test_df.to_csv(test_path, index=False)
         print(f"[ok] {scenario_name}: train={len(train_df)} test={len(test_df)} -> {train_path}, {test_path}")
+        return
+
+    if args.split_mode == "paper80_train_val_test":
+        train_df, val_df, test_df = split_paper80_train_val_test(
+            df,
+            test_size=args.test_size,
+            val_size=args.val_size,
+            seed=args.seed,
+            stratify_labels=stratify_labels,
+        )
+        train_df.to_csv(os.path.join(output_dir, f"{scenario_name}_train.csv"), index=False)
+        val_df.to_csv(os.path.join(output_dir, f"{scenario_name}_val.csv"), index=False)
+        test_df.to_csv(os.path.join(output_dir, f"{scenario_name}_test.csv"), index=False)
+        print(f"[ok] {scenario_name}: train={len(train_df)} val={len(val_df)} test={len(test_df)}")
         return
 
     train_df, val_df, test_df = split_train_val_test(df, seed=args.seed, stratify_labels=stratify_labels)
