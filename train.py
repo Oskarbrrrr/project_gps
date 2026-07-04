@@ -98,6 +98,11 @@ class TrainConfig:
     top3_candidate_margin_weight: float = 0.0
     top3_candidate_margin: float = 0.15
     top3_candidate_topk: int = 7
+    difficulty_curriculum: bool = False
+    curriculum_start_epoch: int = 6
+    curriculum_ramp_epochs: int = 8
+    curriculum_start_factor: float = 0.0
+    curriculum_min_sample_weight: float = 0.25
 
 
 class AlphaFocalLoss(nn.Module):
@@ -286,6 +291,51 @@ def is_better_metric(current: float, best: float | None, mode: str, min_delta: f
     raise ValueError(f"Unsupported early stop mode: {mode}")
 
 
+def get_curriculum_factor(
+    epoch: int,
+    enabled: bool,
+    start_epoch: int,
+    ramp_epochs: int,
+    start_factor: float,
+) -> float:
+    if not enabled:
+        return 1.0
+    start_epoch = max(1, int(start_epoch))
+    ramp_epochs = max(1, int(ramp_epochs))
+    start_factor = float(np.clip(start_factor, 0.0, 1.0))
+    if epoch < start_epoch:
+        return start_factor
+    progress = min(max((epoch - start_epoch + 1) / ramp_epochs, 0.0), 1.0)
+    return start_factor + (1.0 - start_factor) * progress
+
+
+def build_power_curriculum_weights(
+    power_vec: torch.Tensor,
+    curriculum_factor: float,
+    min_sample_weight: float,
+) -> torch.Tensor:
+    power = torch.nan_to_num(power_vec, nan=0.0, posinf=0.0, neginf=0.0)
+    power = torch.clamp(power, min=0.0)
+    topk = min(3, power.size(1))
+    top_power = power.topk(topk, dim=1).values
+    if topk == 1:
+        clarity = torch.ones(power.size(0), device=power.device)
+    else:
+        clarity = (top_power[:, 0] - top_power[:, -1]) / (top_power[:, 0] + 1e-8)
+        clarity = torch.clamp(clarity, 0.0, 1.0)
+    min_sample_weight = float(np.clip(min_sample_weight, 0.0, 1.0))
+    early_weight = min_sample_weight + (1.0 - min_sample_weight) * clarity
+    curriculum_factor = float(np.clip(curriculum_factor, 0.0, 1.0))
+    return curriculum_factor + (1.0 - curriculum_factor) * early_weight
+
+
+def weighted_loss_mean(loss: torch.Tensor, sample_weights: torch.Tensor | None = None) -> torch.Tensor:
+    if sample_weights is None:
+        return loss.mean()
+    weights = sample_weights.to(device=loss.device, dtype=loss.dtype)
+    return (loss * weights).sum() / weights.sum().clamp_min(1e-8)
+
+
 def move_batch_to_device(batch, device: torch.device):
     if len(batch) == 6:
         imgs, radars, lidars, gps, targets, power_vec = batch
@@ -338,6 +388,9 @@ def run_epoch(
     top3_candidate_margin_weight: float = 0.0,
     top3_candidate_margin: float = 0.15,
     top3_candidate_topk: int = 7,
+    difficulty_curriculum: bool = False,
+    curriculum_factor: float = 1.0,
+    curriculum_min_sample_weight: float = 0.25,
 ) -> Dict[str, float]:
     training = optimizer is not None
     model.train(training)
@@ -365,6 +418,13 @@ def run_epoch(
                         outputs, aux_logits = model_outputs
                     else:
                         outputs = model_outputs
+                    sample_weights = None
+                    if training and difficulty_curriculum:
+                        sample_weights = build_power_curriculum_weights(
+                            power_vec.to(outputs.device),
+                            curriculum_factor=curriculum_factor,
+                            min_sample_weight=curriculum_min_sample_weight,
+                        )
                     loss = compute_loss(criterion, outputs, targets, power_vec)
                     if training and rank_margin_weight > 0:
                         loss = loss + rank_margin_weight * topk_margin_loss(
@@ -372,6 +432,7 @@ def run_epoch(
                             targets,
                             topk=rank_topk,
                             margin=rank_margin,
+                            sample_weights=sample_weights,
                         )
                     if training and candidate_rerank_weight > 0:
                         loss = loss + candidate_rerank_weight * candidate_power_rerank_loss(
@@ -379,6 +440,7 @@ def run_epoch(
                             power_vec,
                             topk=candidate_rerank_topk,
                             temperature=candidate_rerank_temperature,
+                            sample_weights=sample_weights,
                         )
                     if training and power_anchor_weight > 0:
                         loss = loss + power_anchor_weight * power_anchor_candidate_loss(
@@ -484,14 +546,16 @@ def topk_margin_loss(
     targets: torch.Tensor,
     topk: int = 3,
     margin: float = 0.2,
+    sample_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    target_logits = outputs.gather(1, targets.unsqueeze(1))
+    target_logits = outputs.gather(1, targets.unsqueeze(1)).squeeze(1)
     negative_logits = outputs.masked_fill(
         torch.zeros_like(outputs, dtype=torch.bool).scatter_(1, targets.unsqueeze(1), True),
         float("-inf"),
     )
-    kth_negative = negative_logits.topk(topk, dim=1).values[:, -1:].detach()
-    return nn.functional.relu(kth_negative + margin - target_logits).mean()
+    kth_negative = negative_logits.topk(topk, dim=1).values[:, -1].detach()
+    loss = nn.functional.relu(kth_negative + margin - target_logits)
+    return weighted_loss_mean(loss, sample_weights)
 
 
 def candidate_power_rerank_loss(
@@ -499,6 +563,7 @@ def candidate_power_rerank_loss(
     power_vec: torch.Tensor,
     topk: int = 7,
     temperature: float = 0.15,
+    sample_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     topk = min(max(int(topk), 1), outputs.size(1))
     candidate_idx = outputs.detach().topk(topk, dim=1).indices
@@ -513,7 +578,8 @@ def candidate_power_rerank_loss(
     soft_logits = torch.log(candidate_power + 1e-8) / max(temperature, 1e-8)
     soft_targets = torch.softmax(soft_logits, dim=1)
     log_probs = nn.functional.log_softmax(candidate_logits, dim=1)
-    return -(soft_targets * log_probs).sum(dim=1).mean()
+    loss = -(soft_targets * log_probs).sum(dim=1)
+    return weighted_loss_mean(loss, sample_weights)
 
 
 def power_anchor_candidate_loss(
@@ -799,6 +865,9 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
                 f"{selection_name}_acc3",
                 f"{selection_name}_dba",
                 f"{selection_name}_apl",
+                "curriculum_factor",
+                "effective_rank_margin_weight",
+                "effective_candidate_rerank_weight",
                 "is_best",
             ]
         )
@@ -816,6 +885,15 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
             ema = ModelEMA(model, train_config.ema_decay)
         if train_config.missing_aug_enabled:
             train_ds.set_missing_epoch(epoch)
+        curriculum_factor = get_curriculum_factor(
+            epoch,
+            enabled=train_config.difficulty_curriculum,
+            start_epoch=train_config.curriculum_start_epoch,
+            ramp_epochs=train_config.curriculum_ramp_epochs,
+            start_factor=train_config.curriculum_start_factor,
+        )
+        effective_rank_margin_weight = train_config.rank_margin_weight * curriculum_factor
+        effective_candidate_rerank_weight = train_config.candidate_rerank_weight * curriculum_factor
         train_metrics = run_epoch(
             model=model,
             loader=train_loader,
@@ -826,10 +904,10 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
             amp_enabled=(train_config.amp and device.type == "cuda"),
             grad_clip_norm=train_config.grad_clip_norm,
             ema=ema,
-            rank_margin_weight=train_config.rank_margin_weight,
+            rank_margin_weight=effective_rank_margin_weight,
             rank_margin=train_config.rank_margin,
             rank_topk=train_config.rank_topk,
-            candidate_rerank_weight=train_config.candidate_rerank_weight,
+            candidate_rerank_weight=effective_candidate_rerank_weight,
             candidate_rerank_topk=train_config.candidate_rerank_topk,
             candidate_rerank_temperature=train_config.candidate_rerank_temperature,
             power_anchor_weight=train_config.power_anchor_weight,
@@ -838,6 +916,9 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
             top3_candidate_margin_weight=train_config.top3_candidate_margin_weight,
             top3_candidate_margin=train_config.top3_candidate_margin,
             top3_candidate_topk=train_config.top3_candidate_topk,
+            difficulty_curriculum=train_config.difficulty_curriculum,
+            curriculum_factor=curriculum_factor,
+            curriculum_min_sample_weight=train_config.curriculum_min_sample_weight,
         )
         if ema is not None:
             ema.store(model)
@@ -883,6 +964,11 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
         current_lr = optimizer.param_groups[0]["lr"]
 
         if epoch % train_config.log_every == 0:
+            curriculum_msg = (
+                f"| curriculum={curriculum_factor:.2f} "
+                if train_config.difficulty_curriculum
+                else ""
+            )
             print(
                 f"Epoch {epoch:03d}/{train_config.epochs} "
                 f"| lr={current_lr:.2e} "
@@ -892,6 +978,7 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
                 f"| {selection_name}_acc3={selection_metrics['acc3']:.2f}% "
                 f"| {selection_name}_dba={selection_metrics['dba']:.4f} "
                 f"| {selection_name}_apl={selection_metrics['apl']:.4f} dB "
+                f"{curriculum_msg}"
                 f"| ETA {eta_string}"
             )
 
@@ -911,6 +998,9 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
                     f"{selection_metrics['acc3']:.4f}",
                     f"{selection_metrics['dba']:.6f}",
                     f"{selection_metrics['apl']:.6f}",
+                    f"{curriculum_factor:.6f}",
+                    f"{effective_rank_margin_weight:.6f}",
+                    f"{effective_candidate_rerank_weight:.6f}",
                     epoch == best_epoch,
                 ]
             )
@@ -1059,7 +1149,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gps-hidden-dim", type=int, default=96)
     parser.add_argument("--no-pretrained-backbones", action="store_true")
     parser.add_argument("--freeze-image-stem", action="store_true")
-    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7", "clean_plus_v8", "clean_plus_v9", "clean_plus_v10", "clean_plus_v11", "clean_plus_v12", "clean_plus_v13", "clean_plus_v14"], default="bemamba",
+    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7", "clean_plus_v8", "clean_plus_v9", "clean_plus_v10", "clean_plus_v11", "clean_plus_v12", "clean_plus_v13", "clean_plus_v14", "clean_plus_v15"], default="bemamba",
                         help="Use the original BeMamba path or the enhanced clean-data variant")
     parser.add_argument("--backbone-stage", type=int, choices=[2, 3, 4], default=None,
                         help="Last ResNet stage used by modality backbones; clean_plus_v4 defaults to 3")
@@ -1105,6 +1195,16 @@ def parse_args() -> argparse.Namespace:
                         help="Margin requiring recoverable Top-K targets to enter Top-3")
     parser.add_argument("--top3-candidate-topk", type=int, default=7,
                         help="Candidate set width used by the hard Top-3 candidate margin loss")
+    parser.add_argument("--difficulty-curriculum", action="store_true",
+                        help="Ramp Top-3/candidate rerank losses and downweight ambiguous power samples early; clean_plus_v15 enables this by default")
+    parser.add_argument("--curriculum-start-epoch", type=int, default=None,
+                        help="Epoch where curriculum ramp begins; clean_plus_v15 defaults to 6")
+    parser.add_argument("--curriculum-ramp-epochs", type=int, default=8,
+                        help="Number of epochs used to linearly ramp curriculum loss weights to full strength")
+    parser.add_argument("--curriculum-start-factor", type=float, default=0.0,
+                        help="Initial multiplier for curriculum-controlled auxiliary losses")
+    parser.add_argument("--curriculum-min-sample-weight", type=float, default=0.25,
+                        help="Minimum early sample weight for ambiguous power-distribution samples")
     parser.add_argument("--missing-enabled", action="store_true",
                         help="Legacy convenience flag: enable both missing augmentation and DMAF")
     parser.add_argument("--missing-aug-enabled", action="store_true",
@@ -1140,6 +1240,12 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         raise ValueError("--ema-decay must be 0 or in (0, 1)")
     if args.ema_start_epoch < 1:
         raise ValueError("--ema-start-epoch must be >= 1")
+    if args.curriculum_ramp_epochs < 1:
+        raise ValueError("--curriculum-ramp-epochs must be >= 1")
+    if args.curriculum_start_factor < 0 or args.curriculum_start_factor > 1:
+        raise ValueError("--curriculum-start-factor must be in [0, 1]")
+    if args.curriculum_min_sample_weight < 0 or args.curriculum_min_sample_weight > 1:
+        raise ValueError("--curriculum-min-sample-weight must be in [0, 1]")
 
     missing_aug_enabled = args.missing_enabled or args.missing_aug_enabled
     dmaf_enabled = (args.missing_enabled or args.dmaf_enabled) and (not args.no_dmaf)
@@ -1157,9 +1263,10 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
     clean_plus_v12 = args.model_variant == "clean_plus_v12"
     clean_plus_v13 = args.model_variant == "clean_plus_v13"
     clean_plus_v14 = args.model_variant == "clean_plus_v14"
+    clean_plus_v15 = args.model_variant == "clean_plus_v15"
     backbone_stage = args.backbone_stage
     if backbone_stage is None:
-        backbone_stage = 3 if (clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14) else 2
+        backbone_stage = 3 if (clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15) else 2
     spatial_mixer_layers = args.spatial_mixer_layers
     if spatial_mixer_layers is None:
         spatial_mixer_layers = 1 if clean_plus else 0
@@ -1168,7 +1275,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
     clean_cross_attn = args.clean_cross_attn or clean_plus
     use_order_gate = args.order_gate or clean_plus
     use_attn_head = args.attn_head or clean_plus
-    use_branch_ensemble = args.branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14
+    use_branch_ensemble = args.branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15
     aux_loss_weight = args.aux_loss_weight
     if aux_loss_weight is None:
         aux_loss_weight = 0.25 if clean_plus_v3 else 0.0
@@ -1176,7 +1283,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         raise ValueError("--aux-loss-weight must be >= 0")
     rank_margin_weight = args.rank_margin_weight
     if rank_margin_weight is None:
-        rank_margin_weight = 0.05 if (clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14) else 0.0
+        rank_margin_weight = 0.05 if (clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15) else 0.0
     if rank_margin_weight < 0:
         raise ValueError("--rank-margin-weight must be >= 0")
     if args.rank_margin < 0:
@@ -1185,7 +1292,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         raise ValueError("--rank-topk must be >= 1")
     candidate_rerank_weight = args.candidate_rerank_weight
     if candidate_rerank_weight is None:
-        candidate_rerank_weight = 0.03 if clean_plus_v13 else (0.05 if (clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v14) else 0.0)
+        candidate_rerank_weight = 0.03 if clean_plus_v13 else (0.05 if (clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v14 or clean_plus_v15) else 0.0)
     if candidate_rerank_weight < 0:
         raise ValueError("--candidate-rerank-weight must be >= 0")
     if args.candidate_rerank_topk < 3:
@@ -1210,7 +1317,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         raise ValueError("--power-anchor-temperature must be > 0")
     modality_feature_dropout = args.modality_feature_dropout
     if modality_feature_dropout is None:
-        modality_feature_dropout = 0.10 if clean_plus_v14 else 0.0
+        modality_feature_dropout = 0.10 if (clean_plus_v14 or clean_plus_v15) else 0.0
     if modality_feature_dropout < 0 or modality_feature_dropout >= 1:
         raise ValueError("--modality-feature-dropout must be in [0, 1)")
     top3_candidate_margin_weight = args.top3_candidate_margin_weight
@@ -1222,6 +1329,12 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         raise ValueError("--top3-candidate-margin must be >= 0")
     if args.top3_candidate_topk < 4:
         raise ValueError("--top3-candidate-topk must be >= 4")
+    difficulty_curriculum = args.difficulty_curriculum or clean_plus_v15
+    curriculum_start_epoch = args.curriculum_start_epoch
+    if curriculum_start_epoch is None:
+        curriculum_start_epoch = 6 if clean_plus_v15 else 1
+    if curriculum_start_epoch < 1:
+        raise ValueError("--curriculum-start-epoch must be >= 1")
 
     train_config = TrainConfig(
         data_root=args.data_root,
@@ -1299,6 +1412,11 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         top3_candidate_margin_weight=top3_candidate_margin_weight,
         top3_candidate_margin=args.top3_candidate_margin,
         top3_candidate_topk=args.top3_candidate_topk,
+        difficulty_curriculum=difficulty_curriculum,
+        curriculum_start_epoch=curriculum_start_epoch,
+        curriculum_ramp_epochs=args.curriculum_ramp_epochs,
+        curriculum_start_factor=args.curriculum_start_factor,
+        curriculum_min_sample_weight=args.curriculum_min_sample_weight,
     )
     model_config = BeMambaConfig(
         d_model=args.d_model,
@@ -1325,14 +1443,14 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         use_order_gate=use_order_gate,
         use_attn_head=use_attn_head,
         use_branch_ensemble=use_branch_ensemble,
-        use_beam_query_head=clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14,
+        use_beam_query_head=clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15,
         use_multiscale_backbone=clean_plus_v6,
         use_ordinal_head=clean_plus_v7,
         use_temporal_attn_pool=clean_plus_v8,
-        use_beam_neighbor_head=clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14,
-        use_candidate_reranker=clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14,
+        use_beam_neighbor_head=clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15,
+        use_candidate_reranker=clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15,
         use_bounded_candidate_reranker=clean_plus_v12,
-        use_modality_feature_dropout=clean_plus_v14 or modality_feature_dropout > 0,
+        use_modality_feature_dropout=clean_plus_v14 or clean_plus_v15 or modality_feature_dropout > 0,
         modality_feature_dropout=modality_feature_dropout,
         candidate_topk=args.candidate_rerank_topk,
         candidate_delta_bound=args.candidate_rerank_delta_bound,

@@ -96,6 +96,10 @@ _Avoid_: bounded reranking, hard margin, bigger backbone
 The fusion-regularized Clean Backbone probe that keeps the clean_plus_v10 candidate-reranking structure and targets SC32 Clean Overfitting through Modality Feature Dropout.
 _Avoid_: two-stage reranker, missing-aware robustness, image augmentation
 
+**clean_plus_v15**:
+The curriculum-regularized Clean Backbone probe that reuses the clean_plus_v14 structure while ramping Top-3 and candidate reranking auxiliary losses from easy-to-hard training.
+_Avoid_: new backbone, DMAF, stronger dropout
+
 **Modality Feature Dropout**:
 A Clean Backbone regularization concept that suppresses whole latent modality streams during clean-data training to reduce modality-specific overfitting while preserving complete-input evaluation.
 _Avoid_: Missing-Aug, DMAF mask, sensor dropout, test-time missing input
@@ -143,6 +147,22 @@ _Avoid_: undertraining, seed search, bigger backbone
 **SC32 Clean Two-Bottleneck Pattern**:
 The current SC32 clean-data state where the model often recovers the correct beam in a wider candidate set but fails to place it in Top-3, while stronger ranking supervision quickly overfits the train split.
 _Avoid_: single-cause diagnosis, seed search, backbone scaling
+
+**Clean Regularization Ladder**:
+The ordered Clean Backbone improvement path that first tests low-risk regularization controls, then moves to difficulty-aware supervision, and only later considers larger structural changes.
+_Avoid_: seed sweep, direct DMAF work, bigger backbone first
+
+**Cheap Regularization Probe**:
+The first Clean Regularization Ladder step: use existing training controls to reduce clean-data overfitting without changing the Clean Backbone architecture or test protocol.
+_Avoid_: new model variant, missing augmentation, test-select tuning
+
+**Difficulty-Aware Curriculum**:
+A later Clean Backbone direction that gradually strengthens supervision for hard or ambiguous beam samples instead of applying strong Top-3 ranking pressure from the beginning of training.
+_Avoid_: standalone reranker, factor-graph branding, one-shot hard mining
+
+**Curriculum Rerank Ramp**:
+A Difficulty-Aware Curriculum mechanism that linearly ramps Top-3 margin and candidate rerank auxiliary losses while early training downweights ambiguous power-distribution samples.
+_Avoid_: fixed loss weights, hard mining, larger model
 
 **Train-Only Image Augmentation**:
 Light camera-image augmentation used only during clean-data training to reduce SC32 overfitting; it is photometric-only and keeps deterministic resizing without random crop, blur, or geometry changes.
