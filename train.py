@@ -20,6 +20,25 @@ from src.model import BeMambaConfig, BeMambaModel, load_checkpoint
 from src.utils import calculate_apl, calculate_dba_score, calculate_topk_accuracy
 
 
+CLEAN_ABLATION_STAGES = (
+    "none",
+    "base",
+    "order_gate",
+    "attn_head",
+    "branch",
+    "beam_query",
+    "neighbor",
+    "rerank",
+    "modality_dropout",
+)
+
+
+def clean_ablation_level(stage: str) -> int:
+    if stage not in CLEAN_ABLATION_STAGES:
+        raise ValueError(f"Unsupported clean_ablation_stage: {stage}")
+    return CLEAN_ABLATION_STAGES.index(stage) - 1
+
+
 @dataclass
 class TrainConfig:
     data_root: str = "./Data/Multi_Modal"
@@ -76,6 +95,7 @@ class TrainConfig:
     use_cross_attn: bool = True
     use_reliability: bool = True
     model_variant: str = "bemamba"
+    clean_ablation_stage: str = "none"
     clean_cross_attn: bool = False
     spatial_mixer_layers: int = 0
     use_order_gate: bool = False
@@ -1151,6 +1171,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--freeze-image-stem", action="store_true")
     parser.add_argument("--model-variant", choices=["bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7", "clean_plus_v8", "clean_plus_v9", "clean_plus_v10", "clean_plus_v11", "clean_plus_v12", "clean_plus_v13", "clean_plus_v14", "clean_plus_v15"], default="bemamba",
                         help="Use the original BeMamba path or the enhanced clean-data variant")
+    parser.add_argument("--clean-ablation-stage", choices=CLEAN_ABLATION_STAGES, default="none",
+                        help="Controlled clean-backbone ablation stage; separates paper ablations from clean_plus history")
     parser.add_argument("--backbone-stage", type=int, choices=[2, 3, 4], default=None,
                         help="Last ResNet stage used by modality backbones; clean_plus_v4 defaults to 3")
     parser.add_argument("--clean-cross-attn", action="store_true",
@@ -1264,18 +1286,53 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
     clean_plus_v13 = args.model_variant == "clean_plus_v13"
     clean_plus_v14 = args.model_variant == "clean_plus_v14"
     clean_plus_v15 = args.model_variant == "clean_plus_v15"
+    clean_ablation_stage = args.clean_ablation_stage
+    clean_ablation_idx = clean_ablation_level(clean_ablation_stage)
+    clean_ablation_enabled = clean_ablation_idx >= 0
+    if clean_ablation_enabled and args.model_variant != "bemamba":
+        raise ValueError("--clean-ablation-stage must be used with --model-variant bemamba")
+    if clean_ablation_enabled and args.backbone_stage not in (None, 3):
+        raise ValueError("--clean-ablation-stage fixes --backbone-stage to 3")
+    if clean_ablation_enabled and args.clean_cross_attn:
+        raise ValueError("--clean-cross-attn is not part of controlled clean ablations")
+    if clean_ablation_enabled and args.spatial_mixer_layers not in (None, 0):
+        raise ValueError("--spatial-mixer-layers must be 0 for controlled clean ablations")
+    if clean_ablation_enabled and (args.order_gate or args.attn_head or args.branch_ensemble):
+        raise ValueError("Do not mix --clean-ablation-stage with manual clean module switches")
+    if clean_ablation_enabled and args.difficulty_curriculum:
+        raise ValueError("--difficulty-curriculum is not part of controlled clean ablations")
+    ablation_order_gate = clean_ablation_idx >= clean_ablation_level("order_gate")
+    ablation_attn_head = clean_ablation_idx >= clean_ablation_level("attn_head")
+    ablation_branch = clean_ablation_idx >= clean_ablation_level("branch")
+    ablation_beam_query = clean_ablation_idx >= clean_ablation_level("beam_query")
+    ablation_neighbor = clean_ablation_idx >= clean_ablation_level("neighbor")
+    ablation_rerank = clean_ablation_idx >= clean_ablation_level("rerank")
+    ablation_modality_dropout = clean_ablation_idx >= clean_ablation_level("modality_dropout")
+    if clean_ablation_enabled:
+        if args.rank_margin_weight is not None and not ablation_beam_query:
+            raise ValueError("--rank-margin-weight is only valid from clean stage beam_query onward")
+        if args.candidate_rerank_weight is not None and not ablation_rerank:
+            raise ValueError("--candidate-rerank-weight is only valid from clean stage rerank onward")
+        if args.modality_feature_dropout is not None and not ablation_modality_dropout:
+            raise ValueError("--modality-feature-dropout is only valid at clean stage modality_dropout")
+        if args.power_anchor_weight not in (None, 0.0):
+            raise ValueError("--power-anchor-weight is not part of controlled clean ablations")
+        if args.top3_candidate_margin_weight not in (None, 0.0):
+            raise ValueError("--top3-candidate-margin-weight is not part of controlled clean ablations")
+        if args.candidate_embed_dropout not in (None, 0.0):
+            raise ValueError("--candidate-embed-dropout is not part of controlled clean ablations")
     backbone_stage = args.backbone_stage
     if backbone_stage is None:
-        backbone_stage = 3 if (clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15) else 2
+        backbone_stage = 3 if (clean_ablation_enabled or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15) else 2
     spatial_mixer_layers = args.spatial_mixer_layers
     if spatial_mixer_layers is None:
         spatial_mixer_layers = 1 if clean_plus else 0
     if spatial_mixer_layers < 0:
         raise ValueError("--spatial-mixer-layers must be >= 0")
     clean_cross_attn = args.clean_cross_attn or clean_plus
-    use_order_gate = args.order_gate or clean_plus
-    use_attn_head = args.attn_head or clean_plus
-    use_branch_ensemble = args.branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15
+    use_order_gate = args.order_gate or clean_plus or ablation_order_gate
+    use_attn_head = args.attn_head or clean_plus or ablation_attn_head
+    use_branch_ensemble = args.branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15 or ablation_branch
     aux_loss_weight = args.aux_loss_weight
     if aux_loss_weight is None:
         aux_loss_weight = 0.25 if clean_plus_v3 else 0.0
@@ -1283,7 +1340,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         raise ValueError("--aux-loss-weight must be >= 0")
     rank_margin_weight = args.rank_margin_weight
     if rank_margin_weight is None:
-        rank_margin_weight = 0.05 if (clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15) else 0.0
+        rank_margin_weight = 0.05 if (ablation_beam_query or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15) else 0.0
     if rank_margin_weight < 0:
         raise ValueError("--rank-margin-weight must be >= 0")
     if args.rank_margin < 0:
@@ -1292,7 +1349,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         raise ValueError("--rank-topk must be >= 1")
     candidate_rerank_weight = args.candidate_rerank_weight
     if candidate_rerank_weight is None:
-        candidate_rerank_weight = 0.03 if clean_plus_v13 else (0.05 if (clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v14 or clean_plus_v15) else 0.0)
+        candidate_rerank_weight = 0.03 if clean_plus_v13 else (0.05 if (ablation_rerank or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v14 or clean_plus_v15) else 0.0)
     if candidate_rerank_weight < 0:
         raise ValueError("--candidate-rerank-weight must be >= 0")
     if args.candidate_rerank_topk < 3:
@@ -1317,7 +1374,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         raise ValueError("--power-anchor-temperature must be > 0")
     modality_feature_dropout = args.modality_feature_dropout
     if modality_feature_dropout is None:
-        modality_feature_dropout = 0.10 if (clean_plus_v14 or clean_plus_v15) else 0.0
+        modality_feature_dropout = 0.10 if (ablation_modality_dropout or clean_plus_v14 or clean_plus_v15) else 0.0
     if modality_feature_dropout < 0 or modality_feature_dropout >= 1:
         raise ValueError("--modality-feature-dropout must be in [0, 1)")
     top3_candidate_margin_weight = args.top3_candidate_margin_weight
@@ -1390,6 +1447,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         use_cross_attn=not args.no_cross_attn,
         use_reliability=not args.no_reliability,
         model_variant=args.model_variant,
+        clean_ablation_stage=clean_ablation_stage,
         clean_cross_attn=clean_cross_attn,
         spatial_mixer_layers=spatial_mixer_layers,
         use_order_gate=use_order_gate,
@@ -1443,14 +1501,14 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         use_order_gate=use_order_gate,
         use_attn_head=use_attn_head,
         use_branch_ensemble=use_branch_ensemble,
-        use_beam_query_head=clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15,
+        use_beam_query_head=ablation_beam_query or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15,
         use_multiscale_backbone=clean_plus_v6,
         use_ordinal_head=clean_plus_v7,
         use_temporal_attn_pool=clean_plus_v8,
-        use_beam_neighbor_head=clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15,
-        use_candidate_reranker=clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15,
+        use_beam_neighbor_head=ablation_neighbor or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15,
+        use_candidate_reranker=ablation_rerank or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15,
         use_bounded_candidate_reranker=clean_plus_v12,
-        use_modality_feature_dropout=clean_plus_v14 or clean_plus_v15 or modality_feature_dropout > 0,
+        use_modality_feature_dropout=ablation_modality_dropout or clean_plus_v14 or clean_plus_v15 or modality_feature_dropout > 0,
         modality_feature_dropout=modality_feature_dropout,
         candidate_topk=args.candidate_rerank_topk,
         candidate_delta_bound=args.candidate_rerank_delta_bound,

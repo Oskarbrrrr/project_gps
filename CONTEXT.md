@@ -12,13 +12,141 @@ _Avoid_: clean reproduction, baseline tuning, paper reproduction
 The paper's own complete-input baseline built on the reproduced BeMamba pipeline and allowed to include clearly stated clean-data structural improvements.
 _Avoid_: Paper Baseline, unmodified BeMamba, robustness method
 
+**最小 BeMamba 基线**:
+The smallest BeMamba-style reproduction baseline used for architecture ablations: ResNet/GPS projection, Temporal Mamba, three-order MBMamba fusion, and a plain MLP classifier.
+_Avoid_: Baseline-0, single-order baseline, clean-plus backbone
+
 **Clean Backbone**:
 The strong complete-input main model that provides clean Top-3 beam prediction ability before missing-aware robustness modules are added; it does not claim missing-input robustness by itself.
 _Avoid_: ResNet-only backbone, DMAF, missing-aware module
 
+**干净骨干精炼**:
+The clean-data ablation line that identifies which complete-input scoring, fusion, beam-refinement, and regularization modules should be kept inside the Clean Backbone.
+_Avoid_: third final method, DMAF, missing-aware robustness module
+
+**两项主创新**:
+论文最终叙事中的创新组织方式，将贡献归纳为干净骨干精炼和动态掩码自适应融合两部分。
+_Avoid_: 三个主方法, clean 冲分作为独立最终方法, 模块堆叠叙事
+
+**两层结构图**:
+论文方法图的组织方式，上层表达干净骨干如何形成完整输入预测能力，下层表达动态掩码自适应融合如何赋予缺失输入鲁棒性。
+_Avoid_: 全模块大杂烩图, 单层堆叠图, clean 冲分和鲁棒模块平铺
+
+**四张核心实验表**:
+论文主实验的表格组织方式，依次覆盖干净骨干前向消融、最终干净骨干三场景验证、动态掩码自适应融合鲁棒主结果和鲁棒模块消融。
+_Avoid_: 单张大表, 模块和鲁棒结果混表, 只报最终模型
+
+**干净消融主表指标**:
+干净骨干精炼前向消融表的指标范围，只围绕验证集 Top-3、测试集 Top-3、Top-3 增量和是否入选来呈现。
+_Avoid_: Top-1 主表决策, DBA 主表决策, 辅助指标挤占主表
+
+**干净骨干主结果指标**:
+最终干净骨干三场景验证表的指标范围，以 SC32、SC33、SC34 的 Top-3 Accuracy 和平均 Top-3 作为主呈现。
+_Avoid_: 单场景主结果, 辅助指标主结果, 历史探索口径混入严格主表
+
+**受控干净消融版本**:
+干净骨干精炼中为论文消融专门定义的模型版本，每个版本只新增一个预先命名的功能组，避免复用历史 clean_plus 版本造成模块耦合。
+_Avoid_: 历史版本代替消融, 多模块同时变化, test-select 版本筛选
+
+**受控消融入口**:
+用于选择受控干净消融版本的训练配置入口，使论文消融和历史 clean_plus 探索版本分离。
+_Avoid_: 复用 model_variant 表示论文消融, 手动组合零散开关
+
+**前向加入消融**:
+一种干净骨干精炼实验方式，从最小 BeMamba 基线开始按顺序加入候选模块，用来判断每一步是否带来主指标收益。
+_Avoid_: 随机堆模块, 只报最终模型
+
+**累积式前向加入**:
+前向加入消融的默认阶段语义，每个阶段继承之前阶段已经加入的功能组，并且只新增当前阶段对应的功能组。
+_Avoid_: 单模块开关, 非累积模块测试, 随机组合搜索
+
+**筛选式前向加入**:
+干净骨干精炼中的前向实验规则，按预设顺序测试功能组，但只有满足 Top-3 去留规则的功能组才进入后续当前最佳干净骨干。
+_Avoid_: 失败模块继续堆叠, 全模块强制累积, 只报成功模块
+
+**固定骨干容量**:
+受控干净消融中的公平性约束，主消融表固定同一档 ResNet 特征输出层级，只比较干净骨干精炼功能组。
+_Avoid_: stage 混合消融, 容量和模块同时变化, backbone 搜索
+
+**固定主损失**:
+受控干净消融中的训练目标约束，所有阶段保持同一个主分类损失，只有当对应功能组加入时才启用其必要辅助损失。
+_Avoid_: 每阶段更换主损失, curriculum 主消融, loss-first 替代结构消融
+
+**最终移除验证**:
+一种干净骨干精炼实验方式，在最终干净骨干上逐个移除关键模块，用来验证该模块在完整组合中仍然有贡献。
+_Avoid_: 单独模块测试, 重新搜索结构
+
+**入选模块移除验证**:
+最终移除验证的范围约束，只对通过筛选式前向加入并进入最终干净骨干的功能组做移除实验。
+_Avoid_: 移除失败模块, 全模块移除表, 补充负结果重复验证
+
+**顺序融合增强**:
+干净骨干精炼中的融合模块组，用自适应门控为三种模态顺序的 MBMamba 输出分配权重。
+_Avoid_: 单顺序替代, 缺失鲁棒融合
+
+**预测头增强**:
+干净骨干精炼中的分类头模块组，用注意力式预测头替代普通 MLP 预测头以增强融合 token 的读出能力。
+_Avoid_: 波束重排, 分支集成
+
+**分支监督增强**:
+干净骨干精炼中的多分支输出模块组，利用融合分支和各模态分支的互补 logits 改善完整输入预测。
+_Avoid_: 模型集成, 两阶段重排
+
+**波束查询增强**:
+干净骨干精炼中的波束感知模块组，让每个候选波束从融合 token 中取证并细化 logits。
+_Avoid_: 候选重排, 普通分类头
+
+**波束邻域增强**:
+干净骨干精炼中的局部波束结构模块组，利用相邻 beam 的物理邻近关系进行 logits 校准。
+_Avoid_: 标签平滑, 序关系先验
+
+**候选重排增强**:
+干净骨干精炼中的 Top-K 排名模块组，只在模型自身高置信候选集合内部调整排序，目标是把可恢复错误推入 Top-3。
+_Avoid_: 两阶段模型, 全类别重分类
+
+**训练期模态正则**:
+干净骨干精炼中的训练期正则模块组，在完整输入训练时随机抑制 latent 模态流以缓解 clean 过拟合。
+_Avoid_: 缺失增强, 测试时传感器缺失
+
 **DMAF**:
 The missing-aware robustness line that uses explicit availability masks to adapt multimodal fusion under incomplete sensor input.
 _Avoid_: clean-plus, ordinary augmentation
+
+**单基座鲁棒消融**:
+动态掩码自适应融合的鲁棒性消融方式，所有缺失增强和缺失感知模块都接在同一个最终干净骨干上比较。
+_Avoid_: 双基座消融, 最小基线鲁棒消融, 混合骨干对比
+
+**缺失增强鲁棒基线**:
+单基座鲁棒消融的起点，在最终干净骨干上加入训练期缺失模拟，但不使用显式缺失感知融合模块。
+_Avoid_: 原始 BeMamba 缺失增强, 动态掩码自适应融合, 最小基线鲁棒起点
+
+**掩码时序聚合**:
+动态掩码自适应融合中的帧级聚合机制，使用可用性 mask 对时序特征进行加权汇总。
+_Avoid_: 掩码编码器, 缺失增强, 普通时间求和
+
+**掩码编码器**:
+动态掩码自适应融合中的显式状态编码模块，把每个时间点或模态的缺失/存在状态注入到特征表示中。
+_Avoid_: 掩码时序聚合, 可靠性估计器
+
+**固定缺失增强策略**:
+单基座鲁棒消融中的公平性约束，所有对比行使用相同的训练期缺失模拟设置，只改变模型侧缺失感知模块。
+_Avoid_: 缺失强度搜索, 混合训练协议, 每行不同缺失配置
+
+**鲁棒评估协议**:
+动态掩码自适应融合的缺失输入评估范围，包含完整输入、随机帧缺失、连续帧缺失、整模态缺失和混合缺失。
+_Avoid_: 单一缺失测试, 只报完整输入, 只报最优缺失场景
+
+**鲁棒主结果指标**:
+动态掩码自适应融合主结果表的指标范围，对原始基线、最终干净骨干、缺失增强鲁棒基线和完整鲁棒模型在五类鲁棒评估协议下报告 Top-3 Accuracy。
+_Avoid_: 只报保持率, 只报最优缺失场景, 缺失增强和显式鲁棒模块混为一谈
+
+**鲁棒模块移除验证**:
+动态掩码自适应融合的最终移除实验，在完整鲁棒模型上逐个移除入选缺失感知模块以验证其组合内贡献。
+_Avoid_: 干净骨干移除验证, 移除未入选鲁棒模块, 重新搜索缺失策略
+
+**SC32 鲁棒模块消融**:
+动态掩码自适应融合中用于判断缺失感知模块贡献的主文消融范围，优先在 SC32 上覆盖完整五类鲁棒评估协议。
+_Avoid_: 三场景全量鲁棒模块消融, 只报最终鲁棒模型, 缺失协议筛选
 
 **Missing-Aug**:
 Training-time simulation of missing sensor data without requiring the model to consume explicit mask-aware fusion modules.
@@ -132,9 +260,29 @@ _Avoid_: multi-scenario sweep, seed validation, simultaneous structure changes
 Top-3 Accuracy is the single primary metric for clean-data model-structure optimization and paper-facing comparison.
 _Avoid_: composite score, Top-1-first tuning, DBA-first tuning
 
+**严格论文口径**:
+使用验证集选择 checkpoint，并且只在最终报告时使用测试集的完整输入评估协议。
+_Avoid_: test-select, 探索口径, held-out 直接报最好点
+
+**SC32 模块筛选**:
+干净骨干精炼中用于判断候选模块去留的单场景消融范围，优先使用 SC32 的严格论文口径结果。
+_Avoid_: 三场景全量模块搜索, seed sweep
+
+**Top-3 去留规则**:
+干净骨干精炼中决定候选模块是否进入最终干净骨干的规则，只以严格论文口径下的 Top-3 Accuracy 作为主判断。
+_Avoid_: Top-1 决策, DBA 决策, 辅助指标替代主指标
+
+**三场景骨干验证**:
+最终干净骨干在 SC32、SC33、SC34 上的跨场景完整输入验证，用来证明入选骨干不是单场景偶然结果。
+_Avoid_: 模块筛选, 探索口径复盘
+
 **Paper-Facing Checkpoint Selection**:
 The reporting protocol where a validation split selects the checkpoint and the test split is used only for final measurement.
 _Avoid_: test-set early stopping, leaderboard-style checkpoint picking, seed validation
+
+**Paper-Reported Validation Result**:
+The original-paper style result when the held-out 20% split is called validation/evaluation and reported directly, without a clearly separate final test split.
+_Avoid_: paper-safe test result, three-way validation protocol, final hidden test
 
 **Paper-Aligned Sequence Order**:
 The reproduction-audit sequence convention that follows the original BeMamba order assumptions before adding Clean-Plus changes.
