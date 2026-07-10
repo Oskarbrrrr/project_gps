@@ -33,6 +33,7 @@ MODEL_VARIANTS = [
     "clean_plus_v12",
     "clean_plus_v13",
     "clean_plus_v14",
+    "clean_plus_v15",
 ]
 
 
@@ -46,6 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scenario", default="scenario32")
     parser.add_argument("--image-subdir", default="camera_data_mask")
     parser.add_argument("--lidar-representation", choices=["binary", "count"], default="count")
+    parser.add_argument("--gps-feature-mode", choices=["bemamba", "physical_kinematic"], default="bemamba")
+    parser.add_argument("--gps-future-steps", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=48)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--device", default="cuda")
@@ -96,6 +99,8 @@ def build_gps_stats(args: argparse.Namespace) -> dict:
         csv_path=train_csv_path,
         image_subdir=args.image_subdir,
         lidar_representation=args.lidar_representation,
+        gps_feature_mode=args.gps_feature_mode,
+        gps_future_steps=args.gps_future_steps,
     )
     return train_ds.get_gps_stats()
 
@@ -377,6 +382,8 @@ def main() -> None:
         image_subdir=args.image_subdir,
         gps_stats=gps_stats,
         lidar_representation=args.lidar_representation,
+        gps_feature_mode=args.gps_feature_mode,
+        gps_future_steps=args.gps_future_steps,
     )
     train_config = TrainConfig(
         batch_size=args.batch_size,

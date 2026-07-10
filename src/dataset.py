@@ -49,12 +49,20 @@ class MultimodalDataset(Dataset):
         missing_modalities=None,
         missing_seed=42,
         image_aug=False,
+        gps_feature_mode="bemamba",
+        gps_future_steps=3,
     ):
         self.data_dir = data_root
         self.mode = mode
         self.image_subdir = image_subdir
         self.image_aug = bool(image_aug)
         self.gps_stats = gps_stats
+        self.gps_feature_mode = str(gps_feature_mode)
+        if self.gps_feature_mode not in ("bemamba", "physical_kinematic"):
+            raise ValueError(f"Unsupported gps_feature_mode: {self.gps_feature_mode}")
+        self.gps_future_steps = int(gps_future_steps)
+        if self.gps_future_steps < 0:
+            raise ValueError("gps_future_steps must be >= 0")
         self.lidar_representation = lidar_representation
         self.lidar_grid_size = int(lidar_grid_size)
         self.lidar_x_range = tuple(lidar_x_range)
@@ -216,30 +224,87 @@ class MultimodalDataset(Dataset):
             self.max_dx = float(self.gps_stats["max_dx"])
             self.min_dy = float(self.gps_stats["min_dy"])
             self.max_dy = float(self.gps_stats["max_dy"])
+            if self.gps_feature_mode == "physical_kinematic":
+                required = (
+                    "mean_dx", "std_dx", "mean_dy", "std_dy", "mean_r", "std_r",
+                    "mean_vx", "std_vx", "mean_vy", "std_vy", "mean_speed", "std_speed",
+                )
+                missing = [key for key in required if key not in self.gps_stats]
+                if missing:
+                    raise ValueError(
+                        "physical_kinematic GPS requires train-derived statistics: "
+                        + ", ".join(missing)
+                    )
+                for key in required:
+                    setattr(self, key, float(self.gps_stats[key]))
             return
 
-        all_dx, all_dy = [], []
+        all_dx, all_dy, all_r = [], [], []
+        all_vx, all_vy, all_speed = [], [], []
         for idx in range(len(self.df)):
             bs_lat, bs_lon = self._read_gps_raw(self.df.iloc[idx]["unit1_loc"])
-            ue_lat, ue_lon = self._read_gps_raw(self.df.iloc[idx]["unit2_loc_1"])
-            if bs_lat != 0.0:
-                dx = (ue_lon - bs_lon) * 111320 * np.cos(np.radians(bs_lat))
-                dy = (ue_lat - bs_lat) * 111320
-                all_dx.append(dx)
-                all_dy.append(dy)
+            ue1_lat, ue1_lon = self._read_gps_raw(self.df.iloc[idx]["unit2_loc_1"])
+            ue2_lat, ue2_lon = self._read_gps_raw(self.df.iloc[idx]["unit2_loc_2"])
+            if bs_lat == 0.0:
+                continue
+            dx1, dy1 = self._relative_xy_m(bs_lat, bs_lon, ue1_lat, ue1_lon)
+            dx2, dy2 = self._relative_xy_m(bs_lat, bs_lon, ue2_lat, ue2_lon)
+            # Keep legacy min/max based on loc_1 for the default BeMamba mode.
+            all_dx.append(dx1)
+            all_dy.append(dy1)
+            if self.gps_feature_mode == "physical_kinematic":
+                all_dx.append(dx2)
+                all_dy.append(dy2)
+                all_r.extend((np.hypot(dx1, dy1), np.hypot(dx2, dy2)))
+                vx, vy = dx2 - dx1, dy2 - dy1
+                all_vx.append(vx)
+                all_vy.append(vy)
+                all_speed.append(np.hypot(vx, vy))
         if all_dx:
             self.min_dx, self.max_dx = np.min(all_dx), np.max(all_dx)
             self.min_dy, self.max_dy = np.min(all_dy), np.max(all_dy)
         else:
             self.min_dx, self.max_dx, self.min_dy, self.max_dy = 0, 1, 0, 1
+        if self.gps_feature_mode == "physical_kinematic":
+            self.mean_dx, self.std_dx = self._mean_std(all_dx)
+            self.mean_dy, self.std_dy = self._mean_std(all_dy)
+            self.mean_r, self.std_r = self._mean_std(all_r)
+            self.mean_vx, self.std_vx = self._mean_std(all_vx)
+            self.mean_vy, self.std_vy = self._mean_std(all_vy)
+            self.mean_speed, self.std_speed = self._mean_std(all_speed)
 
     def get_gps_stats(self):
-        return {
+        stats = {
             "min_dx": float(self.min_dx),
             "max_dx": float(self.max_dx),
             "min_dy": float(self.min_dy),
             "max_dy": float(self.max_dy),
         }
+        if self.gps_feature_mode == "physical_kinematic":
+            for key in (
+                "mean_dx", "std_dx", "mean_dy", "std_dy", "mean_r", "std_r",
+                "mean_vx", "std_vx", "mean_vy", "std_vy", "mean_speed", "std_speed",
+            ):
+                stats[key] = float(getattr(self, key))
+        return stats
+
+    @staticmethod
+    def _mean_std(values):
+        if not values:
+            return 0.0, 1.0
+        mean = float(np.mean(values))
+        std = float(np.std(values))
+        return mean, max(std, 1e-6)
+
+    @staticmethod
+    def _relative_xy_m(bs_lat, bs_lon, ue_lat, ue_lon):
+        dx = (ue_lon - bs_lon) * 111320 * np.cos(np.radians(bs_lat))
+        dy = (ue_lat - bs_lat) * 111320
+        return float(dx), float(dy)
+
+    @staticmethod
+    def _zscore(value, mean, std):
+        return (float(value) - float(mean)) / max(float(std), 1e-6)
 
     def _read_gps_raw(self, rel_path):
         try:
@@ -250,13 +315,50 @@ class MultimodalDataset(Dataset):
             return 0.0, 0.0
 
     def _calc_gps_bemamba_eq1(self, bs_lat, bs_lon, ue_lat, ue_lon):
-        dx = (ue_lon - bs_lon) * 111320 * np.cos(np.radians(bs_lat))
-        dy = (ue_lat - bs_lat) * 111320
+        dx, dy = self._relative_xy_m(bs_lat, bs_lon, ue_lat, ue_lon)
         dx_norm = (dx - self.min_dx) / (self.max_dx - self.min_dx + 1e-8)
         dy_norm = (dy - self.min_dy) / (self.max_dy - self.min_dy + 1e-8)
         dist = np.sqrt(dx_norm**2 + dy_norm**2)
         angle = np.arctan2(dy_norm, dx_norm)
         return [dist, angle]
+
+    def _calc_gps_physical_kinematic(self, bs_lat, bs_lon, ue1_lat, ue1_lon, ue2_lat, ue2_lon):
+        x1, y1 = self._relative_xy_m(bs_lat, bs_lon, ue1_lat, ue1_lon)
+        x2, y2 = self._relative_xy_m(bs_lat, bs_lon, ue2_lat, ue2_lon)
+        vx, vy = x2 - x1, y2 - y1
+        speed = np.hypot(vx, vy)
+        heading = np.arctan2(vy, vx) if speed > 1e-8 else 0.0
+
+        future_x = x2 + self.gps_future_steps * vx
+        future_y = y2 + self.gps_future_steps * vy
+        future_r = np.hypot(future_x, future_y)
+        future_theta = np.arctan2(future_y, future_x)
+        shared = [
+            self._zscore(vx, self.mean_vx, self.std_vx),
+            self._zscore(vy, self.mean_vy, self.std_vy),
+            self._zscore(speed, self.mean_speed, self.std_speed),
+            np.sin(heading),
+            np.cos(heading),
+            self._zscore(future_x, self.mean_dx, self.std_dx),
+            self._zscore(future_y, self.mean_dy, self.std_dy),
+            self._zscore(future_r, self.mean_r, self.std_r),
+            np.sin(future_theta),
+            np.cos(future_theta),
+        ]
+
+        features = []
+        for x, y in ((x1, y1), (x2, y2)):
+            radius = np.hypot(x, y)
+            theta = np.arctan2(y, x)
+            local = [
+                self._zscore(x, self.mean_dx, self.std_dx),
+                self._zscore(y, self.mean_dy, self.std_dy),
+                self._zscore(radius, self.mean_r, self.std_r),
+                np.sin(theta),
+                np.cos(theta),
+            ]
+            features.append(local + shared)
+        return features
 
     def _read_power(self, rel_path):
         try:
@@ -601,9 +703,15 @@ class MultimodalDataset(Dataset):
         bs_lat, bs_lon = self._read_gps_raw(row["unit1_loc"])
         u1_lat, u1_lon = self._read_gps_raw(row["unit2_loc_1"])
         u2_lat, u2_lon = self._read_gps_raw(row["unit2_loc_2"])
-        gps_start = self._calc_gps_bemamba_eq1(bs_lat, bs_lon, u1_lat, u1_lon)
-        gps_end = self._calc_gps_bemamba_eq1(bs_lat, bs_lon, u2_lat, u2_lon)
-        gps = torch.tensor([gps_start, gps_end], dtype=torch.float32)
+        if self.gps_feature_mode == "physical_kinematic":
+            gps_features = self._calc_gps_physical_kinematic(
+                bs_lat, bs_lon, u1_lat, u1_lon, u2_lat, u2_lon
+            )
+        else:
+            gps_start = self._calc_gps_bemamba_eq1(bs_lat, bs_lon, u1_lat, u1_lon)
+            gps_end = self._calc_gps_bemamba_eq1(bs_lat, bs_lon, u2_lat, u2_lon)
+            gps_features = [gps_start, gps_end]
+        gps = torch.tensor(gps_features, dtype=torch.float32)
 
         target = torch.tensor(int(row["unit1_beam"]) - 1, dtype=torch.long)
         power_vec = torch.tensor(self._read_power(row["unit1_pwr_60ghz"]), dtype=torch.float32)

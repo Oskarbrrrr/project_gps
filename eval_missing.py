@@ -24,6 +24,8 @@ def parse_args():
     parser.add_argument("--scenario", default="scenario32")
     parser.add_argument("--image-subdir", default="camera_data_mask")
     parser.add_argument("--lidar-representation", choices=["binary", "count"], default="count")
+    parser.add_argument("--gps-feature-mode", choices=["bemamba", "physical_kinematic"], default="bemamba")
+    parser.add_argument("--gps-future-steps", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=48)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--loss", choices=["ce", "focal", "power_soft_ce"], default="power_soft_ce")
@@ -65,7 +67,7 @@ def parse_args():
     parser.add_argument("--temporal-order", choices=["forward", "reverse"], default="forward")
     parser.add_argument("--spatial-scan", choices=["vertical", "row"], default="vertical")
     parser.add_argument("--dropout", type=float, default=0.25)
-    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7", "clean_plus_v8", "clean_plus_v9", "clean_plus_v10", "clean_plus_v11", "clean_plus_v12", "clean_plus_v13", "clean_plus_v14"], default="bemamba")
+    parser.add_argument("--model-variant", choices=["bemamba", "clean_plus", "clean_plus_v2", "clean_plus_v3", "clean_plus_v4", "clean_plus_v5", "clean_plus_v6", "clean_plus_v7", "clean_plus_v8", "clean_plus_v9", "clean_plus_v10", "clean_plus_v11", "clean_plus_v12", "clean_plus_v13", "clean_plus_v14", "clean_plus_v15"], default="bemamba")
     parser.add_argument("--backbone-stage", type=int, choices=[2, 3, 4], default=None)
     parser.add_argument("--clean-cross-attn", action="store_true")
     parser.add_argument("--spatial-mixer-layers", type=int, default=None)
@@ -95,9 +97,10 @@ def main():
     clean_plus_v12 = args.model_variant == "clean_plus_v12"
     clean_plus_v13 = args.model_variant == "clean_plus_v13"
     clean_plus_v14 = args.model_variant == "clean_plus_v14"
+    clean_plus_v15 = args.model_variant == "clean_plus_v15"
     backbone_stage = args.backbone_stage
     if backbone_stage is None:
-        backbone_stage = 3 if (clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14) else 2
+        backbone_stage = 3 if (clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15) else 2
     spatial_mixer_layers = args.spatial_mixer_layers
     if spatial_mixer_layers is None:
         spatial_mixer_layers = 1 if clean_plus else 0
@@ -106,7 +109,7 @@ def main():
     clean_cross_attn = args.clean_cross_attn or clean_plus
     use_order_gate = args.order_gate or clean_plus
     use_attn_head = args.attn_head or clean_plus
-    use_branch_ensemble = args.branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14
+    use_branch_ensemble = args.branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15
 
     model_config = BeMambaConfig(
         d_model=args.d_model,
@@ -115,6 +118,7 @@ def main():
         temporal_order=args.temporal_order,
         spatial_scan=args.spatial_scan,
         dropout=args.dropout,
+        gps_input_dim=15 if args.gps_feature_mode == "physical_kinematic" else 2,
         backbone_stage=backbone_stage,
         missing_enabled=not args.no_dmaf,
         use_mask_embed=not args.no_mask_embed,
@@ -126,12 +130,12 @@ def main():
         use_order_gate=use_order_gate,
         use_attn_head=use_attn_head,
         use_branch_ensemble=use_branch_ensemble,
-        use_beam_query_head=clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14,
+        use_beam_query_head=clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15,
         use_multiscale_backbone=clean_plus_v6,
         use_ordinal_head=clean_plus_v7,
         use_temporal_attn_pool=clean_plus_v8,
-        use_beam_neighbor_head=clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14,
-        use_candidate_reranker=clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14,
+        use_beam_neighbor_head=clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15,
+        use_candidate_reranker=clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15,
         use_bounded_candidate_reranker=clean_plus_v12,
         candidate_topk=7,
         candidate_delta_bound=args.candidate_rerank_delta_bound,
@@ -144,6 +148,8 @@ def main():
         split_root=args.split_root,
         image_subdir=args.image_subdir,
         lidar_representation=args.lidar_representation,
+        gps_feature_mode=args.gps_feature_mode,
+        gps_future_steps=args.gps_future_steps,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         loss_name=args.loss,
@@ -181,6 +187,8 @@ def main():
         csv_path=train_csv_path,
         image_subdir=args.image_subdir,
         lidar_representation=args.lidar_representation,
+        gps_feature_mode=args.gps_feature_mode,
+        gps_future_steps=args.gps_future_steps,
     )
     gps_stats = temp_ds.get_gps_stats()
 
@@ -235,6 +243,8 @@ def main():
             image_subdir=args.image_subdir,
             gps_stats=gps_stats,
             lidar_representation=args.lidar_representation,
+            gps_feature_mode=args.gps_feature_mode,
+            gps_future_steps=args.gps_future_steps,
             missing_enabled=has_missing,
             return_missing_masks=(has_missing and not args.no_dmaf),
             missing_frame_prob=fp,

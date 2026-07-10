@@ -46,9 +46,12 @@ class TrainConfig:
     output_root: str = "./outputs"
     merge_train_val: bool = True
     selection_split: str = "test"
+    skip_final_test: bool = False
     image_subdir: str = "camera_data"
     image_aug: bool = False
     lidar_representation: str = "count"
+    gps_feature_mode: str = "bemamba"
+    gps_future_steps: int = 3
     scenarios: Tuple[str, ...] = ("scenario32", "scenario33", "scenario34")
     epochs: int = 30
     batch_size: int = 16
@@ -78,6 +81,7 @@ class TrainConfig:
     persistent_workers: bool = True
     log_every: int = 1
     save_every_epoch: bool = False
+    save_ema_every_epoch: bool = False
     device: str = "cuda"
     missing_enabled: bool = False
     missing_aug_enabled: bool = False
@@ -106,6 +110,9 @@ class TrainConfig:
     rank_margin_weight: float = 0.0
     rank_margin: float = 0.2
     rank_topk: int = 3
+    smooth_top3_weight: float = 0.0
+    smooth_top3_temperature: float = 0.2
+    smooth_top3_margin: float = 0.0
     candidate_rerank_weight: float = 0.0
     candidate_rerank_topk: int = 7
     candidate_rerank_temperature: float = 0.15
@@ -399,6 +406,9 @@ def run_epoch(
     rank_margin_weight: float = 0.0,
     rank_margin: float = 0.2,
     rank_topk: int = 3,
+    smooth_top3_weight: float = 0.0,
+    smooth_top3_temperature: float = 0.2,
+    smooth_top3_margin: float = 0.0,
     candidate_rerank_weight: float = 0.0,
     candidate_rerank_topk: int = 7,
     candidate_rerank_temperature: float = 0.15,
@@ -452,6 +462,15 @@ def run_epoch(
                             targets,
                             topk=rank_topk,
                             margin=rank_margin,
+                            sample_weights=sample_weights,
+                        )
+                    if training and smooth_top3_weight > 0:
+                        loss = loss + smooth_top3_weight * smooth_topk_boundary_loss(
+                            outputs,
+                            targets,
+                            topk=3,
+                            margin=smooth_top3_margin,
+                            temperature=smooth_top3_temperature,
                             sample_weights=sample_weights,
                         )
                     if training and candidate_rerank_weight > 0:
@@ -575,6 +594,31 @@ def topk_margin_loss(
     )
     kth_negative = negative_logits.topk(topk, dim=1).values[:, -1].detach()
     loss = nn.functional.relu(kth_negative + margin - target_logits)
+    return weighted_loss_mean(loss, sample_weights)
+
+
+def smooth_topk_boundary_loss(
+    outputs: torch.Tensor,
+    targets: torch.Tensor,
+    topk: int = 3,
+    margin: float = 0.0,
+    temperature: float = 0.2,
+    sample_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Smoothly place the target above the Top-k decision boundary.
+
+    Unlike ``topk_margin_loss``, the kth-negative logit is not detached, so the
+    loss can both raise the target and lower the competing boundary class.
+    """
+    if temperature <= 0:
+        raise ValueError("temperature must be > 0")
+    topk = min(max(int(topk), 1), outputs.size(1) - 1)
+    target_logits = outputs.gather(1, targets.unsqueeze(1)).squeeze(1)
+    target_mask = torch.zeros_like(outputs, dtype=torch.bool).scatter_(1, targets.unsqueeze(1), True)
+    negative_logits = outputs.masked_fill(target_mask, float("-inf"))
+    boundary_logits = negative_logits.topk(topk, dim=1).values[:, -1]
+    violation = (boundary_logits + margin - target_logits) / temperature
+    loss = nn.functional.softplus(violation) * temperature
     return weighted_loss_mean(loss, sample_weights)
 
 
@@ -719,6 +763,8 @@ def run_missing_robustness_tests(
             image_subdir=train_config.image_subdir,
             gps_stats=gps_stats,
             lidar_representation=train_config.lidar_representation,
+            gps_feature_mode=train_config.gps_feature_mode,
+            gps_future_steps=train_config.gps_future_steps,
             missing_enabled=has_missing,
             return_missing_masks=(has_missing and train_config.dmaf_enabled),
             missing_frame_prob=fp,
@@ -812,6 +858,8 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
         image_subdir=train_config.image_subdir,
         image_aug=train_config.image_aug,
         lidar_representation=train_config.lidar_representation,
+        gps_feature_mode=train_config.gps_feature_mode,
+        gps_future_steps=train_config.gps_future_steps,
         missing_enabled=train_config.missing_aug_enabled,
         return_missing_masks=(train_config.missing_aug_enabled and train_config.dmaf_enabled),
         missing_frame_prob=train_config.missing_frame_prob,
@@ -825,20 +873,23 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
         missing_seed=train_config.missing_seed,
     )
     gps_stats = train_ds.get_gps_stats()
-    test_ds = MultimodalDataset(
-        mode="test",
-        data_root=train_config.data_root,
-        split_root=train_config.split_root,
-        scenario_name=scenario_name,
-        csv_path=test_csv_path,
-        image_subdir=train_config.image_subdir,
-        gps_stats=gps_stats,
-        lidar_representation=train_config.lidar_representation,
-    )
-
     train_loader = build_dataloader(train_ds, train_config, shuffle=True)
-    test_loader = build_dataloader(test_ds, train_config, shuffle=False)
     selection_name = train_config.selection_split
+    test_loader = None
+    if selection_name == "test" or not train_config.skip_final_test:
+        test_ds = MultimodalDataset(
+            mode="test",
+            data_root=train_config.data_root,
+            split_root=train_config.split_root,
+            scenario_name=scenario_name,
+            csv_path=test_csv_path,
+            image_subdir=train_config.image_subdir,
+            gps_stats=gps_stats,
+            lidar_representation=train_config.lidar_representation,
+            gps_feature_mode=train_config.gps_feature_mode,
+            gps_future_steps=train_config.gps_future_steps,
+        )
+        test_loader = build_dataloader(test_ds, train_config, shuffle=False)
     if selection_name == "val":
         if not os.path.exists(val_csv_path):
             raise FileNotFoundError(
@@ -853,9 +904,12 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
             image_subdir=train_config.image_subdir,
             gps_stats=gps_stats,
             lidar_representation=train_config.lidar_representation,
+            gps_feature_mode=train_config.gps_feature_mode,
+            gps_future_steps=train_config.gps_future_steps,
         )
         selection_loader = build_dataloader(val_ds, train_config, shuffle=False)
     elif selection_name == "test":
+        assert test_loader is not None
         selection_loader = test_loader
     else:
         raise ValueError(f"Unsupported selection_split: {selection_name}")
@@ -927,6 +981,9 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
             rank_margin_weight=effective_rank_margin_weight,
             rank_margin=train_config.rank_margin,
             rank_topk=train_config.rank_topk,
+            smooth_top3_weight=train_config.smooth_top3_weight,
+            smooth_top3_temperature=train_config.smooth_top3_temperature,
+            smooth_top3_margin=train_config.smooth_top3_margin,
             candidate_rerank_weight=effective_candidate_rerank_weight,
             candidate_rerank_topk=train_config.candidate_rerank_topk,
             candidate_rerank_temperature=train_config.candidate_rerank_temperature,
@@ -1030,6 +1087,9 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
 
         if train_config.save_every_epoch:
             torch.save(model.state_dict(), os.path.join(checkpoints_dir, f"epoch_{epoch:03d}.pth"))
+        if train_config.save_ema_every_epoch and ema is not None:
+            ema_state = {key: value.detach().cpu().clone() for key, value in ema.shadow.items()}
+            torch.save(ema_state, os.path.join(checkpoints_dir, f"ema_epoch_{epoch:03d}.pth"))
 
         if train_config.patience > 0 and epochs_without_improvement >= train_config.patience:
             print(
@@ -1056,6 +1116,41 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
         best_metric_value = best_selection_metrics[train_config.early_stop_metric]
         torch.save(model.state_dict(), best_ckpt_path)
 
+    if final_selection_metrics is not None:
+        last_result_path = os.path.join(run_dir, "last_epoch_result.txt")
+        last_result_text = (
+            f"[Last Epoch {selection_name} Results for {scenario_name}]\n"
+            f"epoch: {epoch}\n"
+            f"top1_acc: {final_selection_metrics['acc1']:.2f}%\n"
+            f"top2_acc: {final_selection_metrics['acc2']:.2f}%\n"
+            f"top3_acc: {final_selection_metrics['acc3']:.2f}%\n"
+            f"dba: {final_selection_metrics['dba']:.4f}\n"
+            f"apl: {final_selection_metrics['apl']:.4f} dB\n"
+        )
+        with open(last_result_path, "w", encoding="utf-8") as handle:
+            handle.write(last_result_text)
+
+    best_selection_path = os.path.join(run_dir, "best_selection_result.txt")
+    best_selection_text = (
+        f"[Best {selection_name} Results for {scenario_name}]\n"
+        f"best_epoch: {best_epoch}\n"
+        f"monitor_metric: {train_config.early_stop_metric}\n"
+        f"monitor_value: {best_metric_value:.4f}\n"
+        f"top1_acc: {best_selection_metrics['acc1']:.2f}%\n"
+        f"top2_acc: {best_selection_metrics['acc2']:.2f}%\n"
+        f"top3_acc: {best_selection_metrics['acc3']:.2f}%\n"
+        f"dba: {best_selection_metrics['dba']:.4f}\n"
+        f"apl: {best_selection_metrics['apl']:.4f} dB\n"
+    )
+    with open(best_selection_path, "w", encoding="utf-8") as handle:
+        handle.write(best_selection_text)
+
+    if train_config.skip_final_test:
+        print("\n" + best_selection_text)
+        print("Final test evaluation skipped by --skip-final-test.")
+        return
+
+    assert test_loader is not None
     load_checkpoint(model, best_ckpt_path, device)
     test_metrics = run_epoch(
         model=model,
@@ -1097,21 +1192,6 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
             run_dir=run_dir,
         )
 
-    if final_selection_metrics is not None:
-        last_result_path = os.path.join(run_dir, "last_epoch_result.txt")
-        last_result_text = (
-            f"[Last Epoch {selection_name} Results for {scenario_name}]\n"
-            f"epoch: {epoch}\n"
-            f"top1_acc: {final_selection_metrics['acc1']:.2f}%\n"
-            f"top2_acc: {final_selection_metrics['acc2']:.2f}%\n"
-            f"top3_acc: {final_selection_metrics['acc3']:.2f}%\n"
-            f"dba: {final_selection_metrics['dba']:.4f}\n"
-            f"apl: {final_selection_metrics['apl']:.4f} dB\n"
-        )
-        with open(last_result_path, "w", encoding="utf-8") as handle:
-            handle.write(last_result_text)
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train BeMamba reproduction experiments.")
     parser.add_argument("--data-root", default="./Data/Multi_Modal")
@@ -1120,10 +1200,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-merge-trainval", action="store_true")
     parser.add_argument("--selection-split", choices=["test", "val"], default="test",
                         help="Split used for checkpoint selection/early stopping; use val for paper-facing runs")
+    parser.add_argument("--skip-final-test", action="store_true",
+                        help="Run val-only development without constructing or evaluating the final test split")
     parser.add_argument("--image-subdir", default="camera_data")
     parser.add_argument("--image-aug", action="store_true",
                         help="Use light train-only image augmentation for clean-data regularization")
     parser.add_argument("--lidar-representation", choices=["binary", "count"], default="count")
+    parser.add_argument("--gps-feature-mode", choices=["bemamba", "physical_kinematic"], default="bemamba",
+                        help="GPS representation; physical_kinematic adds metric position, motion and extrapolation")
+    parser.add_argument("--gps-future-steps", type=int, default=3,
+                        help="Linear-extrapolation steps used by physical_kinematic GPS")
     parser.add_argument("--scenarios", nargs="+", default=["scenario32", "scenario33", "scenario34"])
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -1156,6 +1242,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-pin-memory", action="store_true")
     parser.add_argument("--no-persistent-workers", action="store_true")
     parser.add_argument("--save-every-epoch", action="store_true")
+    parser.add_argument("--save-ema-every-epoch", action="store_true",
+                        help="Save true EMA weights as ema_epoch_XXX.pth after each EMA epoch")
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--d-state", type=int, default=16)
     parser.add_argument("--d-conv", type=int, default=4)
@@ -1193,6 +1281,12 @@ def parse_args() -> argparse.Namespace:
                         help="Margin used by the Top-k ranking loss")
     parser.add_argument("--rank-topk", type=int, default=3,
                         help="Top-k target for the ranking margin loss")
+    parser.add_argument("--smooth-top3-weight", type=float, default=0.0,
+                        help="Weight for the bidirectional smooth Top-3 boundary loss")
+    parser.add_argument("--smooth-top3-temperature", type=float, default=0.2,
+                        help="Softplus temperature for the smooth Top-3 boundary loss")
+    parser.add_argument("--smooth-top3-margin", type=float, default=0.0,
+                        help="Margin above the third-negative boundary for smooth Top-3 loss")
     parser.add_argument("--candidate-rerank-weight", type=float, default=None,
                         help="Power-soft loss weight over current Top-K candidates; clean_plus_v10 defaults to 0.05")
     parser.add_argument("--candidate-rerank-topk", type=int, default=7,
@@ -1258,8 +1352,14 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         raise ValueError("--dmaf-enabled and --no-dmaf cannot be used together")
     if args.selection_split == "val" and not args.no_merge_trainval:
         raise ValueError("--selection-split val requires --no-merge-trainval so validation samples are not trained on")
+    if args.skip_final_test and args.selection_split != "val":
+        raise ValueError("--skip-final-test requires --selection-split val")
+    if args.gps_future_steps < 0:
+        raise ValueError("--gps-future-steps must be >= 0")
     if args.ema_decay != 0.0 and not (0.0 < args.ema_decay < 1.0):
         raise ValueError("--ema-decay must be 0 or in (0, 1)")
+    if args.save_ema_every_epoch and args.ema_decay <= 0:
+        raise ValueError("--save-ema-every-epoch requires --ema-decay > 0")
     if args.ema_start_epoch < 1:
         raise ValueError("--ema-start-epoch must be >= 1")
     if args.curriculum_ramp_epochs < 1:
@@ -1268,6 +1368,12 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         raise ValueError("--curriculum-start-factor must be in [0, 1]")
     if args.curriculum_min_sample_weight < 0 or args.curriculum_min_sample_weight > 1:
         raise ValueError("--curriculum-min-sample-weight must be in [0, 1]")
+    if args.smooth_top3_weight < 0:
+        raise ValueError("--smooth-top3-weight must be >= 0")
+    if args.smooth_top3_temperature <= 0:
+        raise ValueError("--smooth-top3-temperature must be > 0")
+    if args.smooth_top3_margin < 0:
+        raise ValueError("--smooth-top3-margin must be >= 0")
 
     missing_aug_enabled = args.missing_enabled or args.missing_aug_enabled
     dmaf_enabled = (args.missing_enabled or args.dmaf_enabled) and (not args.no_dmaf)
@@ -1399,9 +1505,12 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         output_root=args.output_root,
         merge_train_val=(not args.no_merge_trainval),
         selection_split=args.selection_split,
+        skip_final_test=args.skip_final_test,
         image_subdir=args.image_subdir,
         image_aug=args.image_aug,
         lidar_representation=args.lidar_representation,
+        gps_feature_mode=args.gps_feature_mode,
+        gps_future_steps=args.gps_future_steps,
         scenarios=tuple(args.scenarios),
         epochs=args.epochs,
         batch_size=args.batch_size,
@@ -1430,6 +1539,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         pin_memory=(not args.no_pin_memory),
         persistent_workers=(not args.no_persistent_workers),
         save_every_epoch=args.save_every_epoch,
+        save_ema_every_epoch=args.save_ema_every_epoch,
         device=args.device,
         missing_enabled=args.missing_enabled,
         missing_aug_enabled=missing_aug_enabled,
@@ -1458,6 +1568,9 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         rank_margin_weight=rank_margin_weight,
         rank_margin=args.rank_margin,
         rank_topk=args.rank_topk,
+        smooth_top3_weight=args.smooth_top3_weight,
+        smooth_top3_temperature=args.smooth_top3_temperature,
+        smooth_top3_margin=args.smooth_top3_margin,
         candidate_rerank_weight=candidate_rerank_weight,
         candidate_rerank_topk=args.candidate_rerank_topk,
         candidate_rerank_temperature=args.candidate_rerank_temperature,
@@ -1488,6 +1601,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         spatial_scan=args.spatial_scan,
         dropout=args.dropout,
         gps_hidden_dim=args.gps_hidden_dim,
+        gps_input_dim=15 if args.gps_feature_mode == "physical_kinematic" else 2,
         backbone_stage=backbone_stage,
         pretrained_backbones=(not args.no_pretrained_backbones),
         freeze_image_stem=args.freeze_image_stem,

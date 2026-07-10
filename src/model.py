@@ -22,6 +22,7 @@ class BeMambaConfig:
     patch_grid: int = 6
     dropout: float = 0.2
     gps_hidden_dim: int = 96
+    gps_input_dim: int = 2
     pretrained_backbones: bool = True
     backbone_stage: int = 2
     temporal_layers: int = 1
@@ -273,14 +274,14 @@ class MultiScaleModalityBackbone(nn.Module):
 class GPSProjection(nn.Module):
     """Pure GPS feature projection (no mask handling — see MaskEncoder).
 
-    Input:  [B, 2, 2]  (2 time points × {dist, angle})
+    Input:  [B, 2, gps_input_dim]
     Output: [B, 2, d_model]
     """
 
-    def __init__(self, d_model: int, hidden_dim: int, dropout: float):
+    def __init__(self, input_dim: int, d_model: int, hidden_dim: int, dropout: float):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(2, hidden_dim),
+            nn.Linear(input_dim, hidden_dim),
             nn.SiLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, d_model),
@@ -1092,7 +1093,7 @@ class BeMambaModel(nn.Module):
         if cfg.freeze_image_stem:
             self.img_backbone.freeze_stem()
 
-        self.gps_projection = GPSProjection(cfg.d_model, cfg.gps_hidden_dim, cfg.dropout)
+        self.gps_projection = GPSProjection(cfg.gps_input_dim, cfg.d_model, cfg.gps_hidden_dim, cfg.dropout)
 
         # ── Phase 2: Mask encoders (standalone) ──
         self.img_mask_encoder = MaskEncoder(cfg.d_model)
