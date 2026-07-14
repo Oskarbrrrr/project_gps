@@ -23,13 +23,24 @@ from src.utils import calculate_apl, calculate_dba_score, calculate_topk_accurac
 CLEAN_ABLATION_STAGES = (
     "none",
     "base",
+    "three_order",
     "order_gate",
     "attn_head",
     "branch",
     "beam_query",
+    "ordinal",
     "neighbor",
     "rerank",
     "modality_dropout",
+)
+
+DMAF_ABLATION_STAGES = (
+    "none",
+    "missing_aug",
+    "mask_pool",
+    "mask_embed",
+    "reliability",
+    "cross_attn",
 )
 
 
@@ -37,6 +48,12 @@ def clean_ablation_level(stage: str) -> int:
     if stage not in CLEAN_ABLATION_STAGES:
         raise ValueError(f"Unsupported clean_ablation_stage: {stage}")
     return CLEAN_ABLATION_STAGES.index(stage) - 1
+
+
+def dmaf_ablation_level(stage: str) -> int:
+    if stage not in DMAF_ABLATION_STAGES:
+        raise ValueError(f"Unsupported dmaf_ablation_stage: {stage}")
+    return DMAF_ABLATION_STAGES.index(stage) - 1
 
 
 @dataclass
@@ -47,6 +64,7 @@ class TrainConfig:
     merge_train_val: bool = True
     selection_split: str = "test"
     skip_final_test: bool = False
+    eval_selection_missing: bool = False
     image_subdir: str = "camera_data"
     image_aug: bool = False
     lidar_representation: str = "count"
@@ -95,16 +113,20 @@ class TrainConfig:
     missing_modality_max: int = 2
     missing_modalities: str = "img,radar,lidar,gps"
     missing_seed: int = 42
+    use_mask_weighted_pool: bool = True
     use_mask_embed: bool = True
     use_cross_attn: bool = True
     use_reliability: bool = True
     model_variant: str = "bemamba"
     clean_ablation_stage: str = "none"
+    dmaf_ablation_stage: str = "none"
     clean_cross_attn: bool = False
     spatial_mixer_layers: int = 0
     use_order_gate: bool = False
+    modal_order_count: int = 3
     use_attn_head: bool = False
     use_branch_ensemble: bool = False
+    use_ordinal_head: bool = False
     aux_loss_weight: float = 0.0
     backbone_stage: int = 2
     rank_margin_weight: float = 0.0
@@ -706,10 +728,11 @@ def run_missing_robustness_tests(
     train_config: TrainConfig,
     scenario_name: str,
     gps_stats: dict,
-    test_csv_path: str,
+    eval_csv_path: str,
     device: torch.device,
     criterion: nn.Module,
     run_dir: str,
+    split_name: str = "test",
 ) -> list:
     # Protocol format: (name, frame_prob, burst_prob, modality_prob,
     #                    burst_min, burst_max, mod_min, mod_max)
@@ -744,7 +767,7 @@ def run_missing_robustness_tests(
 
     test_seed = train_config.missing_seed + 10000
     print(f"\n{'='*60}")
-    print(f"  Missing Robustness Tests — {scenario_name}")
+    print(f"  Missing Robustness Tests — {scenario_name} ({split_name})")
     print(f"{'='*60}")
     print(f"{'Protocol':<14} {'Top-1':>7} {'Top-2':>7} {'Top-3':>7} {'DBA':>8} {'APL':>9} {'Ret':>7}")
     print("-" * 62)
@@ -759,7 +782,7 @@ def run_missing_robustness_tests(
             data_root=train_config.data_root,
             split_root=train_config.split_root,
             scenario_name=scenario_name,
-            csv_path=test_csv_path,
+            csv_path=eval_csv_path,
             image_subdir=train_config.image_subdir,
             gps_stats=gps_stats,
             lidar_representation=train_config.lidar_representation,
@@ -796,9 +819,9 @@ def run_missing_robustness_tests(
             f"{retention:>6.1f}%"
         )
 
-    result_path = os.path.join(run_dir, "missing_test_result.txt")
+    result_path = os.path.join(run_dir, f"missing_{split_name}_result.txt")
     with open(result_path, "w", encoding="utf-8") as f:
-        f.write(f"Missing Robustness Test Results ({scenario_name})\n")
+        f.write(f"Missing Robustness Results ({scenario_name}, split={split_name})\n")
         f.write(f"Reference clean Top-3: {clean_acc3:.2f}%\n\n")
         header = f"{'Protocol':<14} {'Top-1':>7} {'Top-2':>7} {'Top-3':>7} {'DBA':>8} {'APL':>9} {'Ret':>7}\n"
         f.write(header)
@@ -810,7 +833,7 @@ def run_missing_robustness_tests(
                 f"{retention:>6.1f}%\n"
             )
 
-    csv_path = os.path.join(run_dir, "missing_test_result.csv")
+    csv_path = os.path.join(run_dir, f"missing_{split_name}_result.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["protocol", "acc1", "acc2", "acc3", "dba", "apl", "retention_pct"])
@@ -1148,6 +1171,21 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
     if train_config.skip_final_test:
         print("\n" + best_selection_text)
         print("Final test evaluation skipped by --skip-final-test.")
+        if train_config.eval_selection_missing and (
+            train_config.missing_aug_enabled or train_config.dmaf_enabled
+        ):
+            load_checkpoint(model, best_ckpt_path, device)
+            run_missing_robustness_tests(
+                model=model,
+                train_config=train_config,
+                scenario_name=scenario_name,
+                gps_stats=gps_stats,
+                eval_csv_path=val_csv_path,
+                device=device,
+                criterion=criterion,
+                run_dir=run_dir,
+                split_name=selection_name,
+            )
         return
 
     assert test_loader is not None
@@ -1186,10 +1224,11 @@ def run_scenario(scenario_name: str, train_config: TrainConfig, model_config: Be
             train_config=train_config,
             scenario_name=scenario_name,
             gps_stats=gps_stats,
-            test_csv_path=test_csv_path,
+            eval_csv_path=test_csv_path,
             device=device,
             criterion=criterion,
             run_dir=run_dir,
+            split_name="test",
         )
 
 def parse_args() -> argparse.Namespace:
@@ -1202,6 +1241,8 @@ def parse_args() -> argparse.Namespace:
                         help="Split used for checkpoint selection/early stopping; use val for paper-facing runs")
     parser.add_argument("--skip-final-test", action="store_true",
                         help="Run val-only development without constructing or evaluating the final test split")
+    parser.add_argument("--eval-selection-missing", action="store_true",
+                        help="Evaluate missing-data protocols on val without touching the final test split")
     parser.add_argument("--image-subdir", default="camera_data")
     parser.add_argument("--image-aug", action="store_true",
                         help="Use light train-only image augmentation for clean-data regularization")
@@ -1261,6 +1302,8 @@ def parse_args() -> argparse.Namespace:
                         help="Use the original BeMamba path or the enhanced clean-data variant")
     parser.add_argument("--clean-ablation-stage", choices=CLEAN_ABLATION_STAGES, default="none",
                         help="Controlled clean-backbone ablation stage; separates paper ablations from clean_plus history")
+    parser.add_argument("--dmaf-ablation-stage", choices=DMAF_ABLATION_STAGES, default="none",
+                        help="Controlled missing-aware ablation stage with fixed cumulative components")
     parser.add_argument("--backbone-stage", type=int, choices=[2, 3, 4], default=None,
                         help="Last ResNet stage used by modality backbones; clean_plus_v4 defaults to 3")
     parser.add_argument("--clean-cross-attn", action="store_true",
@@ -1269,10 +1312,14 @@ def parse_args() -> argparse.Namespace:
                         help="Number of per-modality spatial self-attention layers; clean_plus defaults to 1")
     parser.add_argument("--order-gate", action="store_true",
                         help="Use sample-adaptive weights for the three modal ordering sequences")
+    parser.add_argument("--modal-order-count", type=int, choices=[1, 3], default=None,
+                        help="Use one or three MBMamba modality orderings; default is 3")
     parser.add_argument("--attn-head", action="store_true",
                         help="Use attention/mean/max pooling features in the prediction head")
     parser.add_argument("--branch-ensemble", action="store_true",
                         help="Blend fused logits with auxiliary image/radar/lidar/GPS logits")
+    parser.add_argument("--ordinal-head", action="store_true",
+                        help="Add the continuous beam-index ordinal prior head")
     parser.add_argument("--aux-loss-weight", type=float, default=None,
                         help="Auxiliary branch loss weight; clean_plus_v3 defaults to 0.25")
     parser.add_argument("--rank-margin-weight", type=float, default=None,
@@ -1339,7 +1386,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--missing-modalities", default="img,radar,lidar,gps")
     parser.add_argument("--missing-seed", type=int, default=42)
     parser.add_argument("--no-mask-embed", action="store_true",
-                        help="Disable MaskEncoder (mask embedding injection + weighted aggregation)")
+                        help="Disable MaskEncoder embedding injection")
+    parser.add_argument("--no-mask-weighted-pool", action="store_true",
+                        help="Disable mask-weighted temporal aggregation independently of MaskEncoder")
     parser.add_argument("--no-cross-attn", action="store_true",
                         help="Disable CrossModalFusion (direct cross-modal attention)")
     parser.add_argument("--no-reliability", action="store_true",
@@ -1354,6 +1403,10 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         raise ValueError("--selection-split val requires --no-merge-trainval so validation samples are not trained on")
     if args.skip_final_test and args.selection_split != "val":
         raise ValueError("--skip-final-test requires --selection-split val")
+    if args.eval_selection_missing and args.selection_split != "val":
+        raise ValueError("--eval-selection-missing requires --selection-split val")
+    if args.eval_selection_missing and not args.skip_final_test:
+        raise ValueError("--eval-selection-missing requires --skip-final-test")
     if args.gps_future_steps < 0:
         raise ValueError("--gps-future-steps must be >= 0")
     if args.ema_decay != 0.0 and not (0.0 < args.ema_decay < 1.0):
@@ -1375,8 +1428,34 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
     if args.smooth_top3_margin < 0:
         raise ValueError("--smooth-top3-margin must be >= 0")
 
-    missing_aug_enabled = args.missing_enabled or args.missing_aug_enabled
-    dmaf_enabled = (args.missing_enabled or args.dmaf_enabled) and (not args.no_dmaf)
+    dmaf_ablation_stage = args.dmaf_ablation_stage
+    dmaf_ablation_idx = dmaf_ablation_level(dmaf_ablation_stage)
+    dmaf_ablation_enabled = dmaf_ablation_idx >= 0
+    if dmaf_ablation_enabled and (
+        args.missing_enabled
+        or args.missing_aug_enabled
+        or args.dmaf_enabled
+        or args.no_dmaf
+        or args.no_mask_weighted_pool
+        or args.no_mask_embed
+        or args.no_reliability
+        or args.no_cross_attn
+    ):
+        raise ValueError("Do not mix --dmaf-ablation-stage with manual missing/DMAF switches")
+    if dmaf_ablation_enabled:
+        missing_aug_enabled = True
+        use_mask_weighted_pool = dmaf_ablation_idx >= dmaf_ablation_level("mask_pool")
+        use_mask_embed = dmaf_ablation_idx >= dmaf_ablation_level("mask_embed")
+        use_reliability = dmaf_ablation_idx >= dmaf_ablation_level("reliability")
+        use_cross_attn = dmaf_ablation_idx >= dmaf_ablation_level("cross_attn")
+        dmaf_enabled = use_mask_weighted_pool
+    else:
+        missing_aug_enabled = args.missing_enabled or args.missing_aug_enabled
+        dmaf_enabled = (args.missing_enabled or args.dmaf_enabled) and (not args.no_dmaf)
+        use_mask_weighted_pool = not args.no_mask_weighted_pool
+        use_mask_embed = not args.no_mask_embed
+        use_reliability = not args.no_reliability
+        use_cross_attn = not args.no_cross_attn
     clean_plus = args.model_variant == "clean_plus"
     clean_plus_v2 = args.model_variant == "clean_plus_v2"
     clean_plus_v3 = args.model_variant == "clean_plus_v3"
@@ -1403,14 +1482,22 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         raise ValueError("--clean-cross-attn is not part of controlled clean ablations")
     if clean_ablation_enabled and args.spatial_mixer_layers not in (None, 0):
         raise ValueError("--spatial-mixer-layers must be 0 for controlled clean ablations")
-    if clean_ablation_enabled and (args.order_gate or args.attn_head or args.branch_ensemble):
+    if clean_ablation_enabled and (
+        args.order_gate
+        or args.modal_order_count is not None
+        or args.attn_head
+        or args.branch_ensemble
+        or args.ordinal_head
+    ):
         raise ValueError("Do not mix --clean-ablation-stage with manual clean module switches")
     if clean_ablation_enabled and args.difficulty_curriculum:
         raise ValueError("--difficulty-curriculum is not part of controlled clean ablations")
+    ablation_three_order = clean_ablation_idx >= clean_ablation_level("three_order")
     ablation_order_gate = clean_ablation_idx >= clean_ablation_level("order_gate")
     ablation_attn_head = clean_ablation_idx >= clean_ablation_level("attn_head")
     ablation_branch = clean_ablation_idx >= clean_ablation_level("branch")
     ablation_beam_query = clean_ablation_idx >= clean_ablation_level("beam_query")
+    ablation_ordinal = clean_ablation_idx >= clean_ablation_level("ordinal")
     ablation_neighbor = clean_ablation_idx >= clean_ablation_level("neighbor")
     ablation_rerank = clean_ablation_idx >= clean_ablation_level("rerank")
     ablation_modality_dropout = clean_ablation_idx >= clean_ablation_level("modality_dropout")
@@ -1437,8 +1524,14 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         raise ValueError("--spatial-mixer-layers must be >= 0")
     clean_cross_attn = args.clean_cross_attn or clean_plus
     use_order_gate = args.order_gate or clean_plus or ablation_order_gate
+    modal_order_count = args.modal_order_count if args.modal_order_count is not None else 3
+    if clean_ablation_enabled:
+        modal_order_count = 3 if ablation_three_order else 1
+    if use_order_gate and modal_order_count != 3:
+        raise ValueError("--order-gate requires --modal-order-count 3")
     use_attn_head = args.attn_head or clean_plus or ablation_attn_head
     use_branch_ensemble = args.branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15 or ablation_branch
+    use_ordinal_head = args.ordinal_head or ablation_ordinal or clean_plus_v7
     aux_loss_weight = args.aux_loss_weight
     if aux_loss_weight is None:
         aux_loss_weight = 0.25 if clean_plus_v3 else 0.0
@@ -1446,7 +1539,9 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         raise ValueError("--aux-loss-weight must be >= 0")
     rank_margin_weight = args.rank_margin_weight
     if rank_margin_weight is None:
-        rank_margin_weight = 0.05 if (ablation_beam_query or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15) else 0.0
+        rank_margin_weight = 0.0 if clean_ablation_enabled else (
+            0.05 if (clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15) else 0.0
+        )
     if rank_margin_weight < 0:
         raise ValueError("--rank-margin-weight must be >= 0")
     if args.rank_margin < 0:
@@ -1455,7 +1550,9 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         raise ValueError("--rank-topk must be >= 1")
     candidate_rerank_weight = args.candidate_rerank_weight
     if candidate_rerank_weight is None:
-        candidate_rerank_weight = 0.03 if clean_plus_v13 else (0.05 if (ablation_rerank or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v14 or clean_plus_v15) else 0.0)
+        candidate_rerank_weight = 0.0 if clean_ablation_enabled else (
+            0.03 if clean_plus_v13 else (0.05 if (clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v14 or clean_plus_v15) else 0.0)
+        )
     if candidate_rerank_weight < 0:
         raise ValueError("--candidate-rerank-weight must be >= 0")
     if args.candidate_rerank_topk < 3:
@@ -1506,6 +1603,7 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         merge_train_val=(not args.no_merge_trainval),
         selection_split=args.selection_split,
         skip_final_test=args.skip_final_test,
+        eval_selection_missing=args.eval_selection_missing,
         image_subdir=args.image_subdir,
         image_aug=args.image_aug,
         lidar_representation=args.lidar_representation,
@@ -1553,16 +1651,20 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         missing_modality_max=args.missing_modality_max,
         missing_modalities=args.missing_modalities,
         missing_seed=args.missing_seed,
-        use_mask_embed=not args.no_mask_embed,
-        use_cross_attn=not args.no_cross_attn,
-        use_reliability=not args.no_reliability,
+        use_mask_weighted_pool=use_mask_weighted_pool,
+        use_mask_embed=use_mask_embed,
+        use_cross_attn=use_cross_attn,
+        use_reliability=use_reliability,
         model_variant=args.model_variant,
         clean_ablation_stage=clean_ablation_stage,
+        dmaf_ablation_stage=dmaf_ablation_stage,
         clean_cross_attn=clean_cross_attn,
         spatial_mixer_layers=spatial_mixer_layers,
         use_order_gate=use_order_gate,
+        modal_order_count=modal_order_count,
         use_attn_head=use_attn_head,
         use_branch_ensemble=use_branch_ensemble,
+        use_ordinal_head=use_ordinal_head,
         aux_loss_weight=aux_loss_weight,
         backbone_stage=backbone_stage,
         rank_margin_weight=rank_margin_weight,
@@ -1606,18 +1708,20 @@ def build_configs(args: argparse.Namespace) -> Tuple[TrainConfig, BeMambaConfig]
         pretrained_backbones=(not args.no_pretrained_backbones),
         freeze_image_stem=args.freeze_image_stem,
         missing_enabled=dmaf_enabled,
-        use_mask_embed=not args.no_mask_embed,
-        use_cross_attn=not args.no_cross_attn,
-        use_reliability=not args.no_reliability,
+        use_mask_weighted_pool=use_mask_weighted_pool,
+        use_mask_embed=use_mask_embed,
+        use_cross_attn=use_cross_attn,
+        use_reliability=use_reliability,
         model_variant=args.model_variant,
         clean_cross_attn=clean_cross_attn,
         spatial_mixer_layers=spatial_mixer_layers,
         use_order_gate=use_order_gate,
+        modal_order_count=modal_order_count,
         use_attn_head=use_attn_head,
         use_branch_ensemble=use_branch_ensemble,
         use_beam_query_head=ablation_beam_query or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15,
         use_multiscale_backbone=clean_plus_v6,
-        use_ordinal_head=clean_plus_v7,
+        use_ordinal_head=use_ordinal_head,
         use_temporal_attn_pool=clean_plus_v8,
         use_beam_neighbor_head=ablation_neighbor or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15,
         use_candidate_reranker=ablation_rerank or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15,

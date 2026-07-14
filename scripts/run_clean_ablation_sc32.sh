@@ -2,6 +2,7 @@
 set -euo pipefail
 
 STAGE="${1:-base}"
+SEED="${2:-11}"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
 LOG_DIR="./logs_clean_ablation_sc32"
 mkdir -p "${LOG_DIR}"
@@ -12,9 +13,12 @@ python -u train.py \
   --output-root "./outputs_clean_ablation_sc32/${STAGE}" \
   --scenarios scenario32 \
   --image-subdir camera_data_mask \
+  --gps-feature-mode physical_kinematic \
+  --gps-future-steps 3 \
   --clean-ablation-stage "${STAGE}" \
   --selection-split val \
   --no-merge-trainval \
+  --skip-final-test \
   --epochs 30 \
   --patience 10 \
   --batch-size 16 \
@@ -28,5 +32,5 @@ python -u train.py \
   --hard-loss-weight 0.6 \
   --ema-decay 0.99 \
   --ema-start-epoch 8 \
-  --seed 11 \
-  2>&1 | tee "${LOG_DIR}/${STAGE}_${RUN_ID}.log"
+  --seed "${SEED}" \
+  2>&1 | tee "${LOG_DIR}/${STAGE}_seed${SEED}_${RUN_ID}.log"

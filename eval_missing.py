@@ -56,6 +56,8 @@ def parse_args():
                         help="Skip the hybrid (training config) protocol")
     parser.add_argument("--no-mask-embed", action="store_true",
                         help="Disable MaskEncoder (mask embedding injection)")
+    parser.add_argument("--no-mask-weighted-pool", action="store_true",
+                        help="Disable mask-weighted temporal aggregation")
     parser.add_argument("--no-cross-attn", action="store_true",
                         help="Disable CrossModalFusion (direct cross-modal attention)")
     parser.add_argument("--no-reliability", action="store_true",
@@ -72,8 +74,10 @@ def parse_args():
     parser.add_argument("--clean-cross-attn", action="store_true")
     parser.add_argument("--spatial-mixer-layers", type=int, default=None)
     parser.add_argument("--order-gate", action="store_true")
+    parser.add_argument("--modal-order-count", type=int, choices=[1, 3], default=3)
     parser.add_argument("--attn-head", action="store_true")
     parser.add_argument("--branch-ensemble", action="store_true")
+    parser.add_argument("--ordinal-head", action="store_true")
     parser.add_argument("--candidate-rerank-delta-bound", type=float, default=0.20)
     parser.add_argument("--candidate-embed-dropout", type=float, default=0.0)
     parser.add_argument("--device", default="cuda")
@@ -121,6 +125,7 @@ def main():
         gps_input_dim=15 if args.gps_feature_mode == "physical_kinematic" else 2,
         backbone_stage=backbone_stage,
         missing_enabled=not args.no_dmaf,
+        use_mask_weighted_pool=not args.no_mask_weighted_pool,
         use_mask_embed=not args.no_mask_embed,
         use_cross_attn=not args.no_cross_attn,
         use_reliability=not args.no_reliability,
@@ -128,11 +133,12 @@ def main():
         clean_cross_attn=clean_cross_attn,
         spatial_mixer_layers=spatial_mixer_layers,
         use_order_gate=use_order_gate,
+        modal_order_count=args.modal_order_count,
         use_attn_head=use_attn_head,
         use_branch_ensemble=use_branch_ensemble,
         use_beam_query_head=clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15,
         use_multiscale_backbone=clean_plus_v6,
-        use_ordinal_head=clean_plus_v7,
+        use_ordinal_head=args.ordinal_head or clean_plus_v7,
         use_temporal_attn_pool=clean_plus_v8,
         use_beam_neighbor_head=clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15,
         use_candidate_reranker=clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15,
@@ -163,13 +169,16 @@ def main():
         missing_modality_prob=args.missing_modality_prob,
         missing_modalities=args.missing_modalities,
         missing_seed=args.missing_seed,
+        use_mask_weighted_pool=not args.no_mask_weighted_pool,
         seed=args.seed,
         model_variant=args.model_variant,
         clean_cross_attn=clean_cross_attn,
         spatial_mixer_layers=spatial_mixer_layers,
         use_order_gate=use_order_gate,
+        modal_order_count=args.modal_order_count,
         use_attn_head=use_attn_head,
         use_branch_ensemble=use_branch_ensemble,
+        use_ordinal_head=args.ordinal_head or clean_plus_v7,
         backbone_stage=backbone_stage,
     )
 

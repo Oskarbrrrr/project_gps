@@ -20,15 +20,17 @@
 - 上层：干净骨干如何形成完整输入预测能力。
 - 下层：动态掩码自适应融合如何赋予缺失输入鲁棒性。
 
-## 2. 最小 BeMamba 基线
+## 2. Baseline-0 定义
 
-干净骨干精炼的起点定义为 **最小 BeMamba 基线**：
+为回答“究竟是哪一个模块起作用”，消融起点改为真正的最小结构：
 
 ```text
-ResNet/GPS projection + Temporal Mamba + 三顺序 MBMamba + 普通 MLP
+ResNet/GPS projection + Temporal Mamba + 单顺序 MBMamba + 普通 MLP
 ```
 
-注意：三顺序 MBMamba 属于最小 BeMamba 基线的一部分，不作为主前向消融中的后续新增模块。`single-order MBMamba` 与 `three-order MBMamba` 的比较可以作为补充消融。
+`single-order` 只保留论文 Eq. 11 对应的第一种模态排列。代码在单顺序输出上乘以 3，使其名义尺度与原三顺序求和一致，避免把“顺序多样性”和“特征幅值变化”混在一起。`three-order MBMamba` 作为 Baseline-0 后的第一个新增模块。
+
+MaskEncoder、ReliabilityEstimator 和 CrossModalAttention 不放进 clean 链。它们依赖缺失 mask，必须在固定缺失增强的 DMAF 链中验证；如果把它们与 clean heads 串成一条链，无法区分数据缺失增强、显式 mask 和 clean 分类头各自的贡献。
 
 ## 3. 严格论文口径
 
@@ -74,11 +76,13 @@ Data/splits_paper80_val
 
 | stage | 中文含义 |
 |---|---|
-| `base` | 最小 BeMamba 基线 |
+| `base` | Baseline-0：单顺序 MBMamba + MLP |
+| `three_order` | 改为三顺序 MBMamba 简单求和 |
 | `order_gate` | 顺序融合增强 |
 | `attn_head` | 预测头增强 |
 | `branch` | 分支监督增强 |
 | `beam_query` | 波束查询增强 |
+| `ordinal` | 波束序数先验 |
 | `neighbor` | 波束邻域增强 |
 | `rerank` | 候选重排增强 |
 | `modality_dropout` | 训练期模态正则 |
@@ -93,43 +97,41 @@ Data/splits_paper80_val
 
 | 顺序 | 功能组 | 主要模块 |
 |---:|---|---|
-| 0 | 最小 BeMamba 基线 | ResNet/GPS projection + Temporal Mamba + 三顺序 MBMamba + MLP |
-| 1 | 顺序融合增强 | OrderFusionGate |
-| 2 | 预测头增强 | AttentivePredictionHead |
-| 3 | 分支监督增强 | Branch Ensemble，可选辅助分支损失 |
-| 4 | 波束查询增强 | Beam Query Refinement + Top-k 排序损失 |
-| 5 | 波束邻域增强 | Beam Neighborhood Head |
-| 6 | 候选重排增强 | Candidate Reranker + 候选重排损失 |
-| 7 | 训练期模态正则 | Modality Feature Dropout |
+| 0 | Baseline-0 | ResNet/GPS projection + Temporal Mamba + 单顺序 MBMamba + MLP |
+| 1 | 三顺序融合 | Three-order MBMamba + simple sum |
+| 2 | 顺序融合增强 | OrderFusionGate |
+| 3 | 预测头增强 | AttentivePredictionHead |
+| 4 | 分支融合增强 | Branch Ensemble；主链默认不额外启用 auxiliary branch loss |
+| 5 | 波束查询增强 | Beam Query Refinement；仍只用固定主损失 |
+| 6 | 波束序数增强 | Beam Ordinal Prior |
+| 7 | 波束邻域增强 | Beam Neighborhood Head |
+| 8 | 候选重排增强 | Candidate Reranker；仍只用固定主损失 |
+| 9 | 训练期模态正则 | Modality Feature Dropout |
 
-`Ordinal Prior` 暂不进入主线前向表，因为历史结果主要改善 Top-1/DBA，没有推动 Top-3。它可以作为负结果或辅助消融记录。
+这张表是严格的累计链，相邻两行只增加一个模块。`beam_query` 和 `rerank` 阶段默认不自动打开额外 ranking/rerank loss，避免把“头部结构”和“训练监督”混成一个变量；如果论文还要比较辅助损失，应另开 loss-only 表。由于历史结果表明 Ordinal Prior、Candidate Reranker 等可能为负，论文还需要补最终模型的 leave-one-out；不能只用累计链声称模块具有独立贡献。
 
 ### 4.4 模块去留规则
 
 采用 **Top-3 去留规则**：
 
-- 如果某模块让严格论文口径下 SC32 final test Top-3 明确上升，进入当前最佳干净骨干。
+- 开发阶段只根据固定 val 的 Top-3 判断，不读取或重复使用 SC32 final test。
 - 如果 Top-3 持平，但 Top-1/Top-2/DBA/APL 更好，只能作为辅助优势，不能单独决定入选。
 - 如果 Top-3 下降，即使辅助指标变好，也不进入最终干净骨干。
-- 小幅提升可以暂时保留，但需要最终移除验证再确认。
+- 小幅提升必须在 seeds `11/7/42` 的 paired val 结果中方向稳定，才进入跨场景候选。
 
-采用 **筛选式前向加入**：
-
-- 按预设顺序尝试每个功能组。
-- 失败模块不继续强制叠加到后续实验。
-- 后续模块接在“当前最佳干净骨干”上继续测试。
-- 失败行保留在表中，说明测试过但未入选。
+累计链负责回答“在固定前序结构下，新模块的条件增量是多少”。模块去留则由 paired val、跨场景验证和最终模型 leave-one-out 共同决定。累计链中即使某一阶段为负，也保留后续行以完整呈现模块交互，但不能把后续结果解释为该失败模块的独立收益。
 
 ### 4.5 固定控制变量
 
 干净骨干精炼主消融固定以下条件：
 
-- 场景：SC32。
+- 场景：SC32 只做冻结后的 val 诊断；新的结构选择以 SC33/SC34 paired val 为主。
 - 评估口径：严格论文口径。
 - 骨干容量：固定 `backbone_stage=3`。
 - 主损失：固定同一个主分类损失，例如 `power_soft_ce`。
-- 辅助损失：只在对应功能组加入时启用。例如波束查询增强加入时启用 Top-k 排序损失，候选重排增强加入时启用候选重排损失。
+- 辅助损失：clean 模块主链全部固定为 0。Top-k ranking loss、candidate rerank loss 如需验证，单独做 loss-only 对照。
 - 不把 v15 curriculum 放入主消融，因为当前实验结论为负结果。
+- 所有开发消融都加 `--skip-final-test`。只有配置预先声明且跨场景 val 支持后，才各运行一次 final test。
 
 ### 4.6 最终移除验证
 
@@ -183,6 +185,20 @@ Data/splits_paper80_val
 
 注意：代码层面要区分“掩码时序聚合”和“掩码编码器”。当前实现中，`--no-mask-embed` 只关闭掩码编码器，但只要 `missing_enabled=True`，mask 仍可能传入 `TemporalProcessor` 做加权聚合。论文表述中必须拆开这两个概念。
 
+现在使用独立入口 `--dmaf-ablation-stage`，相邻阶段固定为：
+
+```text
+missing_aug -> mask_pool -> mask_embed -> reliability -> cross_attn
+```
+
+- `missing_aug`：数据侧制造缺失，模型不接收 mask。
+- `mask_pool`：新增 mask-weighted temporal aggregation。
+- `mask_embed`：再新增 MaskEncoder embedding。
+- `reliability`：再新增 ReliabilityEstimator。
+- `cross_attn`：最后新增 CrossModalFusion。
+
+该入口禁止和 `--missing-enabled`、`--dmaf-enabled`、`--no-mask-*`、`--no-reliability`、`--no-cross-attn` 混用，避免配置看似单变量、实际偷偷改变多个模块。
+
 ### 5.4 固定缺失增强策略
 
 鲁棒消融所有行必须固定同一套训练期缺失增强策略，包括：
@@ -235,7 +251,7 @@ Data/splits_paper80_val
 
 用途：证明哪些完整输入模块进入最终干净骨干。
 
-场景：SC32。
+场景：SC32 仅报告冻结 val 诊断；正式选择优先看 SC33/SC34 paired val。
 
 建议列：
 
@@ -244,8 +260,8 @@ Data/splits_paper80_val
 | 阶段 | 当前测试的消融阶段 |
 | 新增功能组 | 相对当前最佳干净骨干尝试加入什么 |
 | Val Top-3 | checkpoint selection 依据 |
-| Test Top-3 | 唯一主指标 |
-| ΔTop-3 | 相对当前最佳干净骨干的变化 |
+| Paired ΔVal Top-3 | 相对上一阶段、同 seed 的变化 |
+| 三种子均值/方向 | 判断收益是否稳定 |
 | 是否入选 | 是否进入后续当前最佳干净骨干 |
 
 Top-1、Top-2、DBA、APL 不放主表，可放附录或备注。
@@ -295,36 +311,39 @@ SC32 Top-3 / SC33 Top-3 / SC34 Top-3 / 平均 Top-3
 
 用途：证明缺失感知模块各自的贡献。
 
-主文建议只用 SC32，覆盖五类鲁棒评估协议。SC33/SC34 的鲁棒模块消融如有篇幅可放附录。
+开发消融先在 val split 上覆盖五类鲁棒协议，输出 `missing_val_result.csv`。SC32 test 已冻结，不再用于模块选择；SC33/SC34 也只有在配置预先冻结后才运行 final test。
 
 建议包含两类结果：
 
 1. 鲁棒前向消融：从缺失增强鲁棒基线逐步加入掩码时序聚合、掩码编码器、可靠性估计器、跨模态注意力。
 2. 鲁棒模块移除验证：在完整鲁棒模型上移除入选鲁棒模块。
 
-## 7. 当前执行优先级
+## 7. 当前执行优先级（2026-07-14）
 
 建议执行顺序：
 
-1. 实现 `--clean-ablation-stage` 受控消融入口。
-2. 在 SC32 严格论文口径下跑干净骨干精炼前向消融。
-3. 根据 Top-3 去留规则确定最终干净骨干。
-4. 对最终干净骨干做入选模块移除验证。
-5. 将最终干净骨干扩展到 SC33/SC34。
-6. 在最终干净骨干上做缺失增强鲁棒基线和完整动态掩码自适应融合。
-7. 在 SC32 上做鲁棒模块消融和鲁棒模块移除验证。
+1. 先在 SC33/SC34 完成 `clean_plus_v14 + physical_kinematic` 与原 GPS 的 paired val-only 验证，确认当前 clean 基座能跨场景。
+2. 若论文需要解释全部复杂模块，再跑 clean 累计链；每个 stage 使用 seeds `11/7/42`，只读 val。
+3. 对最终保留的 clean 模块做 leave-one-out，避免仅靠累计链归因。
+4. 在固定 clean backbone 上跑 DMAF 链：`missing_aug -> mask_pool -> mask_embed -> reliability -> cross_attn`。
+5. DMAF 消融在 val 上同时报告 Clean、Frame 50%、Burst 60%、Modal 60%、Hybrid Top-3，不得只挑有利协议。
+6. 只有在配置预先冻结后，才对 SC33/SC34 各运行一次 final test；SC32 test 不再用于选择。
 
-AutoDL 上可以先启动最小 BeMamba 基线：
-
-```bash
-bash scripts/run_clean_ablation_sc32.sh base
-```
-
-后续阶段根据 Top-3 去留规则逐个启动，例如：
+通用 val-only 脚本格式：
 
 ```bash
-bash scripts/run_clean_ablation_sc32.sh order_gate
-bash scripts/run_clean_ablation_sc32.sh attn_head
+bash scripts/run_controlled_ablation_val.sh clean base scenario33 11
+bash scripts/run_controlled_ablation_val.sh clean three_order scenario33 11
 ```
 
-如果某一阶段未通过 Top-3 去留规则，不应机械继续把失败模块叠入后续当前最佳干净骨干。
+DMAF 链示例：
+
+```bash
+bash scripts/run_controlled_ablation_val.sh dmaf missing_aug scenario33 11
+bash scripts/run_controlled_ablation_val.sh dmaf mask_pool scenario33 11
+bash scripts/run_controlled_ablation_val.sh dmaf mask_embed scenario33 11
+bash scripts/run_controlled_ablation_val.sh dmaf reliability scenario33 11
+bash scripts/run_controlled_ablation_val.sh dmaf cross_attn scenario33 11
+```
+
+脚本统一固定 `physical_kinematic` GPS、val selection、`--skip-final-test`、扫描顺序和优化参数。DMAF family 额外使用 `--eval-selection-missing`，因此会在 val 上生成完整缺失协议结果而不读取 test。SC33/SC34 自动使用 `camera_data_mask_yolo`，SC32 使用 `camera_data_mask`。

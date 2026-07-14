@@ -34,6 +34,7 @@ class BeMambaConfig:
 
     # ── DMAF ablation switches ──
     # All default True — use --no-* flags to disable individual components.
+    use_mask_weighted_pool: bool = True
     use_mask_embed: bool = True
     use_cross_attn: bool = True
     use_reliability: bool = True
@@ -41,6 +42,7 @@ class BeMambaConfig:
     clean_cross_attn: bool = False
     spatial_mixer_layers: int = 0
     use_order_gate: bool = False
+    modal_order_count: int = 3
     use_attn_head: bool = False
     use_branch_ensemble: bool = False
     use_beam_query_head: bool = False
@@ -1058,13 +1060,19 @@ class BeMambaModel(nn.Module):
             spatial_mixer_layers = 1
         if spatial_mixer_layers < 0:
             raise ValueError("spatial_mixer_layers must be >= 0")
+        if cfg.modal_order_count not in {1, 3}:
+            raise ValueError("modal_order_count must be 1 or 3")
 
         # Resolve optional modules. Mask/reliability stay DMAF-only; clean_plus can use cross-attn.
+        self.use_mask_weighted_pool = cfg.missing_enabled and cfg.use_mask_weighted_pool
         self.use_mask_embed = cfg.missing_enabled and cfg.use_mask_embed
         self.use_cross_attn = cfg.use_cross_attn and (cfg.missing_enabled or cfg.clean_cross_attn or clean_plus)
         self.use_reliability = cfg.missing_enabled and cfg.use_reliability
         self.use_spatial_mixer = spatial_mixer_layers > 0
         self.use_order_gate = cfg.use_order_gate or clean_plus
+        self.modal_order_count = cfg.modal_order_count
+        if self.use_order_gate and self.modal_order_count != 3:
+            raise ValueError("OrderFusionGate requires modal_order_count=3")
         self.use_attn_head = cfg.use_attn_head or clean_plus
         self.use_branch_ensemble = cfg.use_branch_ensemble or clean_plus_v2 or clean_plus_v3 or clean_plus_v4 or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15
         self.use_beam_query_head = cfg.use_beam_query_head or clean_plus_v5 or clean_plus_v6 or clean_plus_v7 or clean_plus_v8 or clean_plus_v9 or clean_plus_v10 or clean_plus_v11 or clean_plus_v12 or clean_plus_v13 or clean_plus_v14 or clean_plus_v15
@@ -1150,7 +1158,7 @@ class BeMambaModel(nn.Module):
                             expand=cfg.expand,
                             dropout=cfg.dropout,
                         )
-                        for _ in range(3)
+                        for _ in range(self.modal_order_count)
                     ]
                 )
                 for _ in range(cfg.fusion_layers)
@@ -1242,11 +1250,11 @@ class BeMambaModel(nn.Module):
         lidar_tokens: torch.Tensor,
         radar_tokens: torch.Tensor,
         gps_tokens: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build three mixed-modality sequences (BeMamba paper Eq. 11-13).
+    ) -> Tuple[torch.Tensor, ...]:
+        """Build one or three mixed-modality sequences (BeMamba paper Eq. 11-13).
 
-        Each sequence is a different permutation of [gps_start, img, lidar, radar, gps_end],
-        to handle Mamba's order sensitivity.
+        The one-order ablation keeps only Eq. 11. The default three-order path
+        keeps all permutations used to handle Mamba's order sensitivity.
         """
         N = self.spatial_len
         gps_start = gps_tokens[:, 0, :].unsqueeze(1).expand(-1, N, -1)  # [B, N, d]
@@ -1264,11 +1272,12 @@ class BeMambaModel(nn.Module):
         seq_c1 = seq_c1.reshape(B, N * 5, d)
         seq_c2 = seq_c2.reshape(B, N * 5, d)
         seq_c3 = seq_c3.reshape(B, N * 5, d)
-        return seq_c1, seq_c2, seq_c3
+        sequences = (seq_c1, seq_c2, seq_c3)
+        return sequences[: self.modal_order_count]
 
     def _modal_fusion(
         self,
-        sequences: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        sequences: Tuple[torch.Tensor, ...],
     ) -> torch.Tensor:
         """MBMamba fusion → mean-reduce → sum.
 
@@ -1281,7 +1290,7 @@ class BeMambaModel(nn.Module):
                 next_sequences.append(sequence + block(sequence))
             running_sequences = next_sequences
 
-        # Mean-reduce the 5-modality dimension, then sum the 3 orderings
+        # Mean-reduce the 5-modality dimension, then fuse the active orderings.
         encoded_sequences = []
         for sequence in running_sequences:
             seq = sequence.reshape(sequence.size(0), self.spatial_len, 5, self.config.d_model)
@@ -1289,6 +1298,10 @@ class BeMambaModel(nn.Module):
 
         if self.order_gate is not None:
             return self.order_gate(torch.stack(encoded_sequences, dim=1))
+        if len(encoded_sequences) == 1:
+            # Match the nominal scale of the original three-order sum so this
+            # ablation changes ordering diversity/capacity, not feature scale.
+            return encoded_sequences[0] * 3.0
         return encoded_sequences[0] + encoded_sequences[1] + encoded_sequences[2]
 
     def _apply_modality_feature_dropout(
@@ -1383,10 +1396,13 @@ class BeMambaModel(nn.Module):
         # ═══════════════════════════════════════════════════════════
         # Phase 3: Temporal Processing
         # ═══════════════════════════════════════════════════════════
-        # Pass masks for weighted aggregation (active whenever masks exist)
-        img_tokens = self.img_temporal(img_spatial, mask=img_mask if self.missing_enabled else None)
-        radar_tokens = self.radar_temporal(radar_spatial, mask=radar_mask if self.missing_enabled else None)
-        lidar_tokens = self.lidar_temporal(lidar_spatial, mask=lidar_mask if self.missing_enabled else None)
+        # Mask-weighted pooling is independently switchable from MaskEncoder.
+        temporal_img_mask = img_mask if self.use_mask_weighted_pool else None
+        temporal_radar_mask = radar_mask if self.use_mask_weighted_pool else None
+        temporal_lidar_mask = lidar_mask if self.use_mask_weighted_pool else None
+        img_tokens = self.img_temporal(img_spatial, mask=temporal_img_mask)
+        radar_tokens = self.radar_temporal(radar_spatial, mask=temporal_radar_mask)
+        lidar_tokens = self.lidar_temporal(lidar_spatial, mask=temporal_lidar_mask)
         img_tokens = self.img_token_mixer(img_tokens)
         radar_tokens = self.radar_token_mixer(radar_tokens)
         lidar_tokens = self.lidar_token_mixer(lidar_tokens)
