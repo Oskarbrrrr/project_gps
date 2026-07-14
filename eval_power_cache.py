@@ -1,9 +1,10 @@
-"""Val-only train-cache retrieval diagnostic for clean beam prediction.
+"""Train-cache retrieval diagnostic and guarded fixed-test evaluation.
 
 The cache contains only train-split fused features and normalized 64-beam power
-profiles. Validation samples retrieve nearby train samples, then blend the
-retrieved profile with the model probabilities. Shared sensor/GPS paths are
-purged by default to avoid overlap leakage between nearby windows.
+profiles. Query samples retrieve nearby train samples, then blend the retrieved
+profile with the model probabilities. Shared sensor/GPS paths are purged by
+default to avoid overlap leakage between nearby windows. Test evaluation must
+use one pre-selected value for every cache hyperparameter.
 """
 
 import argparse
@@ -32,7 +33,7 @@ MODEL_VARIANTS = [
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Tune a train-only power-profile cache on the validation split."
+        description="Tune a train-only power cache on val or evaluate one fixed setting on test."
     )
     parser.add_argument("--ckpt", required=True)
     parser.add_argument("--data-root", default="./Data/Multi_Modal")
@@ -46,6 +47,12 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--query-split", choices=["val", "test"], default="val")
+    parser.add_argument(
+        "--confirm-fixed-test",
+        action="store_true",
+        help="Required for test; confirms that K/temperature/alpha were fixed on validation",
+    )
 
     parser.add_argument("--topks", type=int, nargs="+", default=[3, 5, 7, 11])
     parser.add_argument("--retrieval-temperatures", type=float, nargs="+", default=[0.03, 0.05, 0.07, 0.10])
@@ -175,11 +182,25 @@ def main():
         raise ValueError("--retrieval-temperatures values must be > 0")
     if any(value < 0 or value > 1 for value in args.blend_alphas):
         raise ValueError("--blend-alphas values must be in [0, 1]")
+    if args.query_split == "test":
+        if not args.confirm_fixed_test:
+            raise ValueError("--query-split test requires --confirm-fixed-test")
+        if not (
+            len(args.topks) == 1
+            and len(args.retrieval_temperatures) == 1
+            and len(args.blend_alphas) == 1
+        ):
+            raise ValueError(
+                "Test evaluation forbids parameter sweeps: provide exactly one --topks, "
+                "--retrieval-temperatures and --blend-alphas value"
+            )
+        if args.no_purge_shared_paths:
+            raise ValueError("Fixed test evaluation requires shared-path purging")
 
     train_csv = os.path.join(args.split_root, f"{args.scenario}_train.csv")
-    val_csv = os.path.join(args.split_root, f"{args.scenario}_val.csv")
-    if not os.path.exists(val_csv):
-        raise FileNotFoundError(f"Validation split required for tuning: {val_csv}")
+    query_csv = os.path.join(args.split_root, f"{args.scenario}_{args.query_split}.csv")
+    if not os.path.exists(query_csv):
+        raise FileNotFoundError(f"Query split not found: {query_csv}")
 
     device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
     model_config = build_model_config(args)
@@ -200,7 +221,7 @@ def main():
     )
     gps_stats = stats_ds.get_gps_stats()
     train_ds = build_dataset(args, train_csv, gps_stats=gps_stats)
-    val_ds = build_dataset(args, val_csv, gps_stats=gps_stats)
+    query_ds = build_dataset(args, query_csv, gps_stats=gps_stats)
     loader_config = TrainConfig(
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -210,11 +231,11 @@ def main():
 
     print(f"Extracting train cache: {len(train_ds)} samples")
     train_data = extract_split(model, build_dataloader(train_ds, loader_config, False), device)
-    print(f"Extracting validation queries: {len(val_ds)} samples")
-    val_data = extract_split(model, build_dataloader(val_ds, loader_config, False), device)
-    similarities = val_data["features"] @ train_data["features"].T
+    print(f"Extracting {args.query_split} queries: {len(query_ds)} samples")
+    query_data = extract_split(model, build_dataloader(query_ds, loader_config, False), device)
+    similarities = query_data["features"] @ train_data["features"].T
 
-    blocked, path_columns = build_blocked_indices(train_ds.df, val_ds.df)
+    blocked, path_columns = build_blocked_indices(train_ds.df, query_ds.df)
     purge_shared = not args.no_purge_shared_paths
     if purge_shared:
         for row_index, train_indices in enumerate(blocked):
@@ -229,11 +250,11 @@ def main():
         f"min_available_neighbors={min_available}"
     )
     if min_available < 1:
-        raise RuntimeError("At least one validation query has no non-overlapping train neighbor")
+        raise RuntimeError(f"At least one {args.query_split} query has no non-overlapping train neighbor")
 
-    baseline = topk_metrics(val_data["probs"], val_data["targets"])
+    baseline = topk_metrics(query_data["probs"], query_data["targets"])
     print(
-        f"Baseline val: Top-1={baseline['acc1']:.2f}% "
+        f"Baseline {args.query_split}: Top-1={baseline['acc1']:.2f}% "
         f"Top-2={baseline['acc2']:.2f}% Top-3={baseline['acc3']:.2f}%"
     )
     results = []
@@ -245,8 +266,8 @@ def main():
             weights = torch.softmax(neighbor_scores / float(temperature), dim=1)
             retrieved_power = (neighbor_power * weights.unsqueeze(2)).sum(dim=1)
             for alpha in args.blend_alphas:
-                scores = (1.0 - alpha) * val_data["probs"] + alpha * retrieved_power
-                metrics = topk_metrics(scores, val_data["targets"])
+                scores = (1.0 - alpha) * query_data["probs"] + alpha * retrieved_power
+                metrics = topk_metrics(scores, query_data["targets"])
                 results.append(
                     {
                         "topk": k,
@@ -257,34 +278,40 @@ def main():
                 )
 
     results_df = pd.DataFrame(results).drop_duplicates()
-    best_row = results_df.sort_values(
+    selected_row = results_df.sort_values(
         ["acc3", "acc2", "acc1", "alpha"], ascending=[False, False, False, True]
     ).iloc[0]
+    setting_label = "Fixed test cache setting" if args.query_split == "test" else "Best val cache setting"
     print(
-        "Best val cache setting: "
-        f"K={int(best_row['topk'])}, temperature={best_row['temperature']:.3f}, "
-        f"alpha={best_row['alpha']:.2f}, Top-1={best_row['acc1']:.2f}%, "
-        f"Top-2={best_row['acc2']:.2f}%, Top-3={best_row['acc3']:.2f}% "
-        f"(delta={best_row['acc3'] - baseline['acc3']:+.2f}pp)"
+        f"{setting_label}: "
+        f"K={int(selected_row['topk'])}, temperature={selected_row['temperature']:.3f}, "
+        f"alpha={selected_row['alpha']:.2f}, Top-1={selected_row['acc1']:.2f}%, "
+        f"Top-2={selected_row['acc2']:.2f}%, Top-3={selected_row['acc3']:.2f}% "
+        f"(delta={selected_row['acc3'] - baseline['acc3']:+.2f}pp)"
     )
 
     output_dir = args.output_dir
     if output_dir is None:
-        output_dir = os.path.join(os.path.dirname(os.path.dirname(args.ckpt)), "power_cache_eval")
+        output_name = "power_cache_fixed_test" if args.query_split == "test" else "power_cache_eval"
+        output_dir = os.path.join(os.path.dirname(os.path.dirname(args.ckpt)), output_name)
     os.makedirs(output_dir, exist_ok=True)
-    results_df.to_csv(os.path.join(output_dir, "val_grid.csv"), index=False)
+    result_filename = "test_result.csv" if args.query_split == "test" else "val_grid.csv"
+    summary_filename = "test_summary.json" if args.query_split == "test" else "val_summary.json"
+    results_df.to_csv(os.path.join(output_dir, result_filename), index=False)
     summary = {
         "checkpoint": args.ckpt,
         "scenario": args.scenario,
+        "query_split": args.query_split,
         "purge_shared_paths": purge_shared,
         "path_columns": path_columns,
         "max_blocked_per_query": max_blocked,
         "baseline": baseline,
-        "best": {key: float(best_row[key]) for key in results_df.columns},
+        "result": {key: float(selected_row[key]) for key in results_df.columns},
     }
-    with open(os.path.join(output_dir, "val_summary.json"), "w", encoding="utf-8") as handle:
+    with open(os.path.join(output_dir, summary_filename), "w", encoding="utf-8") as handle:
         json.dump(summary, handle, ensure_ascii=False, indent=2)
-    print(f"Saved validation retrieval sweep to: {output_dir}")
+    action = "fixed test evaluation" if args.query_split == "test" else "validation retrieval sweep"
+    print(f"Saved {action} to: {output_dir}")
 
 
 if __name__ == "__main__":
